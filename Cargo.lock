@@ -1720,6 +1720,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "ulid",
 ]
@@ -1731,6 +1732,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "dashmap",
  "serde",
  "serde_json",
  "slip-core",

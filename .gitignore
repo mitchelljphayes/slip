@@ -18,3 +18,4 @@
 
 # slip runtime (never commit secrets)
 /etc/slip/secrets/
+.Claude/

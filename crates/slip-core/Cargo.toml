@@ -27,4 +27,5 @@ regex = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+tower = { workspace = true }
 tempfile = "3"
