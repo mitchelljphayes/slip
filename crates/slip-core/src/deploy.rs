@@ -7,6 +7,7 @@ use serde::Serialize;
 
 use crate::api::AppState;
 use crate::config::AppConfig;
+use crate::state;
 
 // ─── Status types ─────────────────────────────────────────────────────────────
 
@@ -214,7 +215,7 @@ pub async fn execute_deploy(state: Arc<AppState>, mut ctx: DeployContext) {
     }
 
     // Update app runtime state
-    {
+    let state_snapshot = {
         let mut states = state.app_states.write().await;
         let app_state = states.entry(app_name.clone()).or_default();
         app_state.previous_tag = app_state.current_tag.take();
@@ -225,6 +226,13 @@ pub async fn execute_deploy(state: Arc<AppState>, mut ctx: DeployContext) {
         app_state.deployed_at = Some(Utc::now());
         app_state.deploy_id = Some(ctx.id.clone());
         app_state.status = AppStatus::Running;
+        app_state.clone()
+    };
+
+    // Persist state to disk (non-fatal)
+    let state_dir = state.config.storage.path.join("state");
+    if let Err(e) = state::save_app_state(&state_dir, &app_name, &state_snapshot) {
+        tracing::warn!(app = %app_name, error = %e, "failed to persist app state (non-fatal)");
     }
 
     // ── DRAIN + STOP OLD ─────────────────────────────────────────────────────

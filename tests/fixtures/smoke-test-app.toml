@@ -1,0 +1,21 @@
+[app]
+name = "smoke-test"
+image = "nginx"
+
+[routing]
+domain = "smoke-test.localhost"
+port = 80
+
+[health]
+path = "/"
+interval = "1s"
+timeout = "3s"
+retries = 5
+start_period = "2s"
+
+[deploy]
+strategy = "blue-green"
+drain_timeout = "5s"
+
+[network]
+name = "slip"

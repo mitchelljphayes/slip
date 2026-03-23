@@ -3,10 +3,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, body::Bytes};
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
@@ -42,6 +43,36 @@ pub struct DeployResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+/// Response for `GET /v1/status`.
+#[derive(Debug, Serialize)]
+pub struct StatusResponse {
+    pub daemon: String,
+    pub uptime_seconds: i64,
+    pub apps: HashMap<String, AppStatusResponse>,
+}
+
+/// Per-app status within a `StatusResponse`.
+#[derive(Debug, Serialize)]
+pub struct AppStatusResponse {
+    pub status: String,
+    pub tag: Option<String>,
+    pub deployed_at: Option<DateTime<Utc>>,
+    pub container_id: Option<String>,
+    pub port: Option<u16>,
+}
+
+/// Response for `GET /v1/deploys/:deploy_id`.
+#[derive(Debug, Serialize)]
+pub struct DeployStatusResponse {
+    pub deploy_id: String,
+    pub app: String,
+    pub tag: String,
+    pub status: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
 }
 
 // ─── App error ────────────────────────────────────────────────────────────────
@@ -89,6 +120,8 @@ pub struct AppState {
     pub app_states: RwLock<HashMap<String, AppRuntimeState>>,
     /// Recent deploy contexts keyed by deploy_id (capped at 100).
     pub deploys: DashMap<String, DeployContext>,
+    /// Timestamp when the daemon was started (used for uptime calculation).
+    pub started_at: DateTime<Utc>,
 }
 
 impl AppState {
@@ -124,6 +157,11 @@ impl AppState {
 pub fn build_router(state: Arc<AppState>) -> axum::Router {
     axum::Router::new()
         .route("/v1/deploy", axum::routing::post(handle_deploy))
+        .route("/v1/status", axum::routing::get(handle_status))
+        .route(
+            "/v1/deploys/{deploy_id}",
+            axum::routing::get(handle_deploy_status),
+        )
         .with_state(state)
 }
 
@@ -237,6 +275,95 @@ async fn handle_deploy(
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
+// ─── Status handler ───────────────────────────────────────────────────────────
+
+/// `GET /v1/status`
+///
+/// Returns daemon uptime and the runtime status of every configured app.
+async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<StatusResponse>) {
+    let uptime_seconds = (Utc::now() - state.started_at).num_seconds();
+
+    let app_states = state.app_states.read().await;
+
+    let apps = state
+        .apps
+        .keys()
+        .map(|app_name| {
+            let app_status = match app_states.get(app_name) {
+                None => AppStatusResponse {
+                    status: "not_deployed".to_string(),
+                    tag: None,
+                    deployed_at: None,
+                    container_id: None,
+                    port: None,
+                },
+                Some(runtime) => {
+                    let status_str = match runtime.status {
+                        crate::deploy::AppStatus::Running => "running",
+                        crate::deploy::AppStatus::Deploying => "deploying",
+                        crate::deploy::AppStatus::Failed => "failed",
+                        crate::deploy::AppStatus::NotDeployed => "not_deployed",
+                    };
+                    AppStatusResponse {
+                        status: status_str.to_string(),
+                        tag: runtime.current_tag.clone(),
+                        deployed_at: runtime.deployed_at,
+                        container_id: runtime.current_container_id.clone(),
+                        port: runtime.current_port,
+                    }
+                }
+            };
+            (app_name.clone(), app_status)
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(StatusResponse {
+            daemon: "slipd".to_string(),
+            uptime_seconds,
+            apps,
+        }),
+    )
+}
+
+// ─── Deploy status handler ────────────────────────────────────────────────────
+
+/// `GET /v1/deploys/:deploy_id`
+///
+/// Returns the current state of a specific deploy by ID, or 404 if not found.
+async fn handle_deploy_status(
+    State(state): State<Arc<AppState>>,
+    Path(deploy_id): Path<String>,
+) -> Result<(StatusCode, Json<DeployStatusResponse>), AppError> {
+    let ctx = state
+        .deploys
+        .get(&deploy_id)
+        .ok_or_else(|| AppError::NotFound("deploy not found".to_string()))?;
+
+    let status_str = match ctx.status {
+        crate::deploy::DeployStatus::Accepted => "accepted",
+        crate::deploy::DeployStatus::Pulling => "pulling",
+        crate::deploy::DeployStatus::Starting => "starting",
+        crate::deploy::DeployStatus::HealthChecking => "health_checking",
+        crate::deploy::DeployStatus::Switching => "switching",
+        crate::deploy::DeployStatus::Completed => "completed",
+        crate::deploy::DeployStatus::Failed => "failed",
+    };
+
+    let response = DeployStatusResponse {
+        deploy_id: ctx.id.clone(),
+        app: ctx.app.clone(),
+        tag: ctx.tag.clone(),
+        status: status_str.to_string(),
+        started_at: ctx.started_at,
+        finished_at: ctx.finished_at,
+        error: ctx.error.clone(),
+    };
+
+    Ok((StatusCode::OK, Json(response)))
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -250,6 +377,8 @@ mod tests {
     use tokio::sync::RwLock;
     use tower::ServiceExt;
 
+    use chrono::Utc;
+
     use crate::api::{AppState, DeployResponse, ErrorResponse, build_router};
     use crate::auth::compute_signature;
     use crate::caddy::CaddyClient;
@@ -257,6 +386,7 @@ mod tests {
         AppConfig, AppInfo, AuthConfig, CaddyConfig, DeployConfig, HealthConfig, NetworkConfig,
         RegistryConfig, ResourceConfig, RoutingConfig, ServerConfig, SlipConfig, StorageConfig,
     };
+    use crate::deploy::{AppRuntimeState, AppStatus, DeployContext, DeployStatus, TriggerSource};
     use crate::docker::DockerClient;
     use crate::health::HealthChecker;
 
@@ -313,6 +443,7 @@ mod tests {
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
+            started_at: Utc::now(),
         })
     }
 
@@ -532,6 +663,7 @@ mod tests {
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
+            started_at: Utc::now(),
         });
 
         let app = build_router(state_inner);
@@ -574,6 +706,7 @@ mod tests {
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
+            started_at: Utc::now(),
         });
 
         let app = build_router(state);
@@ -591,5 +724,151 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    // ── GET /v1/status — no deploys ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_status_no_deploys() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/status")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(payload["daemon"], "slipd");
+        assert!(payload["uptime_seconds"].as_i64().unwrap() >= 0);
+
+        let apps = &payload["apps"];
+        let testapp = &apps[APP_NAME];
+        assert_eq!(testapp["status"], "not_deployed");
+        assert!(testapp["tag"].is_null());
+        assert!(testapp["container_id"].is_null());
+        assert!(testapp["port"].is_null());
+    }
+
+    // ── GET /v1/status — app with running status ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_status_with_running_app() {
+        let state = create_test_state();
+
+        // Pre-populate runtime state with a Running app.
+        {
+            let mut app_states = state.app_states.write().await;
+            app_states.insert(
+                APP_NAME.to_string(),
+                AppRuntimeState {
+                    status: AppStatus::Running,
+                    current_tag: Some("v1.2.3".to_string()),
+                    current_container_id: Some("abc123".to_string()),
+                    current_port: Some(8080),
+                    deployed_at: Some(Utc::now()),
+                    deploy_id: Some("dep_test".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/status")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let testapp = &payload["apps"][APP_NAME];
+        assert_eq!(testapp["status"], "running");
+        assert_eq!(testapp["tag"], "v1.2.3");
+        assert_eq!(testapp["container_id"], "abc123");
+        assert_eq!(testapp["port"], 8080);
+    }
+
+    // ── GET /v1/deploys/:deploy_id — found ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_deploy_status_found() {
+        let state = create_test_state();
+
+        let ctx = DeployContext {
+            id: "dep_testid123".to_string(),
+            app: APP_NAME.to_string(),
+            image: APP_IMAGE.to_string(),
+            tag: "v2.0.0".to_string(),
+            status: DeployStatus::Completed,
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            error: None,
+            triggered_by: TriggerSource::Webhook,
+            new_container_id: Some("ctr456".to_string()),
+            new_port: Some(9000),
+        };
+        state.deploys.insert(ctx.id.clone(), ctx);
+
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/deploys/dep_testid123")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(payload["deploy_id"], "dep_testid123");
+        assert_eq!(payload["app"], APP_NAME);
+        assert_eq!(payload["tag"], "v2.0.0");
+        assert_eq!(payload["status"], "completed");
+        assert!(payload["finished_at"].is_string());
+        assert!(payload["error"].is_null());
+    }
+
+    // ── GET /v1/deploys/:deploy_id — not found ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_deploy_status_not_found() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/deploys/dep_doesnotexist")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(payload.error.contains("deploy not found"));
     }
 }

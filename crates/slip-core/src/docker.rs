@@ -184,6 +184,17 @@ impl DockerClient {
         Ok(())
     }
 
+    /// Check whether a container exists (regardless of running state).
+    ///
+    /// Uses Docker inspect; returns `false` if the container is not found or
+    /// if the inspect call fails for any reason.
+    pub async fn container_exists(&self, container_id: &str) -> bool {
+        self.docker
+            .inspect_container(container_id, None)
+            .await
+            .is_ok()
+    }
+
     /// Ensure a Docker bridge network with the given name exists.
     ///
     /// If the network already exists this is a no-op.

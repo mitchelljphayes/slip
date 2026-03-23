@@ -6,6 +6,7 @@ pub mod deploy;
 pub mod docker;
 pub mod error;
 pub mod health;
+pub mod state;
 
 // Re-exports for convenience
 pub use api::{AppState, DeployRequest, DeployResponse, build_router};
@@ -21,3 +22,6 @@ pub use deploy::{
 pub use docker::{DockerClient, extract_host_port, parse_cpu_limit, parse_memory_limit};
 pub use error::{CaddyError, ConfigError, DockerError, HealthError};
 pub use health::HealthChecker;
+pub use state::{
+    PersistedAppState, load_app_states, reconcile_routes, save_app_state, verify_containers,
+};

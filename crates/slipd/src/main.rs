@@ -1,10 +1,13 @@
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use chrono::Utc;
 use clap::Parser;
 use dashmap::DashMap;
-use slip_core::{AppState, CaddyClient, DockerClient, HealthChecker, build_router, load_config};
+use slip_core::{
+    AppState, CaddyClient, DockerClient, HealthChecker, build_router, load_app_states, load_config,
+    reconcile_routes, verify_containers,
+};
 use tokio::sync::RwLock;
 
 /// slip deploy daemon — receives webhooks, manages zero-downtime container deploys.
@@ -83,6 +86,15 @@ async fn main() -> anyhow::Result<()> {
     // ── Connect to Caddy ─────────────────────────────────────────────────────
     let caddy = CaddyClient::new(slip_config.caddy.admin_api.clone());
 
+    // ── Load and reconcile persisted state ───────────────────────────────────
+    let state_dir = slip_config.storage.path.join("state");
+    let raw_states = load_app_states(&state_dir).unwrap_or_default();
+    let verified_states = verify_containers(&docker, raw_states).await;
+
+    if let Err(e) = reconcile_routes(&caddy, &verified_states, &apps).await {
+        tracing::warn!(error = %e, "caddy route reconciliation failed on startup (non-fatal)");
+    }
+
     // ── Build application state ──────────────────────────────────────────────
     let state = Arc::new(AppState {
         config: slip_config,
@@ -91,16 +103,15 @@ async fn main() -> anyhow::Result<()> {
         docker,
         caddy,
         health: HealthChecker::new(),
-        app_states: RwLock::new(HashMap::new()),
+        app_states: RwLock::new(verified_states),
         deploys: DashMap::new(),
+        started_at: Utc::now(),
     });
 
     // ── Build router ─────────────────────────────────────────────────────────
     let router = build_router(state);
 
     // TODO: bootstrap (network, Caddy server block)
-    // TODO: load persisted state
-    // TODO: reconcile Caddy routes
 
     // ── Start HTTP server ────────────────────────────────────────────────────
     tracing::info!(%listen_addr, "slipd listening");
