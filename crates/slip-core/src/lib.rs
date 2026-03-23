@@ -15,6 +15,9 @@ pub use config::{
     RegistryConfig, ResourceConfig, RoutingConfig, ServerConfig, SlipConfig, StorageConfig,
     load_config, resolve_env_vars,
 };
+pub use deploy::{
+    AppRuntimeState, AppStatus, DeployContext, DeployStatus, TriggerSource, execute_deploy,
+};
 pub use docker::{DockerClient, extract_host_port, parse_cpu_limit, parse_memory_limit};
 pub use error::{CaddyError, ConfigError, DockerError, HealthError};
 pub use health::HealthChecker;

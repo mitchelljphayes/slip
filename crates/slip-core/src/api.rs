@@ -9,11 +9,15 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, body::Bytes};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::auth::{resolve_secret, verify_signature};
+use crate::caddy::CaddyClient;
 use crate::config::{AppConfig, SlipConfig};
+use crate::deploy::{AppRuntimeState, DeployContext, TriggerSource, execute_deploy};
+use crate::docker::DockerClient;
+use crate::health::HealthChecker;
 
 // ─── Request / Response types ─────────────────────────────────────────────────
 
@@ -75,7 +79,43 @@ pub struct AppState {
     pub apps: HashMap<String, AppConfig>,
     /// Per-app deploy locks; prevents concurrent deploys for the same app.
     pub deploy_locks: DashMap<String, Arc<Mutex<()>>>,
-    // deploy_contexts will be added by SLIP-8
+    /// Docker daemon client.
+    pub docker: DockerClient,
+    /// Caddy admin API client.
+    pub caddy: CaddyClient,
+    /// HTTP health checker.
+    pub health: HealthChecker,
+    /// Runtime state for each app (current container, port, tag, etc.).
+    pub app_states: RwLock<HashMap<String, AppRuntimeState>>,
+    /// Recent deploy contexts keyed by deploy_id (capped at 100).
+    pub deploys: DashMap<String, DeployContext>,
+}
+
+impl AppState {
+    /// Record (insert/update) a deploy context, evicting the oldest entry if
+    /// the map exceeds 100 entries.
+    pub fn record_deploy(&self, ctx: &DeployContext) {
+        self.deploys.insert(ctx.id.clone(), ctx.clone());
+        // Cap at 100 entries — evict one approximate-oldest entry.
+        if self.deploys.len() > 100
+            && let Some(oldest) = self.deploys.iter().next().map(|e| e.key().clone())
+        {
+            self.deploys.remove(&oldest);
+        }
+    }
+
+    /// Build Docker registry credentials from the configured GHCR token, if any.
+    pub fn docker_credentials(&self) -> Option<bollard::auth::DockerCredentials> {
+        self.config
+            .registry
+            .ghcr_token
+            .as_ref()
+            .map(|token| bollard::auth::DockerCredentials {
+                username: Some("slip".to_string()),
+                password: Some(token.clone()),
+                ..Default::default()
+            })
+    }
 }
 
 // ─── Router ───────────────────────────────────────────────────────────────────
@@ -177,24 +217,21 @@ async fn handle_deploy(
         status: "accepted".to_string(),
     };
 
-    // 11. Spawn placeholder task.
-    let app_name = request.app.clone();
-    let tag = request.tag.clone();
+    // 11. Spawn deploy orchestrator.
+    let deploy_ctx = DeployContext::new(
+        deploy_id.clone(),
+        request.app.clone(),
+        request.image.clone(),
+        request.tag.clone(),
+        TriggerSource::Webhook,
+    );
+    state.record_deploy(&deploy_ctx);
+
+    let state_clone = state.clone();
     tokio::spawn(async move {
-        // Lock guard is moved into the task — it will be released when this task ends.
+        // Lock guard is moved into the task — released when the task ends.
         let _guard = guard;
-        info!(
-            deploy_id = %deploy_id,
-            app = %app_name,
-            tag = %tag,
-            "placeholder deploy task started (SLIP-8 will implement real logic)"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        info!(
-            deploy_id = %deploy_id,
-            app = %app_name,
-            "placeholder deploy task finished, lock released"
-        );
+        execute_deploy(state_clone, deploy_ctx).await;
     });
 
     Ok((StatusCode::ACCEPTED, Json(response)))
@@ -209,14 +246,19 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use dashmap::DashMap;
+    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     use crate::api::{AppState, DeployResponse, ErrorResponse, build_router};
     use crate::auth::compute_signature;
+    use crate::caddy::CaddyClient;
     use crate::config::{
         AppConfig, AppInfo, AuthConfig, CaddyConfig, DeployConfig, HealthConfig, NetworkConfig,
         RegistryConfig, ResourceConfig, RoutingConfig, ServerConfig, SlipConfig, StorageConfig,
     };
+    use crate::docker::DockerClient;
+    use crate::health::HealthChecker;
 
     const GLOBAL_SECRET: &str = "global-secret";
     const APP_SECRET: &str = "app-secret";
@@ -265,7 +307,12 @@ mod tests {
         Arc::new(AppState {
             config: test_slip_config(),
             apps,
-            deploy_locks: dashmap::DashMap::new(),
+            deploy_locks: DashMap::new(),
+            docker: DockerClient::new().expect("DockerClient::new"),
+            caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
+            health: HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
         })
     }
 
@@ -480,6 +527,11 @@ mod tests {
             config: test_slip_config(),
             apps,
             deploy_locks,
+            docker: DockerClient::new().expect("DockerClient::new"),
+            caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
+            health: HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
         });
 
         let app = build_router(state_inner);
@@ -516,7 +568,12 @@ mod tests {
         let state = Arc::new(AppState {
             config: test_slip_config(),
             apps,
-            deploy_locks: dashmap::DashMap::new(),
+            deploy_locks: DashMap::new(),
+            docker: DockerClient::new().expect("DockerClient::new"),
+            caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
+            health: HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
         });
 
         let app = build_router(state);

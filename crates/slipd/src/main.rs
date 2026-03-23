@@ -1,8 +1,11 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use clap::Parser;
-use slip_core::{AppState, build_router, load_config};
+use dashmap::DashMap;
+use slip_core::{AppState, CaddyClient, DockerClient, HealthChecker, build_router, load_config};
+use tokio::sync::RwLock;
 
 /// slip deploy daemon — receives webhooks, manages zero-downtime container deploys.
 #[derive(Parser)]
@@ -71,18 +74,30 @@ async fn main() -> anyhow::Result<()> {
         "config loaded"
     );
 
+    // ── Connect to Docker ────────────────────────────────────────────────────
+    let docker = DockerClient::new().map_err(|e| {
+        tracing::error!(error = %e, "failed to connect to Docker daemon");
+        anyhow::anyhow!("Docker connection error: {e}")
+    })?;
+
+    // ── Connect to Caddy ─────────────────────────────────────────────────────
+    let caddy = CaddyClient::new(slip_config.caddy.admin_api.clone());
+
     // ── Build application state ──────────────────────────────────────────────
     let state = Arc::new(AppState {
         config: slip_config,
         apps,
-        deploy_locks: dashmap::DashMap::new(),
+        deploy_locks: DashMap::new(),
+        docker,
+        caddy,
+        health: HealthChecker::new(),
+        app_states: RwLock::new(HashMap::new()),
+        deploys: DashMap::new(),
     });
 
     // ── Build router ─────────────────────────────────────────────────────────
     let router = build_router(state);
 
-    // TODO: connect to Docker  (SLIP-8)
-    // TODO: connect to Caddy   (SLIP-7)
     // TODO: bootstrap (network, Caddy server block)
     // TODO: load persisted state
     // TODO: reconcile Caddy routes
