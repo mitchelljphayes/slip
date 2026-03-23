@@ -1,0 +1,62 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/mitchelljphayes/slip"
+
+[workspace.dependencies]
+# Web framework
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+
+# Docker
+bollard = "0.18"
+
+# HTTP client (Caddy admin API + health checks)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Auth
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+subtle = "2"
+
+# IDs
+ulid = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Concurrency
+dashmap = "6"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async utilities
+futures-util = "0.3"
+
+# Regex (for env var resolution)
+regex = "1"
+
+# Shared crate
+slip-core = { path = "crates/slip-core" }

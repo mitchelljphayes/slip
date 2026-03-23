@@ -1,0 +1,20 @@
+[package]
+name = "slip-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "slip CLI — manage apps, deploys, secrets, and status"
+
+[[bin]]
+name = "slip"
+path = "src/main.rs"
+
+[dependencies]
+slip-core = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
