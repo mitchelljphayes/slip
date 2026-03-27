@@ -178,10 +178,9 @@ mod tests {
         http::StatusCode,
         routing::{get, patch, post},
     };
-    use std::{
-        collections::HashMap,
-        sync::{Arc, Mutex},
-    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     type MockState = Arc<Mutex<HashMap<String, serde_json::Value>>>;
 
@@ -190,7 +189,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     async fn mock_get_server(State(state): State<MockState>) -> StatusCode {
-        let map = state.lock().unwrap();
+        let map = state.lock().await;
         if map.contains_key("__server__") {
             StatusCode::OK
         } else {
@@ -202,7 +201,7 @@ mod tests {
         State(state): State<MockState>,
         axum::Json(body): axum::Json<serde_json::Value>,
     ) -> StatusCode {
-        let mut map = state.lock().unwrap();
+        let mut map = state.lock().await;
         map.insert("__server__".to_string(), body);
         StatusCode::OK
     }
@@ -216,7 +215,7 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("__unknown__")
             .to_string();
-        let mut map = state.lock().unwrap();
+        let mut map = state.lock().await;
         map.insert(id, body);
         StatusCode::OK
     }
@@ -226,7 +225,7 @@ mod tests {
         Path(id): Path<String>,
         axum::Json(body): axum::Json<serde_json::Value>,
     ) -> StatusCode {
-        let mut map = state.lock().unwrap();
+        let mut map = state.lock().await;
         if let std::collections::hash_map::Entry::Occupied(mut e) = map.entry(id) {
             e.insert(body);
             StatusCode::OK
@@ -239,7 +238,7 @@ mod tests {
         State(state): State<MockState>,
         Path(id): Path<String>,
     ) -> StatusCode {
-        let mut map = state.lock().unwrap();
+        let mut map = state.lock().await;
         if map.remove(&id).is_some() {
             StatusCode::OK
         } else {
@@ -283,12 +282,12 @@ mod tests {
         let (port, state) = start_mock_caddy().await;
         let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
 
-        assert!(!state.lock().unwrap().contains_key("__server__"));
+        assert!(!state.lock().await.contains_key("__server__"));
 
         client.bootstrap().await.expect("bootstrap should succeed");
 
         assert!(
-            state.lock().unwrap().contains_key("__server__"),
+            state.lock().await.contains_key("__server__"),
             "server block should have been created"
         );
     }
@@ -301,7 +300,7 @@ mod tests {
         // Pre-populate server block.
         state
             .lock()
-            .unwrap()
+            .await
             .insert("__server__".to_string(), json!({"listen": [":443"]}));
 
         // Should not fail and should not change the existing value.
@@ -310,7 +309,7 @@ mod tests {
             .await
             .expect("idempotent bootstrap should succeed");
 
-        let map = state.lock().unwrap();
+        let map = state.lock().await;
         assert_eq!(
             map["__server__"],
             json!({"listen": [":443"]}),
@@ -328,7 +327,7 @@ mod tests {
             .await
             .expect("set_route should succeed");
 
-        let map = state.lock().unwrap();
+        let map = state.lock().await;
         assert!(
             map.contains_key("slip-walden-api"),
             "route should have been stored"
@@ -345,7 +344,7 @@ mod tests {
         let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
 
         // Pre-populate a route so PATCH will succeed.
-        state.lock().unwrap().insert(
+        state.lock().await.insert(
             "slip-myapp".to_string(),
             json!({"@id": "slip-myapp", "port": 9000}),
         );
@@ -355,7 +354,7 @@ mod tests {
             .await
             .expect("set_route update should succeed");
 
-        let map = state.lock().unwrap();
+        let map = state.lock().await;
         // The route should now reflect the new upstream port.
         let route = &map["slip-myapp"];
         let dial = route["handle"][0]["routes"][0]["handle"][0]["upstreams"][0]["dial"]
@@ -371,7 +370,7 @@ mod tests {
 
         state
             .lock()
-            .unwrap()
+            .await
             .insert("slip-todelete".to_string(), json!({"@id": "slip-todelete"}));
 
         client
@@ -380,7 +379,7 @@ mod tests {
             .expect("remove_route should succeed");
 
         assert!(
-            !state.lock().unwrap().contains_key("slip-todelete"),
+            !state.lock().await.contains_key("slip-todelete"),
             "route should have been removed"
         );
     }
@@ -425,7 +424,7 @@ mod tests {
             .await
             .expect("reconcile should succeed");
 
-        let map = state.lock().unwrap();
+        let map = state.lock().await;
         assert!(
             map.contains_key("slip-app-one"),
             "app-one should be registered"
