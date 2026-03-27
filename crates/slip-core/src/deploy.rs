@@ -156,7 +156,14 @@ pub(crate) async fn execute_deploy_inner(
     mut ctx: DeployContext,
 ) {
     let app_name = ctx.app.clone();
-    let app_config = shared.apps.get(&app_name).unwrap().clone();
+    let app_config = match shared.apps.get(&app_name) {
+        Some(cfg) => cfg.clone(),
+        None => {
+            ctx.fail(&format!("app '{}' not found in config", app_name));
+            record_deploy(shared.deploys, &ctx);
+            return;
+        }
+    };
 
     // ── PULL ─────────────────────────────────────────────────────────────────
     ctx.status = DeployStatus::Pulling;
@@ -209,10 +216,16 @@ pub(crate) async fn execute_deploy_inner(
     ctx.status = DeployStatus::HealthChecking;
     record_deploy(shared.deploys, &ctx);
 
-    if let Err(e) = health
-        .check(ctx.new_port.unwrap(), &app_config.health)
-        .await
-    {
+    let new_port = match ctx.new_port {
+        Some(port) => port,
+        None => {
+            ctx.fail("internal error: port not set after container start");
+            record_deploy(shared.deploys, &ctx);
+            return;
+        }
+    };
+
+    if let Err(e) = health.check(new_port, &app_config.health).await {
         tracing::error!(app = %app_name, error = %e, "health check failed");
         if let Some(ref id) = ctx.new_container_id {
             let _ = docker.stop_and_remove(id).await;
@@ -234,7 +247,7 @@ pub(crate) async fn execute_deploy_inner(
     };
 
     if let Err(e) = caddy
-        .set_route(&app_name, &app_config.routing.domain, ctx.new_port.unwrap())
+        .set_route(&app_name, &app_config.routing.domain, new_port)
         .await
     {
         tracing::error!(app = %app_name, error = %e, "caddy route update failed");

@@ -86,6 +86,19 @@ async fn main() -> anyhow::Result<()> {
     // ── Connect to Caddy ─────────────────────────────────────────────────────
     let caddy = CaddyClient::new(slip_config.caddy.admin_api.clone());
 
+    // ── Bootstrap infrastructure (before state reconciliation) ───────────────
+    docker.ensure_network("slip").await.map_err(|e| {
+        tracing::error!(error = %e, "failed to create Docker network");
+        anyhow::anyhow!("Docker network error: {e}")
+    })?;
+
+    caddy.bootstrap().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to bootstrap Caddy");
+        anyhow::anyhow!("Caddy bootstrap error: {e}")
+    })?;
+
+    tracing::info!("infrastructure bootstrap complete");
+
     // ── Load and reconcile persisted state ───────────────────────────────────
     let state_dir = slip_config.storage.path.join("state");
     let raw_states = load_app_states(&state_dir).unwrap_or_default();
@@ -107,19 +120,6 @@ async fn main() -> anyhow::Result<()> {
         deploys: DashMap::new(),
         started_at: Utc::now(),
     });
-
-    // ── Bootstrap infrastructure ──────────────────────────────────────────────
-    state.docker.ensure_network("slip").await.map_err(|e| {
-        tracing::error!(error = %e, "failed to create Docker network");
-        anyhow::anyhow!("Docker network error: {e}")
-    })?;
-
-    state.caddy.bootstrap().await.map_err(|e| {
-        tracing::error!(error = %e, "failed to bootstrap Caddy");
-        anyhow::anyhow!("Caddy bootstrap error: {e}")
-    })?;
-
-    tracing::info!("infrastructure bootstrap complete");
 
     // ── Build router ─────────────────────────────────────────────────────────
     let router = build_router(state);
