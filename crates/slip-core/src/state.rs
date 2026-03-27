@@ -367,4 +367,217 @@ mod tests {
         assert!(restored.current_container_id.is_none());
         assert!(restored.current_port.is_none());
     }
+
+    // ── Reconcile routes tests ──────────────────────────────────────────────────
+
+    /// Helper to start a mock Caddy server for testing reconcile_routes.
+    /// Returns (port, mock_state) where mock_state tracks the routes.
+    async fn start_mock_caddy_for_reconcile() -> (
+        u16,
+        std::sync::Arc<tokio::sync::Mutex<HashMap<String, serde_json::Value>>>,
+    ) {
+        use axum::{
+            Router,
+            extract::State,
+            http::StatusCode,
+            routing::{get, post},
+        };
+
+        type MockState = std::sync::Arc<tokio::sync::Mutex<HashMap<String, serde_json::Value>>>;
+
+        async fn mock_get_server(State(s): State<MockState>) -> StatusCode {
+            let map = s.lock().await;
+            if map.contains_key("__server__") {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        }
+
+        async fn mock_create_server(
+            State(s): State<MockState>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> StatusCode {
+            let mut map = s.lock().await;
+            map.insert("__server__".to_string(), body);
+            StatusCode::OK
+        }
+
+        async fn mock_add_route(
+            State(s): State<MockState>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> StatusCode {
+            let id = body
+                .get("@id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("__unknown__")
+                .to_string();
+            let mut map = s.lock().await;
+            map.insert(id, body);
+            StatusCode::OK
+        }
+
+        let state: MockState = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let app = Router::new()
+            .route(
+                "/config/apps/http/servers/slip",
+                get(mock_get_server).post(mock_create_server),
+            )
+            .route(
+                "/config/apps/http/servers/slip/routes",
+                post(mock_add_route),
+            )
+            .route("/config/", get(|| async { StatusCode::OK }))
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, state)
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_routes_skips_non_running_apps() {
+        let (port, state) = start_mock_caddy_for_reconcile().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let caddy = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        caddy.bootstrap().await.unwrap();
+
+        // Create app configs
+        let mut app_configs = HashMap::new();
+        app_configs.insert(
+            "app1".to_string(),
+            AppConfig {
+                app: crate::config::AppInfo {
+                    name: "app1".to_string(),
+                    image: "nginx".to_string(),
+                    secret: None,
+                },
+                routing: crate::config::RoutingConfig {
+                    domain: "app1.example.com".to_string(),
+                    port: 80,
+                },
+                health: crate::config::HealthConfig::default(),
+                deploy: crate::config::DeployConfig::default(),
+                network: crate::config::NetworkConfig::default(),
+                resources: crate::config::ResourceConfig::default(),
+                env: HashMap::new(),
+                env_file: None,
+            },
+        );
+
+        // Create states with mixed statuses
+        let mut states = HashMap::new();
+        states.insert(
+            "app1".to_string(),
+            AppRuntimeState {
+                status: AppStatus::Running,
+                current_tag: Some("v1".to_string()),
+                current_port: Some(8080),
+                ..Default::default()
+            },
+        );
+        states.insert(
+            "app2".to_string(),
+            AppRuntimeState {
+                status: AppStatus::Failed,
+                current_tag: Some("v1".to_string()),
+                current_port: Some(8081),
+                ..Default::default()
+            },
+        );
+        states.insert(
+            "app3".to_string(),
+            AppRuntimeState {
+                status: AppStatus::Deploying,
+                current_tag: Some("v1".to_string()),
+                current_port: Some(8082),
+                ..Default::default()
+            },
+        );
+
+        // Reconcile
+        reconcile_routes(&caddy, &states, &app_configs)
+            .await
+            .unwrap();
+
+        // Verify only app1 route was created
+        let map = state.lock().await;
+        assert!(map.contains_key("slip-app1"), "app1 route should exist");
+        assert!(
+            !map.contains_key("slip-app2"),
+            "app2 (Failed) should not have route"
+        );
+        assert!(
+            !map.contains_key("slip-app3"),
+            "app3 (Deploying) should not have route"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_routes_handles_missing_app_config() {
+        let (port, state) = start_mock_caddy_for_reconcile().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let caddy = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        caddy.bootstrap().await.unwrap();
+
+        // App configs only has app1
+        let mut app_configs = HashMap::new();
+        app_configs.insert(
+            "app1".to_string(),
+            AppConfig {
+                app: crate::config::AppInfo {
+                    name: "app1".to_string(),
+                    image: "nginx".to_string(),
+                    secret: None,
+                },
+                routing: crate::config::RoutingConfig {
+                    domain: "app1.example.com".to_string(),
+                    port: 80,
+                },
+                health: crate::config::HealthConfig::default(),
+                deploy: crate::config::DeployConfig::default(),
+                network: crate::config::NetworkConfig::default(),
+                resources: crate::config::ResourceConfig::default(),
+                env: HashMap::new(),
+                env_file: None,
+            },
+        );
+
+        // States have both app1 and app2 (app2 has no config)
+        let mut states = HashMap::new();
+        states.insert(
+            "app1".to_string(),
+            AppRuntimeState {
+                status: AppStatus::Running,
+                current_tag: Some("v1".to_string()),
+                current_port: Some(8080),
+                ..Default::default()
+            },
+        );
+        states.insert(
+            "app2".to_string(),
+            AppRuntimeState {
+                status: AppStatus::Running,
+                current_tag: Some("v1".to_string()),
+                current_port: Some(8081),
+                ..Default::default()
+            },
+        );
+
+        // Reconcile should succeed, skipping app2
+        reconcile_routes(&caddy, &states, &app_configs)
+            .await
+            .unwrap();
+
+        // Verify only app1 route was created
+        let map = state.lock().await;
+        assert!(map.contains_key("slip-app1"), "app1 route should exist");
+        assert!(
+            !map.contains_key("slip-app2"),
+            "app2 (no config) should not have route"
+        );
+    }
 }
