@@ -171,9 +171,11 @@ impl DockerClient {
         network: &str,
         resources: &ResourceConfig,
     ) -> Result<(String, u16), DockerError> {
-        // Container name: slip-{app_name}-{first 12 chars of tag}
+        // Container name: slip-{app_name}-{tag_prefix}-{random_suffix}
+        // Random suffix prevents name collision on re-deploy of same tag
         let tag_prefix = if tag.len() >= 12 { &tag[..12] } else { tag };
-        let container_name = format!("slip-{app_name}-{tag_prefix}");
+        let suffix = &ulid::Ulid::new().to_string()[..8];
+        let container_name = format!("slip-{app_name}-{tag_prefix}-{suffix}");
 
         info!(container_name, image, tag, "creating container");
 

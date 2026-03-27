@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, body::Bytes};
@@ -162,6 +162,7 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
             "/v1/deploys/{deploy_id}",
             axum::routing::get(handle_deploy_status),
         )
+        .layer(DefaultBodyLimit::max(64 * 1024)) // 64 KiB limit
         .with_state(state)
 }
 
