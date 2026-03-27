@@ -109,14 +109,10 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // ── Bootstrap infrastructure ──────────────────────────────────────────────
-    state
-        .docker
-        .ensure_network("slip")
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to create Docker network");
-            anyhow::anyhow!("Docker network error: {e}")
-        })?;
+    state.docker.ensure_network("slip").await.map_err(|e| {
+        tracing::error!(error = %e, "failed to create Docker network");
+        anyhow::anyhow!("Docker network error: {e}")
+    })?;
 
     state.caddy.bootstrap().await.map_err(|e| {
         tracing::error!(error = %e, "failed to bootstrap Caddy");

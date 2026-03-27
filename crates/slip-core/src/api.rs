@@ -438,7 +438,8 @@ mod tests {
             config: test_slip_config(),
             apps,
             deploy_locks: DashMap::new(),
-            docker: DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            docker: DockerClient::new_with_url("http://127.0.0.1:19998")
+                .expect("DockerClient::new"),
             caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
@@ -658,7 +659,8 @@ mod tests {
             config: test_slip_config(),
             apps,
             deploy_locks,
-            docker: DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            docker: DockerClient::new_with_url("http://127.0.0.1:19998")
+                .expect("DockerClient::new"),
             caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
@@ -701,7 +703,8 @@ mod tests {
             config: test_slip_config(),
             apps,
             deploy_locks: DashMap::new(),
-            docker: DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            docker: DockerClient::new_with_url("http://127.0.0.1:19998")
+                .expect("DockerClient::new"),
             caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
