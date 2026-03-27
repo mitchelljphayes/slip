@@ -27,15 +27,6 @@ pub enum ConfigError {
     },
 }
 
-/// Errors related to HMAC signature verification.
-#[derive(Debug, thiserror::Error)]
-pub enum AuthError {
-    #[error("missing X-Slip-Signature header")]
-    MissingSignature,
-    #[error("invalid signature")]
-    InvalidSignature,
-}
-
 /// Errors that can occur during container health checking.
 #[derive(Debug, thiserror::Error)]
 pub enum HealthError {

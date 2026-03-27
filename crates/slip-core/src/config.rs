@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use regex::Regex;
@@ -292,8 +293,8 @@ impl Default for NetworkConfig {
 ///
 /// Returns [`ConfigError::MissingEnvVar`] if any referenced variable is not set.
 pub fn resolve_env_vars(input: &str) -> Result<String, ConfigError> {
-    // Lazily compiled regex; fine for config loading (not a hot path).
-    let re = Regex::new(r"\$\{([^}]+)\}").expect("valid regex");
+    static ENV_VAR_REGEX: OnceLock<Regex> = OnceLock::new();
+    let re = ENV_VAR_REGEX.get_or_init(|| Regex::new(r"\$\{([^}]+)\}").expect("valid regex"));
 
     let mut result = input.to_owned();
     // Collect captures first to avoid borrow issues while mutating `result`.
@@ -307,6 +308,12 @@ pub fn resolve_env_vars(input: &str) -> Result<String, ConfigError> {
         .collect();
 
     for (placeholder, var_name) in vars {
+        if var_name.is_empty() {
+            return Err(ConfigError::MissingEnvVar {
+                var: String::new(),
+                context: format!("empty variable name in {}", input),
+            });
+        }
         let value = std::env::var(&var_name).map_err(|_| ConfigError::MissingEnvVar {
             var: var_name.clone(),
             context: input.to_owned(),

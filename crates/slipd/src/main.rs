@@ -46,17 +46,16 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Config check mode ────────────────────────────────────────────────────
     if args.check {
-        tracing::info!("config check mode — validating and exiting");
         match load_config(config_path) {
             Ok((cfg, apps)) => {
-                tracing::info!(
-                    listen = %cfg.server.listen,
-                    app_count = apps.len(),
-                    "config is valid"
+                println!(
+                    "✓ Configuration is valid ({} apps, listening on {})",
+                    apps.len(),
+                    cfg.server.listen
                 );
             }
             Err(e) => {
-                tracing::error!(error = %e, "config validation failed");
+                eprintln!("✗ Configuration validation failed: {e}");
                 std::process::exit(1);
             }
         }
@@ -81,6 +80,12 @@ async fn main() -> anyhow::Result<()> {
     let docker = DockerClient::new().map_err(|e| {
         tracing::error!(error = %e, "failed to connect to Docker daemon");
         anyhow::anyhow!("Docker connection error: {e}")
+    })?;
+
+    // Verify Docker is reachable (fail fast if not)
+    docker.ping().await.map_err(|e| {
+        tracing::error!(error = %e, "Docker daemon is not responding");
+        anyhow::anyhow!("Docker ping error: {e}")
     })?;
 
     // ── Connect to Caddy ─────────────────────────────────────────────────────

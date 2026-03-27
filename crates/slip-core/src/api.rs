@@ -219,9 +219,20 @@ async fn handle_deploy(
         )));
     }
 
-    // 8. Validate tag is non-empty.
+    // 8. Validate tag is non-empty and contains only valid characters.
     if request.tag.is_empty() {
         return Err(AppError::BadRequest("tag must not be empty".to_string()));
+    }
+    // Docker container names must match [a-zA-Z0-9][a-zA-Z0-9_.-]*
+    // We use the tag in the container name, so validate it here.
+    if !request
+        .tag
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(AppError::BadRequest(
+            "tag contains invalid characters (allowed: alphanumeric, -, _, .)".to_string(),
+        ));
     }
 
     // 9. Try to acquire per-app deploy lock (non-blocking).

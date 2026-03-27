@@ -133,6 +133,14 @@ impl DockerClient {
         Ok(Self { docker })
     }
 
+    /// Ping the Docker daemon to verify connectivity.
+    ///
+    /// Returns Ok(()) if Docker is reachable and responding.
+    pub async fn ping(&self) -> Result<(), DockerError> {
+        self.docker.ping().await?;
+        Ok(())
+    }
+
     /// Pull `image:tag` from a registry, streaming progress to the log.
     ///
     /// `credentials` is passed through to Docker for authenticated registries.
