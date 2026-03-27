@@ -151,19 +151,32 @@ pub async fn verify_containers(
                 verified.insert(app_name, state);
             }
             Some(container_id) => {
-                if docker.container_exists(container_id).await {
-                    tracing::info!(app = %app_name, container_id, "container verified running");
-                    verified.insert(app_name, state);
-                } else {
-                    tracing::warn!(
-                        app = %app_name,
-                        container_id,
-                        "container no longer exists, clearing state"
-                    );
-                    state.current_container_id = None;
-                    state.current_port = None;
-                    state.status = AppStatus::NotDeployed;
-                    verified.insert(app_name, state);
+                match docker.container_exists(container_id).await {
+                    Ok(true) => {
+                        tracing::info!(app = %app_name, container_id, "container verified running");
+                        verified.insert(app_name, state);
+                    }
+                    Ok(false) => {
+                        tracing::warn!(
+                            app = %app_name,
+                            container_id,
+                            "container no longer exists, clearing state"
+                        );
+                        state.current_container_id = None;
+                        state.current_port = None;
+                        state.status = AppStatus::NotDeployed;
+                        verified.insert(app_name, state);
+                    }
+                    Err(e) => {
+                        // Docker error — don't clear state, it might be transient
+                        tracing::warn!(
+                            app = %app_name,
+                            container_id,
+                            error = %e,
+                            "failed to verify container, keeping state"
+                        );
+                        verified.insert(app_name, state);
+                    }
                 }
             }
         }

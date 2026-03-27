@@ -41,11 +41,11 @@ mod duration_serde {
             return Ok(Duration::from_millis(millis));
         }
         if let Some(rest) = s.strip_suffix('s') {
-            let secs: u64 = rest
+            let secs: f64 = rest
                 .trim()
                 .parse()
                 .map_err(|_| format!("invalid duration: '{s}'"))?;
-            return Ok(Duration::from_secs(secs));
+            return Ok(Duration::from_secs_f64(secs));
         }
         if let Some(rest) = s.strip_suffix('m') {
             let mins: u64 = rest

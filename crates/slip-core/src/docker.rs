@@ -306,13 +306,17 @@ impl DockerClient {
 
     /// Check whether a container exists (regardless of running state).
     ///
-    /// Uses Docker inspect; returns `false` if the container is not found or
-    /// if the inspect call fails for any reason.
-    pub async fn container_exists(&self, container_id: &str) -> bool {
-        self.docker
-            .inspect_container(container_id, None)
-            .await
-            .is_ok()
+    /// Returns `Ok(true)` if the container exists.
+    /// Returns `Ok(false)` if the container is not found (404).
+    /// Returns `Err` for other Docker errors (network issues, etc.).
+    pub async fn container_exists(&self, container_id: &str) -> Result<bool, DockerError> {
+        match self.docker.inspect_container(container_id, None).await {
+            Ok(_) => Ok(true),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(false),
+            Err(e) => Err(DockerError::Api(e)),
+        }
     }
 
     /// Check whether a container is currently running.

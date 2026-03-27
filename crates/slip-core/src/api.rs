@@ -50,6 +50,8 @@ pub struct ErrorResponse {
 pub struct StatusResponse {
     pub daemon: String,
     pub uptime_seconds: i64,
+    pub caddy: String,
+    pub docker: String,
     pub apps: HashMap<String, AppStatusResponse>,
 }
 
@@ -294,6 +296,18 @@ async fn handle_deploy(
 async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<StatusResponse>) {
     let uptime_seconds = (Utc::now() - state.started_at).num_seconds();
 
+    // Check Caddy and Docker health
+    let caddy_health = if state.caddy.ping().await.is_ok() {
+        "ok"
+    } else {
+        "error"
+    };
+    let docker_health = if state.docker.ping().await.is_ok() {
+        "ok"
+    } else {
+        "error"
+    };
+
     let app_states = state.app_states.read().await;
 
     let apps = state
@@ -333,6 +347,8 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         Json(StatusResponse {
             daemon: "slipd".to_string(),
             uptime_seconds,
+            caddy: caddy_health.to_string(),
+            docker: docker_health.to_string(),
             apps,
         }),
     )

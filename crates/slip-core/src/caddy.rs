@@ -61,6 +61,17 @@ impl CaddyClient {
         }
     }
 
+    /// Check if Caddy admin API is reachable.
+    pub async fn ping(&self) -> Result<(), CaddyError> {
+        let url = format!("{}/config/", self.base_url);
+        let resp = self.client.get(&url).send().await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(CaddyError::Http(resp.error_for_status().unwrap_err()))
+        }
+    }
+
     /// Ensure the slip HTTP server block exists in Caddy.
     ///
     /// Idempotent: if the block already exists, this is a no-op.

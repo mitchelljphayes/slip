@@ -1709,12 +1709,8 @@ dependencies = [
  "chrono",
  "clap",
  "dashmap",
- "serde",
- "serde_json",
  "slip-core",
  "tokio",
- "tower",
- "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2006,7 +2002,6 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
