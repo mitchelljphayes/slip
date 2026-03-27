@@ -108,10 +108,25 @@ async fn main() -> anyhow::Result<()> {
         started_at: Utc::now(),
     });
 
+    // ── Bootstrap infrastructure ──────────────────────────────────────────────
+    state
+        .docker
+        .ensure_network("slip")
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to create Docker network");
+            anyhow::anyhow!("Docker network error: {e}")
+        })?;
+
+    state.caddy.bootstrap().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to bootstrap Caddy");
+        anyhow::anyhow!("Caddy bootstrap error: {e}")
+    })?;
+
+    tracing::info!("infrastructure bootstrap complete");
+
     // ── Build router ─────────────────────────────────────────────────────────
     let router = build_router(state);
-
-    // TODO: bootstrap (network, Caddy server block)
 
     // ── Start HTTP server ────────────────────────────────────────────────────
     tracing::info!(%listen_addr, "slipd listening");

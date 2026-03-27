@@ -30,6 +30,15 @@ impl DockerClient {
         Ok(Self { docker })
     }
 
+    /// Connect to a Docker daemon at a specific HTTP URL.
+    ///
+    /// Useful for tests (where no real socket exists) or non-default daemon
+    /// addresses. The connection is lazy — no I/O happens until an API call.
+    pub fn new_with_url(url: &str) -> Result<Self, DockerError> {
+        let docker = Docker::connect_with_http(url, 120, bollard::API_DEFAULT_VERSION)?;
+        Ok(Self { docker })
+    }
+
     /// Pull `image:tag` from a registry, streaming progress to the log.
     ///
     /// `credentials` is passed through to Docker for authenticated registries.
