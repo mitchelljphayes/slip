@@ -17,6 +17,86 @@ use tracing::{debug, info, warn};
 use crate::config::ResourceConfig;
 use crate::error::DockerError;
 
+// ─── Trait ────────────────────────────────────────────────────────────────────
+
+/// Abstraction over Docker container lifecycle operations used by the deploy
+/// orchestrator. Implemented by [`DockerClient`]; can be mocked in tests.
+pub trait ContainerRuntime: Send + Sync {
+    /// Pull `image:tag` from a registry.
+    fn pull_image<'a>(
+        &'a self,
+        image: &'a str,
+        tag: &'a str,
+        credentials: Option<bollard::auth::DockerCredentials>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>;
+
+    /// Create and start a container; returns `(container_id, host_port)`.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn create_and_start<'a>(
+        &'a self,
+        app_name: &'a str,
+        image: &'a str,
+        tag: &'a str,
+        container_port: u16,
+        env_vars: Vec<String>,
+        network: &'a str,
+        resources: &'a ResourceConfig,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(String, u16), DockerError>> + Send + 'a>,
+    >;
+
+    /// Stop and remove a container by ID.
+    fn stop_and_remove<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>;
+}
+
+impl ContainerRuntime for DockerClient {
+    fn pull_image<'a>(
+        &'a self,
+        image: &'a str,
+        tag: &'a str,
+        credentials: Option<bollard::auth::DockerCredentials>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>
+    {
+        Box::pin(DockerClient::pull_image(self, image, tag, credentials))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn create_and_start<'a>(
+        &'a self,
+        app_name: &'a str,
+        image: &'a str,
+        tag: &'a str,
+        container_port: u16,
+        env_vars: Vec<String>,
+        network: &'a str,
+        resources: &'a ResourceConfig,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(String, u16), DockerError>> + Send + 'a>,
+    > {
+        Box::pin(DockerClient::create_and_start(
+            self,
+            app_name,
+            image,
+            tag,
+            container_port,
+            env_vars,
+            network,
+            resources,
+        ))
+    }
+
+    fn stop_and_remove<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>
+    {
+        Box::pin(DockerClient::stop_and_remove(self, container_id))
+    }
+}
+
 /// A thin wrapper around [`bollard::Docker`] providing higher-level container
 /// lifecycle operations used by the slip deploy daemon.
 pub struct DockerClient {

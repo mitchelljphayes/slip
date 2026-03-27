@@ -10,7 +10,7 @@ pub mod state;
 
 // Re-exports for convenience
 pub use api::{AppState, DeployRequest, DeployResponse, build_router};
-pub use caddy::{CaddyClient, RouteInfo};
+pub use caddy::{CaddyClient, ReverseProxy, RouteInfo};
 pub use config::{
     AppConfig, AppInfo, CaddyConfig, DeployConfig, EnvFileConfig, HealthConfig, NetworkConfig,
     RegistryConfig, ResourceConfig, RoutingConfig, ServerConfig, SlipConfig, StorageConfig,
@@ -19,9 +19,11 @@ pub use config::{
 pub use deploy::{
     AppRuntimeState, AppStatus, DeployContext, DeployStatus, TriggerSource, execute_deploy,
 };
-pub use docker::{DockerClient, extract_host_port, parse_cpu_limit, parse_memory_limit};
+pub use docker::{
+    ContainerRuntime, DockerClient, extract_host_port, parse_cpu_limit, parse_memory_limit,
+};
 pub use error::{CaddyError, ConfigError, DockerError, HealthError};
-pub use health::HealthChecker;
+pub use health::{HealthCheck, HealthChecker};
 pub use state::{
     PersistedAppState, load_app_states, reconcile_routes, save_app_state, verify_containers,
 };

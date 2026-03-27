@@ -5,6 +5,30 @@ use tracing::{info, warn};
 use crate::config::HealthConfig;
 use crate::error::HealthError;
 
+// ─── Trait ────────────────────────────────────────────────────────────────────
+
+/// Abstraction over container health checking used by the deploy orchestrator.
+/// Implemented by [`HealthChecker`]; can be mocked in tests.
+pub trait HealthCheck: Send + Sync {
+    /// Check the health of a container listening on `host_port`.
+    fn check<'a>(
+        &'a self,
+        host_port: u16,
+        config: &'a HealthConfig,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), HealthError>> + Send + 'a>>;
+}
+
+impl HealthCheck for HealthChecker {
+    fn check<'a>(
+        &'a self,
+        host_port: u16,
+        config: &'a HealthConfig,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), HealthError>> + Send + 'a>>
+    {
+        Box::pin(HealthChecker::check(self, host_port, config))
+    }
+}
+
 /// Polls a container's HTTP health endpoint until it responds successfully or
 /// all retries are exhausted.
 pub struct HealthChecker {

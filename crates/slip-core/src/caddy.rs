@@ -3,6 +3,37 @@
 use crate::error::CaddyError;
 use serde_json::json;
 
+// ─── Trait ────────────────────────────────────────────────────────────────────
+
+/// Abstraction over reverse-proxy route management used by the deploy
+/// orchestrator. Implemented by [`CaddyClient`]; can be mocked in tests.
+pub trait ReverseProxy: Send + Sync {
+    /// Create or update the reverse-proxy route for an app.
+    fn set_route<'a>(
+        &'a self,
+        app_name: &'a str,
+        domain: &'a str,
+        upstream_port: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>;
+}
+
+impl ReverseProxy for CaddyClient {
+    fn set_route<'a>(
+        &'a self,
+        app_name: &'a str,
+        domain: &'a str,
+        upstream_port: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>
+    {
+        Box::pin(CaddyClient::set_route(
+            self,
+            app_name,
+            domain,
+            upstream_port,
+        ))
+    }
+}
+
 /// Info needed to reconcile a single app's route.
 pub struct RouteInfo {
     pub app_name: String,
