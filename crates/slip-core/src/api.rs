@@ -109,6 +109,12 @@ pub struct AppState {
     /// Per-application configurations keyed by app name.
     pub apps: HashMap<String, AppConfig>,
     /// Per-app deploy locks; prevents concurrent deploys for the same app.
+    ///
+    /// Entries are created on first deploy and never removed. This is bounded by
+    /// the number of registered apps in the config. If hot-reload is added in
+    /// Phase 2, we'll need to clean up locks for removed apps.
+    ///
+    /// TODO(Phase 2): Add cleanup when apps are removed during hot-reload.
     pub deploy_locks: DashMap<String, Arc<Mutex<()>>>,
     /// Docker daemon client.
     pub docker: DockerClient,
