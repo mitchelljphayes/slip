@@ -65,4 +65,6 @@ pub enum DockerError {
     PullFailed(String),
     #[error("no host port assigned to container")]
     NoPortAssigned,
+    #[error("container {0} is not running after start")]
+    ContainerNotRunning(String),
 }

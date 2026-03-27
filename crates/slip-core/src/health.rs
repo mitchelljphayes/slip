@@ -45,14 +45,20 @@ impl HealthChecker {
 
     /// Check the health of a container listening on `host_port`.
     ///
-    /// - If `config.path` is `None` → returns `Ok(())` immediately.
+    /// - If `config.path` is `None` → waits for `start_period` then returns `Ok(())`.
+    ///   This gives the container time to start before traffic is switched.
     /// - Otherwise builds `http://127.0.0.1:{host_port}{path}`, waits
     ///   `start_period`, then polls up to `retries` times with `timeout` per
     ///   request and `interval` between failures.
     pub async fn check(&self, host_port: u16, config: &HealthConfig) -> Result<(), HealthError> {
         let path = match &config.path {
             Some(p) => p.clone(),
-            None => return Ok(()),
+            None => {
+                // No health check path configured — wait for start_period to give
+                // the container time to initialize, then return success.
+                tokio::time::sleep(config.start_period).await;
+                return Ok(());
+            }
         };
 
         let url = format!("http://127.0.0.1:{host_port}{path}");

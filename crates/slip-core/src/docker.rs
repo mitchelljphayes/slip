@@ -50,6 +50,12 @@ pub trait ContainerRuntime: Send + Sync {
         &'a self,
         container_id: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>;
+
+    /// Check if a container is currently running.
+    fn container_is_running<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, DockerError>> + Send + 'a>>;
 }
 
 impl ContainerRuntime for DockerClient {
@@ -94,6 +100,14 @@ impl ContainerRuntime for DockerClient {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>
     {
         Box::pin(DockerClient::stop_and_remove(self, container_id))
+    }
+
+    fn container_is_running<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, DockerError>> + Send + 'a>>
+    {
+        Box::pin(DockerClient::container_is_running(self, container_id))
     }
 }
 
@@ -233,11 +247,18 @@ impl DockerClient {
             .start_container(&container_id, None::<StartContainerOptions<String>>)
             .await?;
 
-        // Inspect to find the assigned host port
+        // Inspect to find the assigned host port and verify container is running
         let info = self.docker.inspect_container(&container_id, None).await?;
 
+        // Verify the container is actually running (not crashed immediately)
+        let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
+        if !running {
+            warn!(container_id, "container is not running after start");
+            return Err(DockerError::ContainerNotRunning(container_id));
+        }
+
         let host_port = extract_host_port(&info, container_port)?;
-        info!(container_id, host_port, "container started");
+        info!(container_id, host_port, "container started and running");
 
         Ok((container_id, host_port))
     }
@@ -284,6 +305,17 @@ impl DockerClient {
             .inspect_container(container_id, None)
             .await
             .is_ok()
+    }
+
+    /// Check whether a container is currently running.
+    ///
+    /// Returns `Ok(true)` if the container exists and its state is "running".
+    /// Returns `Ok(false)` if the container exists but is not running.
+    /// Returns `Err` if the inspect call fails (e.g., container not found).
+    pub async fn container_is_running(&self, container_id: &str) -> Result<bool, DockerError> {
+        let info = self.docker.inspect_container(container_id, None).await?;
+        let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
+        Ok(running)
     }
 
     /// Ensure a Docker bridge network with the given name exists.

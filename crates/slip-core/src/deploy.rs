@@ -235,6 +235,26 @@ pub(crate) async fn execute_deploy_inner(
         return;
     }
 
+    // Verify container is still running after health check wait
+    // (container could have crashed during start_period wait)
+    if let Some(ref id) = ctx.new_container_id {
+        match docker.container_is_running(id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::error!(app = %app_name, container_id = %id, "container not running after health check");
+                ctx.fail("container exited during health check");
+                record_deploy(shared.deploys, &ctx);
+                return;
+            }
+            Err(e) => {
+                tracing::error!(app = %app_name, error = %e, "failed to verify container state");
+                ctx.fail(&format!("container state check failed: {e}"));
+                record_deploy(shared.deploys, &ctx);
+                return;
+            }
+        }
+    }
+
     // ── SWITCH ───────────────────────────────────────────────────────────────
     ctx.status = DeployStatus::Switching;
     record_deploy(shared.deploys, &ctx);
@@ -437,6 +457,16 @@ mod tests {
         {
             self.stop_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
+        }
+
+        fn container_is_running<'a>(
+            &'a self,
+            _container_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, DockerError>> + Send + 'a>,
+        > {
+            // Mock containers are always running unless explicitly set otherwise
+            Box::pin(async { Ok(true) })
         }
     }
 
