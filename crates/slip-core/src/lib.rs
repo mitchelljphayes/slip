@@ -18,6 +18,7 @@ pub use config::{
 };
 pub use deploy::{
     AppRuntimeState, AppStatus, DeployContext, DeployStatus, TriggerSource, execute_deploy,
+    record_deploy,
 };
 pub use docker::{
     ContainerRuntime, DockerClient, extract_host_port, parse_cpu_limit, parse_memory_limit,

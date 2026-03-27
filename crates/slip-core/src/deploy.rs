@@ -161,9 +161,18 @@ pub(crate) async fn execute_deploy_inner(
         None => {
             ctx.fail(&format!("app '{}' not found in config", app_name));
             record_deploy(shared.deploys, &ctx);
+            set_app_failed(shared.app_states, &app_name);
             return;
         }
     };
+
+    // Set app status to Deploying at the start
+    {
+        let mut states = shared.app_states.write().await;
+        if let Some(app_state) = states.get_mut(&app_name) {
+            app_state.status = AppStatus::Deploying;
+        }
+    }
 
     // ── PULL ─────────────────────────────────────────────────────────────────
     ctx.status = DeployStatus::Pulling;
@@ -181,6 +190,7 @@ pub(crate) async fn execute_deploy_inner(
     {
         ctx.fail(&format!("image pull failed: {e}"));
         record_deploy(shared.deploys, &ctx);
+        set_app_failed(shared.app_states, &app_name);
         return;
     }
 
@@ -208,6 +218,7 @@ pub(crate) async fn execute_deploy_inner(
         Err(e) => {
             ctx.fail(&format!("container start failed: {e}"));
             record_deploy(shared.deploys, &ctx);
+            set_app_failed(shared.app_states, &app_name);
             return;
         }
     }
@@ -221,6 +232,7 @@ pub(crate) async fn execute_deploy_inner(
         None => {
             ctx.fail("internal error: port not set after container start");
             record_deploy(shared.deploys, &ctx);
+            set_app_failed(shared.app_states, &app_name);
             return;
         }
     };
@@ -232,6 +244,7 @@ pub(crate) async fn execute_deploy_inner(
         }
         ctx.fail(&format!("health check failed: {e}"));
         record_deploy(shared.deploys, &ctx);
+        set_app_failed(shared.app_states, &app_name);
         return;
     }
 
@@ -244,12 +257,14 @@ pub(crate) async fn execute_deploy_inner(
                 tracing::error!(app = %app_name, container_id = %id, "container not running after health check");
                 ctx.fail("container exited during health check");
                 record_deploy(shared.deploys, &ctx);
+                set_app_failed(shared.app_states, &app_name);
                 return;
             }
             Err(e) => {
                 tracing::error!(app = %app_name, error = %e, "failed to verify container state");
                 ctx.fail(&format!("container state check failed: {e}"));
                 record_deploy(shared.deploys, &ctx);
+                set_app_failed(shared.app_states, &app_name);
                 return;
             }
         }
@@ -276,6 +291,7 @@ pub(crate) async fn execute_deploy_inner(
         }
         ctx.fail(&format!("caddy route update failed: {e}"));
         record_deploy(shared.deploys, &ctx);
+        set_app_failed(shared.app_states, &app_name);
         return;
     }
 
@@ -327,12 +343,27 @@ pub(crate) async fn execute_deploy_inner(
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
 
-fn record_deploy(deploys: &DashMap<String, DeployContext>, ctx: &DeployContext) {
+/// Record (insert/update) a deploy context, evicting an entry if the map exceeds 100.
+///
+/// Note: Current eviction uses `DashMap::iter().next()` which returns an arbitrary
+/// (not oldest) entry. For proper FIFO eviction, we'd need to track insertion order
+/// with a separate VecDeque. This is acceptable for Phase 1 but should be improved
+/// in Phase 2.
+pub fn record_deploy(deploys: &DashMap<String, DeployContext>, ctx: &DeployContext) {
     deploys.insert(ctx.id.clone(), ctx.clone());
     if deploys.len() > 100
         && let Some(oldest) = deploys.iter().next().map(|e| e.key().clone())
     {
         deploys.remove(&oldest);
+    }
+}
+
+/// Set the app status to Failed in the shared state.
+fn set_app_failed(app_states: &RwLock<HashMap<String, AppRuntimeState>>, app_name: &str) {
+    if let Ok(mut states) = app_states.try_write()
+        && let Some(app_state) = states.get_mut(app_name)
+    {
+        app_state.status = AppStatus::Failed;
     }
 }
 

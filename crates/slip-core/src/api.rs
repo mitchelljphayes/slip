@@ -125,16 +125,9 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Record (insert/update) a deploy context, evicting the oldest entry if
-    /// the map exceeds 100 entries.
+    /// Record (insert/update) a deploy context, evicting an entry if the map exceeds 100.
     pub fn record_deploy(&self, ctx: &DeployContext) {
-        self.deploys.insert(ctx.id.clone(), ctx.clone());
-        // Cap at 100 entries — evict one approximate-oldest entry.
-        if self.deploys.len() > 100
-            && let Some(oldest) = self.deploys.iter().next().map(|e| e.key().clone())
-        {
-            self.deploys.remove(&oldest);
-        }
+        crate::deploy::record_deploy(&self.deploys, ctx);
     }
 
     /// Build Docker registry credentials from the configured GHCR token, if any.
