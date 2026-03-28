@@ -175,14 +175,21 @@ slipd (on server)
 ### CI is minimal
 
 ```yaml
-# .github/workflows/deploy.yml
+# .github/workflows/deploy.yml — simple single-image deploy
 - run: |
     curl -X POST https://slip.example.com/v1/deploy \
       -H "X-Slip-Signature: sha256=$(echo -n '{"app":"stat-stream","tag":"${{ github.sha }}"}' | openssl dgst -sha256 -hmac ${{ secrets.SLIP_SECRET }} | cut -d' ' -f2)" \
       -d '{"app":"stat-stream","tag":"${{ github.sha }}"}'
 ```
 
-CI doesn't know about domains, secrets, or infrastructure. It just says "deploy this tag."
+```yaml
+# Multi-image deploy — tag applies to primary image, override specific sidecars
+- run: |
+    curl -X POST https://slip.example.com/v1/deploy \
+      -d '{"app":"stat-stream","tag":"v1.2.3","images":{"dagster-daemon":"ghcr.io/me/statstream-dagster:v1.2.3"}}'
+```
+
+CI doesn't know about domains, secrets, or infrastructure. It just says "deploy this tag." The `images` map is optional — only needed when updating sidecar images alongside the primary.
 
 ---
 
@@ -339,6 +346,7 @@ PR #42 closed  → slip tears down preview + cleans up resources
 enabled = true
 ttl = "72h"                     # auto-teardown after 72 hours
 max = 5                         # max concurrent previews for this app
+resources = { memory = "256m", cpus = "0.5" }   # resource requests for previews
 
 [preview.database]
 strategy = "shared"             # no migration, use staging DB as-is
@@ -363,25 +371,83 @@ strategy = "shared"             # no migration, use staging DB as-is
 name = "stat-stream"
 domain = "stat-stream.example.com"
 preview_domain = "*.stat-stream.preview.dev"    # wildcard DNS + TLS
+preview_max = 3                                 # override: fewer previews
+preview_resources = { memory = "128m", cpus = "0.25" }  # override: smaller
 ```
+
+Server caps override repo requests. Production resources are reserved separately — previews only use what's left.
 
 ### API
 
 ```
-# Create/update a preview
+# Create/update a preview (CI calls this on PR open + push)
 POST /v1/deploy
 {
   "app": "stat-stream",
-  "tag": "pr-42-abc123",
+  "tag": "abc123def456",
   "preview": {
-    "id": "pr-42",              # unique preview identifier
-    "pr_number": 42,            # for GitHub integration
-    "repo": "me/stat-stream"    # for PR comments
+    "id": "pr-42",              # used for subdomain: pr-42.stat-stream.preview.dev
+    "sha": "abc123def456"       # tracked in deploy metadata
   }
 }
 
-# Tear down a preview
+# Tear down a preview (CI calls this on PR close/merge)
 DELETE /v1/previews/stat-stream/pr-42
+```
+
+### Example CI workflow
+
+```yaml
+# .github/workflows/preview.yml
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and push
+        run: |
+          docker build -t ghcr.io/me/statstream-api:${{ github.sha }} .
+          docker push ghcr.io/me/statstream-api:${{ github.sha }}
+
+      - name: Deploy preview
+        run: |
+          PAYLOAD='{"app":"stat-stream","tag":"${{ github.sha }}","preview":{"id":"pr-${{ github.event.number }}","sha":"${{ github.sha }}"}}'
+          SIG=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "${{ secrets.SLIP_SECRET }}" | cut -d' ' -f2)
+          RESPONSE=$(curl -s -X POST https://slip.example.com/v1/deploy \
+            -H "X-Slip-Signature: sha256=$SIG" \
+            -d "$PAYLOAD")
+          echo "Deploy ID: $(echo $RESPONSE | jq -r '.deploy_id')"
+
+      - name: Comment preview URL
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `Preview deployed: https://pr-${context.issue.number}.stat-stream.preview.dev`
+            })
+
+---
+# .github/workflows/preview-cleanup.yml
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  teardown:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Teardown preview
+        run: |
+          curl -X DELETE https://slip.example.com/v1/previews/stat-stream/pr-${{ github.event.number }} \
+            -H "X-Slip-Signature: sha256=..."
 ```
 
 ### Preview deploy flow
@@ -668,12 +734,12 @@ slip validate --strict                   # also check image references exist
 
 | Task | Effort |
 |------|--------|
-| Preview deploy endpoint (new fields in webhook) | 1 day |
-| Preview routing (dynamic subdomains, Caddy wildcard) | 2 days |
-| Preview lifecycle (TTL, max limit, eviction) | 2 days |
+| Preview deploy endpoint (preview context in webhook) | 1 day |
+| Preview routing (dynamic subdomains via PR number, Caddy wildcard) | 2 days |
+| Preview lifecycle (TTL timer, max limit, eviction of oldest) | 2 days |
 | Post-deploy hooks (`exec_in_container` for migrate/seed) | 1 day |
-| GitHub integration (PR comments, status checks) | 2 days |
-| Preview teardown (on PR close, TTL, manual) | 1 day |
+| Preview teardown endpoint (`DELETE /v1/previews/:app/:id`) | 1 day |
+| Preview resource limits (repo requests, server caps) | 1 day |
 
 ### Phase 2e: Database Branching (~1 week)
 
@@ -723,13 +789,11 @@ Priority order: 2a → 2b → 2c → 2d → 2f → 2e
 4. **Pod orchestration**: `podman kube play` — don't reimplement.
 5. **Preview databases**: Pluggable strategies. slip provides hooks, doesn't know about ORMs.
 6. **Persistent volumes**: Host paths only. Volume lifecycle is the operator's job.
+7. **Preview subdomains**: Use PR number for subdomain (`pr-42.app.preview.dev`). Track commit SHA in deploy metadata for knowing which commit is live.
+8. **Preview lifecycle**: CI sends lifecycle webhooks (deploy on PR open/push, teardown on PR close). slip doesn't talk to GitHub directly. PR comments with preview URL are CI's job. A GitHub App can be added later as a nice-to-have.
+9. **Multi-image pods**: Tag in webhook applies to the primary image only (the one matching `[app] image`). Sidecars use pinned tags from `pod.yaml`. Optional `images` map in webhook payload for overriding specific sidecar tags when needed.
+10. **Preview resources**: Repo declares preview resource requests in `[preview] resources`. Server can override with caps in `[[apps]] preview_resources`. Max preview count + TTL prevents oversubscription. Production resources are reserved separately.
 
 ## Open Questions
 
 1. **Wildcard TLS for preview domains** — Caddy supports DNS challenge for wildcard certs. Which DNS providers to support out of the box? (Cloudflare is most common.)
-
-2. **GitHub App vs webhook for PR lifecycle** — GitHub App gives us PR close events natively. Webhook requires CI to call teardown. GitHub App is better UX but more setup.
-
-3. **Multi-image pods** — When a pod has 3 container images, does `POST /v1/deploy { tag }` apply the tag to all of them? Or just the primary? Probably just the primary (the one matching `app.image`), and sidecars use pinned tags.
-
-4. **Preview resource limits** — Should previews automatically get reduced resources (e.g., half the production limits)? Or is this configurable per-app?
