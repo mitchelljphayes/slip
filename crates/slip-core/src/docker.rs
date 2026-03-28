@@ -1,6 +1,7 @@
 //! Docker client wrapper around bollard for container lifecycle management.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 
 use bollard::Docker;
 use bollard::auth::DockerCredentials;
@@ -15,101 +16,8 @@ use futures_util::StreamExt;
 use tracing::{debug, info, warn};
 
 use crate::config::ResourceConfig;
-use crate::error::DockerError;
-
-// ─── Trait ────────────────────────────────────────────────────────────────────
-
-/// Abstraction over Docker container lifecycle operations used by the deploy
-/// orchestrator. Implemented by [`DockerClient`]; can be mocked in tests.
-pub trait ContainerRuntime: Send + Sync {
-    /// Pull `image:tag` from a registry.
-    fn pull_image<'a>(
-        &'a self,
-        image: &'a str,
-        tag: &'a str,
-        credentials: Option<bollard::auth::DockerCredentials>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>;
-
-    /// Create and start a container; returns `(container_id, host_port)`.
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn create_and_start<'a>(
-        &'a self,
-        app_name: &'a str,
-        image: &'a str,
-        tag: &'a str,
-        container_port: u16,
-        env_vars: Vec<String>,
-        network: &'a str,
-        resources: &'a ResourceConfig,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(String, u16), DockerError>> + Send + 'a>,
-    >;
-
-    /// Stop and remove a container by ID.
-    fn stop_and_remove<'a>(
-        &'a self,
-        container_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>;
-
-    /// Check if a container is currently running.
-    fn container_is_running<'a>(
-        &'a self,
-        container_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, DockerError>> + Send + 'a>>;
-}
-
-impl ContainerRuntime for DockerClient {
-    fn pull_image<'a>(
-        &'a self,
-        image: &'a str,
-        tag: &'a str,
-        credentials: Option<bollard::auth::DockerCredentials>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>
-    {
-        Box::pin(DockerClient::pull_image(self, image, tag, credentials))
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn create_and_start<'a>(
-        &'a self,
-        app_name: &'a str,
-        image: &'a str,
-        tag: &'a str,
-        container_port: u16,
-        env_vars: Vec<String>,
-        network: &'a str,
-        resources: &'a ResourceConfig,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(String, u16), DockerError>> + Send + 'a>,
-    > {
-        Box::pin(DockerClient::create_and_start(
-            self,
-            app_name,
-            image,
-            tag,
-            container_port,
-            env_vars,
-            network,
-            resources,
-        ))
-    }
-
-    fn stop_and_remove<'a>(
-        &'a self,
-        container_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>
-    {
-        Box::pin(DockerClient::stop_and_remove(self, container_id))
-    }
-
-    fn container_is_running<'a>(
-        &'a self,
-        container_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, DockerError>> + Send + 'a>>
-    {
-        Box::pin(DockerClient::container_is_running(self, container_id))
-    }
-}
+use crate::error::{DockerError, RuntimeError};
+use crate::runtime::{RegistryCredentials, RuntimeBackend};
 
 /// A thin wrapper around [`bollard::Docker`] providing higher-level container
 /// lifecycle operations used by the slip deploy daemon.
@@ -367,6 +275,113 @@ impl DockerClient {
 
         info!(name, "network created");
         Ok(())
+    }
+}
+
+// ─── RuntimeBackend impl ──────────────────────────────────────────────────────
+
+impl RuntimeBackend for DockerClient {
+    fn name(&self) -> &str {
+        "docker"
+    }
+
+    fn ping(
+        &self,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + '_>> {
+        Box::pin(async {
+            DockerClient::ping(self)
+                .await
+                .map_err(|e| RuntimeError::Connection(e.to_string()))
+        })
+    }
+
+    fn ensure_network<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            DockerClient::ensure_network(self, name)
+                .await
+                .map_err(|e| RuntimeError::NetworkError(e.to_string()))
+        })
+    }
+
+    fn pull_image<'a>(
+        &'a self,
+        image: &'a str,
+        tag: &'a str,
+        credentials: Option<RegistryCredentials>,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            let creds = credentials.map(|c| DockerCredentials {
+                username: Some(c.username),
+                password: Some(c.password),
+                ..Default::default()
+            });
+            DockerClient::pull_image(self, image, tag, creds)
+                .await
+                .map_err(|e| RuntimeError::PullFailed(e.to_string()))
+        })
+    }
+
+    fn create_and_start<'a>(
+        &'a self,
+        app_name: &'a str,
+        image: &'a str,
+        tag: &'a str,
+        container_port: u16,
+        env_vars: Vec<String>,
+        network: &'a str,
+        resources: &'a ResourceConfig,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(String, u16), RuntimeError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            DockerClient::create_and_start(
+                self,
+                app_name,
+                image,
+                tag,
+                container_port,
+                env_vars,
+                network,
+                resources,
+            )
+            .await
+            .map_err(RuntimeError::from)
+        })
+    }
+
+    fn stop_and_remove<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            DockerClient::stop_and_remove(self, container_id)
+                .await
+                .map_err(RuntimeError::from)
+        })
+    }
+
+    fn container_is_running<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<bool, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            DockerClient::container_is_running(self, container_id)
+                .await
+                .map_err(RuntimeError::from)
+        })
+    }
+
+    fn container_exists<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<bool, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            DockerClient::container_exists(self, container_id)
+                .await
+                .map_err(RuntimeError::from)
+        })
     }
 }
 

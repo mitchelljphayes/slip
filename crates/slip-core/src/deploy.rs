@@ -11,8 +11,8 @@ use tokio::sync::RwLock;
 use crate::api::AppState;
 use crate::caddy::ReverseProxy;
 use crate::config::{AppConfig, SlipConfig};
-use crate::docker::ContainerRuntime;
 use crate::health::HealthCheck;
+use crate::runtime::{RegistryCredentials, RuntimeBackend};
 use crate::state;
 
 // ─── Status types ─────────────────────────────────────────────────────────────
@@ -125,7 +125,7 @@ pub(crate) struct DeploySharedState<'a> {
     pub apps: &'a HashMap<String, AppConfig>,
     pub app_states: &'a RwLock<HashMap<String, AppRuntimeState>>,
     pub deploys: &'a DashMap<String, DeployContext>,
-    pub credentials: Option<bollard::auth::DockerCredentials>,
+    pub credentials: Option<RegistryCredentials>,
 }
 
 // ─── Core orchestrator ────────────────────────────────────────────────────────
@@ -141,16 +141,23 @@ pub async fn execute_deploy(state: Arc<AppState>, ctx: DeployContext) {
         apps: &state.apps,
         app_states: &state.app_states,
         deploys: &state.deploys,
-        credentials: state.docker_credentials(),
+        credentials: state.registry_credentials(),
     };
-    execute_deploy_inner(shared, &state.docker, &state.caddy, &state.health, ctx).await;
+    execute_deploy_inner(
+        shared,
+        state.runtime.as_ref(),
+        &state.caddy,
+        &state.health,
+        ctx,
+    )
+    .await;
 }
 
 /// Inner deploy state machine — generic over trait objects so it can be driven
 /// from tests with mock implementations.
 pub(crate) async fn execute_deploy_inner(
     shared: DeploySharedState<'_>,
-    docker: &dyn ContainerRuntime,
+    runtime: &dyn RuntimeBackend,
     caddy: &dyn ReverseProxy,
     health: &dyn HealthCheck,
     mut ctx: DeployContext,
@@ -184,7 +191,7 @@ pub(crate) async fn execute_deploy_inner(
         "pulling image"
     );
 
-    if let Err(e) = docker
+    if let Err(e) = runtime
         .pull_image(&ctx.image, &ctx.tag, shared.credentials)
         .await
     {
@@ -199,7 +206,7 @@ pub(crate) async fn execute_deploy_inner(
     record_deploy(shared.deploys, &ctx);
 
     let env_vars = resolve_env_vars_for_app(&app_config);
-    match docker
+    match runtime
         .create_and_start(
             &app_name,
             &ctx.image,
@@ -240,7 +247,7 @@ pub(crate) async fn execute_deploy_inner(
     if let Err(e) = health.check(new_port, &app_config.health).await {
         tracing::error!(app = %app_name, error = %e, "health check failed");
         if let Some(ref id) = ctx.new_container_id {
-            let _ = docker.stop_and_remove(id).await;
+            let _ = runtime.stop_and_remove(id).await;
         }
         ctx.fail(&format!("health check failed: {e}"));
         record_deploy(shared.deploys, &ctx);
@@ -251,7 +258,7 @@ pub(crate) async fn execute_deploy_inner(
     // Verify container is still running after health check wait
     // (container could have crashed during start_period wait)
     if let Some(ref id) = ctx.new_container_id {
-        match docker.container_is_running(id).await {
+        match runtime.container_is_running(id).await {
             Ok(true) => {}
             Ok(false) => {
                 tracing::error!(app = %app_name, container_id = %id, "container not running after health check");
@@ -287,7 +294,7 @@ pub(crate) async fn execute_deploy_inner(
     {
         tracing::error!(app = %app_name, error = %e, "caddy route update failed");
         if let Some(ref id) = ctx.new_container_id {
-            let _ = docker.stop_and_remove(id).await;
+            let _ = runtime.stop_and_remove(id).await;
         }
         ctx.fail(&format!("caddy route update failed: {e}"));
         record_deploy(shared.deploys, &ctx);
@@ -320,7 +327,7 @@ pub(crate) async fn execute_deploy_inner(
     if let Some(old_id) = old_container_id {
         tracing::info!(app = %app_name, "draining old container");
         tokio::time::sleep(app_config.deploy.drain_timeout).await;
-        if let Err(e) = docker.stop_and_remove(&old_id).await {
+        if let Err(e) = runtime.stop_and_remove(&old_id).await {
             tracing::warn!(
                 app = %app_name,
                 error = %e,
@@ -410,13 +417,13 @@ mod tests {
         AppConfig, AppInfo, AuthConfig, CaddyConfig, DeployConfig, HealthConfig, RegistryConfig,
         ResourceConfig, RoutingConfig, ServerConfig, SlipConfig, StorageConfig,
     };
-    use crate::docker::ContainerRuntime;
-    use crate::error::{CaddyError, DockerError, HealthError};
+    use crate::error::{CaddyError, HealthError, RuntimeError};
     use crate::health::HealthCheck;
+    use crate::runtime::{RegistryCredentials, RuntimeBackend};
 
-    // ── Mock: ContainerRuntime ────────────────────────────────────────────────
+    // ── Mock: RuntimeBackend ──────────────────────────────────────────────────
 
-    /// Configurable mock for `ContainerRuntime`.
+    /// Configurable mock for `RuntimeBackend`.
     struct MockDocker {
         /// Whether `pull_image` should succeed.
         pull_ok: bool,
@@ -449,18 +456,40 @@ mod tests {
         }
     }
 
-    impl ContainerRuntime for MockDocker {
+    impl RuntimeBackend for MockDocker {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn ping(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + '_>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn ensure_network<'a>(
+            &'a self,
+            _name: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
         fn pull_image<'a>(
             &'a self,
             _image: &'a str,
             _tag: &'a str,
-            _credentials: Option<bollard::auth::DockerCredentials>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>
-        {
+            _credentials: Option<RegistryCredentials>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
+        > {
             let result = if self.pull_ok {
                 Ok(())
             } else {
-                Err(DockerError::PullFailed("mock pull failure".to_string()))
+                Err(RuntimeError::PullFailed("mock pull failure".to_string()))
             };
             Box::pin(async move { result })
         }
@@ -475,7 +504,7 @@ mod tests {
             _network: &'a str,
             _resources: &'a crate::config::ResourceConfig,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(String, u16), DockerError>> + Send + 'a>,
+            Box<dyn std::future::Future<Output = Result<(String, u16), RuntimeError>> + Send + 'a>,
         > {
             let result = Ok((self.container_id.clone(), self.container_port));
             Box::pin(async move { result })
@@ -484,8 +513,9 @@ mod tests {
         fn stop_and_remove<'a>(
             &'a self,
             _container_id: &'a str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
+        > {
             self.stop_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
@@ -494,9 +524,18 @@ mod tests {
             &'a self,
             _container_id: &'a str,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<bool, DockerError>> + Send + 'a>,
+            Box<dyn std::future::Future<Output = Result<bool, RuntimeError>> + Send + 'a>,
         > {
             // Mock containers are always running unless explicitly set otherwise
+            Box::pin(async { Ok(true) })
+        }
+
+        fn container_exists<'a>(
+            &'a self,
+            _container_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, RuntimeError>> + Send + 'a>,
+        > {
             Box::pin(async { Ok(true) })
         }
     }
@@ -582,6 +621,7 @@ mod tests {
             },
             registry: RegistryConfig { ghcr_token: None },
             storage: StorageConfig { path: storage_path },
+            runtime: crate::config::RuntimeConfig::default(),
         }
     }
 
