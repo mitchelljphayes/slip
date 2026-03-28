@@ -8,7 +8,7 @@
 
 ## Vision
 
-slip should be the easiest way to deploy anything on a VPS — from a static Astro site to a multi-container application with databases. Same tool, same workflow, progressive complexity.
+slip should be the easiest way to deploy anything on a VPS — from a static Astro site to a multi-container application with databases. Same tool, same workflow, progressive complexity. Preview deployments for every PR.
 
 ```
 Simple                                                     Complex
@@ -20,7 +20,171 @@ Static site     Single container     Container + sidecar     Full pod
 
   slip deploy     slip deploy          slip deploy             slip deploy
   (just works)    (just works)         (just works)            (just works)
+      |               |                    |                       |
+      +-- preview --- +--- preview -------+------ preview --------+
 ```
+
+---
+
+## Config Model: Repo Defines App, Server Defines Infra
+
+### Principle
+
+The **repo** describes **what the app is**. The **server** describes **where it runs**.
+
+The repo's `slip.toml` and optional `pod.yaml` are baked into the container image. slip extracts them at deploy time and merges with server-side config. CI only needs to send `{app, tag}`.
+
+### Repo-side config (`slip.toml` — checked into git)
+
+```toml
+# What this app IS — lives in the repo
+[app]
+name = "stat-stream"
+kind = "pod"                    # "container" (default) or "pod"
+manifest = "pod.yaml"           # path to K8s Pod YAML (relative to repo root)
+
+[health]
+path = "/v1/status"
+container = "api"               # which container to health check (pod mode)
+interval = "2s"
+timeout = "5s"
+retries = 5
+start_period = "10s"
+
+[routing]
+port = 8000
+container = "api"               # which container to route to (pod mode)
+
+[defaults]
+resources = { memory = "512m", cpus = "1" }
+
+[preview]
+enabled = true
+ttl = "72h"
+max = 5
+
+[preview.database]
+strategy = "shared"             # "shared", "branch", or "ephemeral"
+# provider = "neon"             # for "branch" strategy
+# project_id = "${NEON_PROJECT_ID}"
+# branch_from = "main"
+
+[preview.hooks]
+# Commands run inside the container after startup, before traffic switch
+migrate = "uv run alembic upgrade head"
+seed = "uv run python scripts/seed.py"
+```
+
+### Server-side config (`slip.toml` on server — managed via CLI)
+
+```toml
+# Where apps RUN — lives on the server
+[server]
+listen = "0.0.0.0:7890"
+
+[auth]
+secret = "${SLIP_SECRET}"
+
+[caddy]
+admin_api = "http://localhost:2019"
+
+[storage]
+path = "/var/lib/slip"
+
+[runtime]
+backend = "auto"                # "auto", "docker", or "podman"
+
+[[apps]]
+name = "blog"
+domain = "blog.example.com"
+secret = "${BLOG_SECRET}"
+
+[[apps]]
+name = "stat-stream"
+domain = "stat-stream.example.com"
+secret = "${STAT_STREAM_SECRET}"
+preview_domain = "*.preview.stat-stream.dev"    # wildcard for previews
+resources = { memory = "1g", cpus = "2" }       # override repo defaults
+
+[[apps.secrets]]
+# Injected as env vars, never leave the server
+POSTGRES_PASSWORD = "${POSTGRES_PASSWORD}"
+API_FOOTBALL_KEY = "${API_FOOTBALL_KEY}"
+NEON_PROJECT_ID = "${NEON_PROJECT_ID}"
+```
+
+### Config merge at deploy time
+
+| Concern | Source | Who controls | Example |
+|---------|--------|-------------|---------|
+| App shape | Repo `slip.toml` + `pod.yaml` | Developer | containers, ports, health checks |
+| Domain + TLS | Server `slip.toml` `[[apps]]` | Operator | `stat-stream.example.com` |
+| Secrets | Server `slip.toml` `[[apps.secrets]]` | Operator | `POSTGRES_PASSWORD` |
+| Resource limits | Server overrides repo defaults | Operator | memory, CPU caps |
+| Preview config | Repo `slip.toml` `[preview]` | Developer | TTL, max, DB strategy |
+| Preview domain | Server `slip.toml` `[[apps]]` | Operator | wildcard DNS |
+
+### Config extraction from image
+
+The repo config travels inside the container image — no need to sync git repos or send config in webhooks.
+
+```dockerfile
+# In your Dockerfile — convention: put slip config at /slip/
+COPY slip.toml /slip/slip.toml
+COPY pod.yaml /slip/pod.yaml
+```
+
+At deploy time, slip extracts config from the image:
+
+```bash
+podman create --name slip-tmp ghcr.io/me/statstream-api:v1.2.3
+podman cp slip-tmp:/slip/slip.toml ./rendered/slip.toml
+podman cp slip-tmp:/slip/pod.yaml ./rendered/pod.yaml
+podman rm slip-tmp
+```
+
+If no `/slip/slip.toml` exists in the image, slip falls back to the server-side `[[apps]]` config (backwards compatible with Phase 1).
+
+---
+
+## Full Pipeline
+
+```
+Developer pushes code
+    |
+    v
+CI Pipeline (GitHub Actions)
+    |-- 1. Lint / test
+    |-- 2. slip validate                   <-- validates slip.toml + pod.yaml
+    |-- 3. Build image(s)
+    |-- 4. Push to registry
+    '-- 5. POST /v1/deploy { app, tag }    <-- minimal webhook
+    |
+    v
+slipd (on server)
+    |-- 1. Pull image
+    |-- 2. Extract /slip/slip.toml + /slip/pod.yaml from image
+    |-- 3. Merge with server config (domain, secrets, resources)
+    |-- 4. Deploy (container or pod via podman kube play)
+    |-- 5. Run hooks (migrate, seed) if configured
+    |-- 6. Health check
+    |-- 7. Switch Caddy route
+    '-- 8. Tear down old container/pod
+```
+
+### CI is minimal
+
+```yaml
+# .github/workflows/deploy.yml
+- run: |
+    curl -X POST https://slip.example.com/v1/deploy \
+      -H "X-Slip-Signature: sha256=$(echo -n '{"app":"stat-stream","tag":"${{ github.sha }}"}' | openssl dgst -sha256 -hmac ${{ secrets.SLIP_SECRET }} | cut -d' ' -f2)" \
+      -d '{"app":"stat-stream","tag":"${{ github.sha }}"}'
+```
+
+CI doesn't know about domains, secrets, or infrastructure. It just says "deploy this tag."
+
+---
 
 ## Key Insight: `podman kube play`
 
@@ -38,50 +202,57 @@ podman kube play --replace pod.yaml  # Update pod in place
 podman kube down pod.yaml          # Tear down everything
 ```
 
+---
+
 ## App Tiers
 
-### Tier 1: Single Container (today)
+### Tier 1: Single Container
 
 A static site, simple API, or any single-process app.
 
 ```toml
-# apps/blog.toml
+# In repo: slip.toml
 [app]
 name = "blog"
-image = "ghcr.io/me/blog"
 
 [routing]
-domain = "blog.example.com"
-port = 3000
+port = 80
+
+[health]
+path = "/"
+```
+
+```dockerfile
+FROM caddy:2-alpine
+COPY dist /srv
 ```
 
 Deploy: Pull image → start container → health check → switch Caddy → stop old.
 
-**No changes needed.** This is what slip does today.
+**This is what slip does today** (with the webhook providing the image reference).
 
-### Tier 2: Pod Deploy (new)
+### Tier 2: Pod Deploy
 
 A multi-container app defined as a Kubernetes Pod YAML.
 
 ```toml
-# apps/stat-stream.toml
+# In repo: slip.toml
 [app]
 name = "stat-stream"
-kind = "pod"                              # NEW: signals pod mode
-manifest = "pods/stat-stream.yaml"        # NEW: path to K8s YAML
+kind = "pod"
+manifest = "pod.yaml"
 
 [routing]
-domain = "stat-stream.example.com"
-container = "api"                         # NEW: which container to route to
 port = 8000
+container = "api"
 
 [health]
 path = "/v1/status"
-container = "api"                         # NEW: which container to health check
+container = "api"
 ```
 
 ```yaml
-# pods/stat-stream.yaml — standard K8s Pod spec
+# In repo: pod.yaml — standard K8s Pod spec
 apiVersion: v1
 kind: Pod
 metadata:
@@ -94,10 +265,10 @@ spec:
       image: ghcr.io/me/statstream-api:latest
       ports:
         - containerPort: 8000
-          hostPort: 0    # slip assigns ephemeral port
+          hostPort: 0           # slip assigns ephemeral port
       env:
         - name: DATABASE_URL
-          value: "postgres://statstream:${POSTGRES_PASSWORD}@localhost:5432/statstream"
+          value: "postgres://statstream:$(POSTGRES_PASSWORD)@localhost:5432/statstream"
         - name: REDIS_URL
           value: "redis://localhost:6379"
 
@@ -116,12 +287,6 @@ spec:
     - name: redis
       image: redis:7-alpine
 
-    - name: dagster-daemon
-      image: ghcr.io/me/statstream-dagster:latest
-      env:
-        - name: DATABASE_URL
-          value: "postgres://statstream:${POSTGRES_PASSWORD}@localhost:5432/statstream"
-
   volumes:
     - name: pgdata
       hostPath:
@@ -130,197 +295,171 @@ spec:
 ```
 
 Deploy flow:
-1. `podman kube play pod.yaml` → creates pod with all containers  
-2. Health check the `api` container
-3. Switch Caddy route to new pod's API port
-4. `podman kube down old-pod.yaml` → tear down old pod
+1. Pull images for all containers
+2. Render manifest (inject secrets, set versioned pod name)
+3. `podman kube play rendered-manifest.yaml`
+4. Health check the `api` container
+5. Switch Caddy route to new pod's API port
+6. `podman kube down old-manifest.yaml`
 
 **Why this works:**
 - Containers in a pod share `localhost` — api talks to postgres at `localhost:5432`
 - Podman manages the full lifecycle as a unit
 - The YAML is valid K8s — copy it to a cluster later if needed
-- Secrets handled via K8s Secret objects or slip's env injection
+- Secrets injected by slip, never leave the server
 
 ### Tier 3: Future — Multi-pod with dependencies (not in scope)
 
 Multiple pods with dependency ordering (e.g., database pod starts before app pod). This is where you'd graduate to k3s. We explicitly don't build this.
 
-## Architecture Changes
+---
 
-### What changes in slip
+## Preview Deployments
 
-```
-Current:
-  slip.toml → AppConfig → DockerClient → single container → Caddy
+### Overview
 
-Proposed:
-  slip.toml → AppConfig → RuntimeBackend → container OR pod → Caddy
-                              │
-                              ├── DockerBackend (single containers)
-                              └── PodmanBackend (single containers + pods)
-```
-
-### Runtime Backend Trait
-
-```rust
-/// Abstraction over container runtimes.
-/// Docker supports single containers.
-/// Podman supports single containers AND pods.
-#[async_trait]
-pub trait RuntimeBackend: Send + Sync {
-    // ── Single container operations (both Docker and Podman) ────────
-    async fn pull_image(&self, image: &str, tag: &str, creds: Option<Credentials>)
-        -> Result<(), RuntimeError>;
-    async fn create_and_start(&self, spec: &ContainerSpec)
-        -> Result<ContainerInfo, RuntimeError>;
-    async fn stop_and_remove(&self, id: &str) -> Result<(), RuntimeError>;
-    async fn is_running(&self, id: &str) -> Result<bool, RuntimeError>;
-    async fn exists(&self, id: &str) -> Result<bool, RuntimeError>;
-    
-    // ── Pod operations (Podman only, Docker returns Unsupported) ────
-    async fn deploy_pod(&self, manifest: &Path, name: &str)
-        -> Result<PodInfo, RuntimeError>;
-    async fn teardown_pod(&self, manifest: &Path)
-        -> Result<(), RuntimeError>;
-    async fn pod_container_port(&self, pod: &str, container: &str, container_port: u16)
-        -> Result<u16, RuntimeError>;
-}
-
-pub struct ContainerInfo {
-    pub id: String,
-    pub host_port: u16,
-}
-
-pub struct PodInfo {
-    pub name: String,
-    pub containers: Vec<ContainerInfo>,
-}
-```
-
-### Config Changes
-
-```rust
-#[derive(Deserialize)]
-pub struct AppConfig {
-    pub app: AppInfo,
-    pub routing: RoutingConfig,
-    pub health: HealthConfig,
-    pub deploy: DeployConfig,
-    // ... existing fields ...
-}
-
-#[derive(Deserialize)]
-pub struct AppInfo {
-    pub name: String,
-    pub image: Option<String>,        // Required for single container
-    pub secret: Option<String>,
-    pub kind: Option<AppKind>,        // NEW: "container" (default) or "pod"
-    pub manifest: Option<PathBuf>,    // NEW: path to K8s YAML for pods
-}
-
-#[derive(Deserialize, Default)]
-pub enum AppKind {
-    #[default]
-    Container,
-    Pod,
-}
-
-#[derive(Deserialize)]
-pub struct RoutingConfig {
-    pub domain: String,
-    pub port: u16,
-    pub container: Option<String>,    // NEW: which container in pod to route to
-}
-```
-
-### Deploy Flow Changes
+Every PR can get its own running instance at a unique URL. Preview deploys are just deploys with an ephemeral lifecycle and a dynamic subdomain.
 
 ```
-Single container (unchanged):
-  1. Pull image
-  2. Create + start container
-  3. Health check container
-  4. Switch Caddy to container port
-  5. Stop old container
+PR #42 opened  → slip creates preview
+                   - container/pod running PR code
+                   - route: pr-42.stat-stream.preview.dev
+                   - comment on PR with URL
 
-Pod deploy (new):
-  1. Render manifest (inject env vars, set pod name with version suffix)
-  2. podman kube play rendered-manifest.yaml
-  3. Find host port for the routable container
-  4. Health check the routable container
-  5. Switch Caddy to new pod's port
-  6. podman kube down old-manifest.yaml
+PR #42 updated → slip redeploys the preview
+
+PR #42 closed  → slip tears down preview + cleans up resources
 ```
 
-### Runtime Detection
+### Repo config
 
 ```toml
-# slip.toml
-[runtime]
-backend = "auto"   # auto-detect (default), "docker", or "podman"
-# socket = "/run/user/1000/podman/podman.sock"  # override socket path
+# In repo: slip.toml
+[preview]
+enabled = true
+ttl = "72h"                     # auto-teardown after 72 hours
+max = 5                         # max concurrent previews for this app
+
+[preview.database]
+strategy = "shared"             # no migration, use staging DB as-is
+# strategy = "branch"           # Neon/Supabase: create DB branch per preview
+# strategy = "ephemeral"        # Postgres in the pod, seeded from snapshot
+
+# For "branch" strategy:
+# provider = "neon"
+# project_id = "${NEON_PROJECT_ID}"
+# branch_from = "main"
+
+[preview.hooks]
+# Commands run inside the container after startup, before traffic switch
+# migrate = "uv run alembic upgrade head"
+# seed = "uv run python scripts/seed.py"
 ```
 
-Auto-detection:
-1. Check for `podman` binary → use Podman backend
-2. Check for Docker socket → use Docker backend
-3. Fail with helpful error
+### Server config
 
-### Podman Backend Implementation
+```toml
+[[apps]]
+name = "stat-stream"
+domain = "stat-stream.example.com"
+preview_domain = "*.stat-stream.preview.dev"    # wildcard DNS + TLS
+```
 
-For **single containers**, Podman's API is Docker-compatible. We can use bollard with Podman's socket.
+### API
 
-For **pods**, we shell out to `podman kube play` / `podman kube down`. This is intentional:
-- The CLI is the stable interface
-- No need to reimplement pod orchestration
-- `--replace` flag handles updates atomically
-
-```rust
-impl RuntimeBackend for PodmanBackend {
-    async fn deploy_pod(&self, manifest: &Path, name: &str) -> Result<PodInfo, RuntimeError> {
-        // Render manifest with unique pod name for blue-green
-        let rendered = self.render_manifest(manifest, name)?;
-        
-        // Deploy via CLI
-        let output = Command::new("podman")
-            .args(["kube", "play", &rendered.to_string_lossy()])
-            .output()
-            .await?;
-            
-        if !output.status.success() {
-            return Err(RuntimeError::PodDeployFailed(
-                String::from_utf8_lossy(&output.stderr).to_string()
-            ));
-        }
-        
-        // Inspect to get container ports
-        self.inspect_pod(name).await
-    }
-    
-    async fn teardown_pod(&self, manifest: &Path) -> Result<(), RuntimeError> {
-        Command::new("podman")
-            .args(["kube", "down", &manifest.to_string_lossy()])
-            .output()
-            .await?;
-        Ok(())
-    }
+```
+# Create/update a preview
+POST /v1/deploy
+{
+  "app": "stat-stream",
+  "tag": "pr-42-abc123",
+  "preview": {
+    "id": "pr-42",              # unique preview identifier
+    "pr_number": 42,            # for GitHub integration
+    "repo": "me/stat-stream"    # for PR comments
+  }
 }
+
+# Tear down a preview
+DELETE /v1/previews/stat-stream/pr-42
 ```
+
+### Preview deploy flow
+
+```
+1. Receive deploy request with preview context
+2. Pull image
+3. Extract /slip/slip.toml from image
+4. Check preview limits (max concurrent)
+    - If at limit, evict oldest preview
+5. Create DB branch (if strategy = "branch")
+    - Call Neon/Supabase API
+    - Get branch DATABASE_URL
+6. Deploy container/pod
+    - Name: stat-stream-preview-pr-42
+    - Inject: DATABASE_URL (branched or shared), secrets
+7. Run hooks (migrate, seed) in container
+    - If hooks fail → preview fails, teardown, report
+8. Health check
+9. Create Caddy route: pr-42.stat-stream.preview.dev
+10. Comment on PR with preview URL (GitHub API)
+11. Set TTL timer for auto-cleanup
+```
+
+### Preview teardown flow
+
+```
+Triggered by: PR closed/merged, TTL expired, manual, eviction
+
+1. Remove Caddy route
+2. Stop and remove container/pod
+3. Delete DB branch (if strategy = "branch")
+4. Update PR comment: "Preview torn down"
+5. Clean up state
+```
+
+### Database strategies for previews
+
+**Strategy: `shared`** (default)
+- Preview connects to the same staging database
+- No migrations run (unless explicitly configured)
+- Cheapest and simplest
+- Works when PRs don't change the schema
+
+**Strategy: `branch`** (Neon / Supabase / PlanetScale)
+- slip calls the provider API to create a copy-on-write DB branch
+- Each preview gets its own `DATABASE_URL`
+- Migrations run in isolation
+- Branch deleted on preview teardown
+
+```
+slip → Neon API: POST /branches { parent: "main" }
+     ← { branch_id: "br-xyz", host: "br-xyz.us-east-1.aws.neon.tech" }
+     → Set DATABASE_URL=postgres://...@br-xyz.us-east-1.aws.neon.tech/...
+```
+
+**Strategy: `ephemeral`** (Postgres in the pod)
+- Preview pod includes its own Postgres container
+- Optionally seeded from a snapshot
+- Full isolation, no external dependency
+- Heavier on resources (each preview = own DB)
+
+slip doesn't know about ORMs or migration frameworks. The `migrate` and `seed` hooks are opaque commands that run in the container. If they fail, the preview fails.
+
+---
 
 ## Blue-Green for Pods
-
-The key challenge: how do we run two pods simultaneously for zero-downtime?
 
 ### Approach: Versioned Pod Names
 
 ```yaml
-# Template in pods/stat-stream.yaml:
+# Template in pod.yaml:
 metadata:
-  name: stat-stream            # slip appends: stat-stream-abc123
+  name: stat-stream            # slip appends: stat-stream-{ulid}
 
 # During deploy, slip renders two copies:
-# Active:  stat-stream-v1 (serving traffic)
-# New:     stat-stream-v2 (starting up, health checking)
+# Active:  stat-stream-01ABCDEF (serving traffic)
+# New:     stat-stream-01GHIJKL (starting up, health checking)
 ```
 
 Flow:
@@ -333,95 +472,236 @@ Flow:
 
 ### Port Management
 
-Pods expose ports via `hostPort` in the YAML. For blue-green, we need two pods on different host ports:
+Pods expose ports via `hostPort` in the YAML. For blue-green, we need two pods on different host ports.
 
-Option A: **Ephemeral ports** — set `hostPort: 0` in manifest, let Podman assign
-Option B: **slip-managed ports** — slip rewrites `hostPort` in rendered manifest
+Approach: **Ephemeral ports** — set `hostPort: 0` in manifest, let Podman assign. slip reads the assigned port via `podman pod inspect`.
 
-Recommendation: **Option A** — simpler, Podman handles port allocation.
+---
 
-## Static Site Support
+## Architecture Changes
 
-For Tier 1, static sites like Astro/Hugo are already supported — they just need a container:
+### What changes in slip
 
-```dockerfile
-# Dockerfile for Astro site
-FROM node:20-alpine AS build
-WORKDIR /app
-COPY package*.json .
-RUN npm ci
-COPY . .
-RUN npm run build
-
-FROM caddy:2-alpine
-COPY --from=build /app/dist /srv
-COPY Caddyfile /etc/caddy/Caddyfile
 ```
+Phase 1 (current):
+  server slip.toml → AppConfig → DockerClient → single container → Caddy
+
+Phase 2 (proposed):
+  image /slip/slip.toml + server [[apps]] → merged AppConfig → RuntimeBackend → container OR pod → Caddy
+                                                                    |
+                                                                    +-- DockerBackend (single containers)
+                                                                    +-- PodmanBackend (single containers + pods)
+```
+
+### Runtime Backend Trait
+
+```rust
+/// Abstraction over container runtimes.
+/// Docker supports single containers.
+/// Podman supports single containers AND pods.
+#[async_trait]
+pub trait RuntimeBackend: Send + Sync {
+    // ── Image operations ────────────────────────────────────────────
+    async fn pull_image(&self, image: &str, tag: &str, creds: Option<Credentials>)
+        -> Result<(), RuntimeError>;
+    async fn extract_file(&self, image: &str, tag: &str, path: &str)
+        -> Result<Option<Vec<u8>>, RuntimeError>;
+
+    // ── Single container operations (both Docker and Podman) ────────
+    async fn create_and_start(&self, spec: &ContainerSpec)
+        -> Result<ContainerInfo, RuntimeError>;
+    async fn stop_and_remove(&self, id: &str) -> Result<(), RuntimeError>;
+    async fn is_running(&self, id: &str) -> Result<bool, RuntimeError>;
+    async fn exists(&self, id: &str) -> Result<bool, RuntimeError>;
+    async fn exec_in_container(&self, id: &str, cmd: &[&str])
+        -> Result<ExecResult, RuntimeError>;
+
+    // ── Pod operations (Podman only, Docker returns Unsupported) ────
+    async fn deploy_pod(&self, manifest: &Path, name: &str)
+        -> Result<PodInfo, RuntimeError>;
+    async fn teardown_pod(&self, manifest: &Path)
+        -> Result<(), RuntimeError>;
+    async fn pod_container_port(&self, pod: &str, container: &str, container_port: u16)
+        -> Result<u16, RuntimeError>;
+}
+```
+
+### Deploy orchestrator changes
+
+```rust
+async fn execute_deploy(ctx: DeployContext, backend: &dyn RuntimeBackend) {
+    // 1. Pull primary image
+    backend.pull_image(&ctx.image, &ctx.tag, creds).await?;
+
+    // 2. Extract repo config from image
+    let repo_config = backend.extract_file(&ctx.image, &ctx.tag, "/slip/slip.toml").await?;
+    let merged = merge_config(repo_config, server_config);
+
+    // 3. Deploy based on app kind
+    match merged.app.kind {
+        AppKind::Container => deploy_container(backend, &merged).await,
+        AppKind::Pod => {
+            let manifest = backend.extract_file(&ctx.image, &ctx.tag, "/slip/pod.yaml").await?;
+            deploy_pod(backend, &merged, &manifest).await
+        }
+    }
+
+    // 4. Run hooks (migrate, seed)
+    if let Some(migrate) = merged.hooks.migrate {
+        backend.exec_in_container(&container_id, &["sh", "-c", &migrate]).await?;
+    }
+
+    // 5. Health check
+    // 6. Switch Caddy
+    // 7. Tear down old
+}
+```
+
+### Runtime Detection
 
 ```toml
-# apps/blog.toml
-[app]
-name = "blog"
-image = "ghcr.io/me/blog"
-
-[routing]
-domain = "blog.example.com"
-port = 80
-
-[resources]
-memory = "64m"
-cpus = "0.1"
+# Server slip.toml
+[runtime]
+backend = "auto"   # auto-detect (default), "docker", or "podman"
 ```
 
-No special handling needed — it's just a container.
+Auto-detection:
+1. Check for `podman` binary → use Podman backend
+2. Check for Docker socket → use Docker backend  
+3. Fail with helpful error
+
+---
 
 ## Migration Path: slip → Kubernetes
 
 The design explicitly supports graduating to K8s:
 
-| Step | Tool | Config |
-|------|------|--------|
-| 1. Start simple | slip + Docker | `apps/myapp.toml` |
-| 2. Add services | slip + Podman | `apps/myapp.toml` + `pods/myapp.yaml` |
-| 3. Scale out | k3s/k8s | Same `pods/myapp.yaml` + Helm chart |
+| Stage | Tool | Config |
+|-------|------|--------|
+| 1. Start simple | slip + Docker | `slip.toml` in repo |
+| 2. Add services | slip + Podman | `slip.toml` + `pod.yaml` in repo |
+| 3. Scale out | k3s/k8s | Same `pod.yaml` + Deployment wrapper + Ingress |
 
-The pod YAML is the portable artifact. slip's TOML is just the routing/deploy metadata that maps to K8s Ingress + Deployment in a real cluster.
+The pod YAML is the portable artifact. slip's TOML is the deploy/routing metadata that maps to K8s Ingress + Deployment in a real cluster.
+
+---
+
+## CLI Commands
+
+### App management (no SSH needed)
+
+```bash
+# From your laptop, over Tailscale:
+slip apps add stat-stream --domain stat-stream.example.com
+slip apps add stat-stream --preview-domain "*.stat-stream.preview.dev"
+slip apps list
+slip apps edit stat-stream --domain new-domain.com
+slip apps rm stat-stream
+
+slip secrets set stat-stream POSTGRES_PASSWORD=hunter2
+slip secrets list stat-stream
+slip secrets rm stat-stream POSTGRES_PASSWORD
+```
+
+### Deploy operations
+
+```bash
+slip deploy stat-stream v1.2.3           # manual deploy
+slip status                              # all apps
+slip status stat-stream                  # single app
+slip rollback stat-stream                # deploy previous tag
+slip logs stat-stream                    # container/pod logs
+```
+
+### Preview operations
+
+```bash
+slip previews list stat-stream           # list active previews
+slip previews teardown stat-stream pr-42 # manual teardown
+slip previews teardown stat-stream --all # teardown all previews
+```
+
+### Validation (for CI)
+
+```bash
+slip validate                            # validate slip.toml + pod.yaml
+slip validate --strict                   # also check image references exist
+```
+
+---
 
 ## Implementation Plan
 
-### Phase 2a: Podman Backend for Single Containers
+### Phase 2a: Config Model + Podman Backend (~1 week)
 
-| Task | Effort | Description |
-|------|--------|-------------|
-| Abstract `RuntimeBackend` trait | 2 days | Extract from current `ContainerRuntime` |
-| Implement `PodmanBackend` (single container) | 2 days | Use bollard against Podman socket |
-| Runtime auto-detection | 1 day | Check for podman/docker |
-| Config: `[runtime]` section | 0.5 day | Backend selection |
-| Tests | 2 days | Mock both backends |
-| **Total** | ~1 week | |
+| Task | Effort |
+|------|--------|
+| Extract `RuntimeBackend` trait from `ContainerRuntime` | 2 days |
+| Implement `PodmanBackend` for single containers (bollard against Podman socket) | 2 days |
+| Runtime auto-detection | 0.5 day |
+| Config: `[runtime]` section in server slip.toml | 0.5 day |
+| Tests for both backends | 2 days |
 
-### Phase 2b: Pod Deploys
+### Phase 2b: Image Config Extraction + Merge (~1 week)
 
-| Task | Effort | Description |
-|------|--------|-------------|
-| Config: `kind = "pod"`, `manifest` field | 1 day | Parse new fields |
-| Manifest rendering (env var injection, name suffix) | 2 days | Template + write rendered YAML |
-| `deploy_pod` / `teardown_pod` implementation | 2 days | Shell out to `podman kube play` |
-| Pod health checking (target specific container) | 1 day | Find container port, check health |
-| Blue-green for pods | 2 days | Two pods, port management, Caddy switch |
-| State tracking for pods | 1 day | Track pod name + manifest in AppRuntimeState |
-| Tests | 2 days | Mock podman CLI output |
-| **Total** | ~1.5 weeks | |
+| Task | Effort |
+|------|--------|
+| `extract_file` implementation (create tmp container, cp, rm) | 1 day |
+| Repo-side `slip.toml` parser (new fields: kind, manifest, preview) | 1 day |
+| Config merge logic (repo + server → merged config) | 2 days |
+| Fallback to server-only config when no `/slip/slip.toml` in image | 0.5 day |
+| `slip validate` CLI command | 0.5 day |
+| Tests | 2 days |
 
-### Phase 2c: Secrets Management
+### Phase 2c: Pod Deploys (~1.5 weeks)
 
-| Task | Effort | Description |
-|------|--------|-------------|
-| `slip secrets set/list/rm` CLI | 2 days | Manage K8s Secret YAML files |
-| Secret injection into pod manifests | 1 day | `--configmap` flag to `kube play` |
-| **Total** | ~3 days | |
+| Task | Effort |
+|------|--------|
+| Manifest rendering (env var injection, versioned pod name) | 2 days |
+| `deploy_pod` / `teardown_pod` via `podman kube play` | 2 days |
+| Pod health checking (target specific container) | 1 day |
+| Blue-green for pods (versioned names, port management) | 2 days |
+| State tracking for pods | 1 day |
+| Tests | 2 days |
 
-### Total: ~3 weeks for pod deploy support
+### Phase 2d: Preview Deployments (~1.5 weeks)
+
+| Task | Effort |
+|------|--------|
+| Preview deploy endpoint (new fields in webhook) | 1 day |
+| Preview routing (dynamic subdomains, Caddy wildcard) | 2 days |
+| Preview lifecycle (TTL, max limit, eviction) | 2 days |
+| Post-deploy hooks (`exec_in_container` for migrate/seed) | 1 day |
+| GitHub integration (PR comments, status checks) | 2 days |
+| Preview teardown (on PR close, TTL, manual) | 1 day |
+
+### Phase 2e: Database Branching (~1 week)
+
+| Task | Effort |
+|------|--------|
+| Database strategy abstraction | 1 day |
+| Neon provider (branch create/delete API) | 2 days |
+| Supabase provider (branch create/delete API) | 1 day |
+| DATABASE_URL injection into preview deploys | 1 day |
+| Tests | 1 day |
+
+### Phase 2f: CLI + App Management (~1 week)
+
+| Task | Effort |
+|------|--------|
+| `slip apps add/list/edit/rm` | 2 days |
+| `slip secrets set/list/rm` | 1 day |
+| `slip previews list/teardown` | 1 day |
+| `slip validate` | 0.5 day |
+| `slip rollback` | 1 day |
+
+### Total: ~7 weeks
+
+Priority order: 2a → 2b → 2c → 2d → 2f → 2e
+
+(Database branching is last because `strategy = "shared"` works without it.)
+
+---
 
 ## What We Explicitly Don't Build
 
@@ -432,17 +712,24 @@ The pod YAML is the portable artifact. slip's TOML is just the routing/deploy me
 - **Image registry** — use GHCR/Docker Hub
 - **Log aggregation** — use `podman logs` or journald
 - **Metrics/monitoring** — separate concern
+- **Migration framework integration** — hooks are opaque commands
+- **Multi-replica** — single node = single replica, use K8s for more
+
+## Resolved Decisions
+
+1. **Config model**: Repo owns app definition (`slip.toml` + `pod.yaml` in image), server owns infra (domains, secrets, resources).
+2. **Config delivery**: Baked into the container image at `/slip/`. Extracted at deploy time.
+3. **Webhook**: Minimal `{app, tag}`. Everything else is in the image or on the server.
+4. **Pod orchestration**: `podman kube play` — don't reimplement.
+5. **Preview databases**: Pluggable strategies. slip provides hooks, doesn't know about ORMs.
+6. **Persistent volumes**: Host paths only. Volume lifecycle is the operator's job.
 
 ## Open Questions
 
-1. **Should slip manage persistent volumes?** Or just reference host paths in the YAML?
-   - Recommendation: Host paths only. Volume lifecycle is the operator's job.
+1. **Wildcard TLS for preview domains** — Caddy supports DNS challenge for wildcard certs. Which DNS providers to support out of the box? (Cloudflare is most common.)
 
-2. **Should slip support `podman kube play --replace`?** This updates in-place without blue-green.
-   - Recommendation: Not for stateless services. Maybe as `deploy.strategy = "replace"` for databases that can't run two copies.
+2. **GitHub App vs webhook for PR lifecycle** — GitHub App gives us PR close events natively. Webhook requires CI to call teardown. GitHub App is better UX but more setup.
 
-3. **How to handle pod secrets?** K8s Secrets are base64-encoded YAML files.
-   - Recommendation: `slip secrets` CLI generates K8s Secret YAML, `podman kube play --configmap` injects them.
+3. **Multi-image pods** — When a pod has 3 container images, does `POST /v1/deploy { tag }` apply the tag to all of them? Or just the primary? Probably just the primary (the one matching `app.image`), and sidecars use pinned tags.
 
-4. **Should we support Deployments (replicas > 1)?** Podman sets replicas to 1.
-   - Recommendation: No. Single node = single replica. Use K8s for multi-replica.
+4. **Preview resource limits** — Should previews automatically get reduced resources (e.g., half the production limits)? Or is this configurable per-app?
