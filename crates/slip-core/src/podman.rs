@@ -1,10 +1,11 @@
-//! Podman backend — single container operations via Podman's Docker-compatible API.
+//! Podman backend — container and pod operations via Podman.
 //!
-//! Podman exposes a Docker-compatible socket API, so we use `bollard` to talk to
-//! it. For single container operations, Podman's API is Docker-compatible.
-//! Pod operations (Phase 2c) will use `podman kube play` via CLI.
+//! Single container operations use the Docker-compatible socket API via `bollard`.
+//! Pod operations use the `podman` CLI (`podman kube play`, `podman port`) since
+//! the Docker-compat API doesn't support Kubernetes pod manifests.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::pin::Pin;
 
 use bollard::Docker;
@@ -24,13 +25,16 @@ use crate::docker::{
     extract_file_from_tar, extract_host_port, parse_cpu_limit, parse_memory_limit,
 };
 use crate::error::RuntimeError;
-use crate::runtime::{RegistryCredentials, RuntimeBackend};
+use crate::runtime::{PodInfo, RegistryCredentials, RuntimeBackend};
 
 /// Podman container runtime backend.
 ///
-/// Connects to the Podman socket using the Docker-compatible API via `bollard`.
+/// Single container operations use the Docker-compatible socket API via `bollard`.
+/// Pod operations shell out to the `podman` CLI binary.
 pub struct PodmanBackend {
     client: Docker,
+    /// Path to the `podman` CLI binary (default: `"podman"`).
+    podman_path: String,
 }
 
 impl PodmanBackend {
@@ -48,7 +52,13 @@ impl PodmanBackend {
         let client = Docker::connect_with_unix(&url, 120, bollard::API_DEFAULT_VERSION)
             .map_err(|e| RuntimeError::Connection(format!("failed to connect to Podman: {e}")))?;
 
-        Ok(Self { client })
+        let podman_path =
+            std::env::var("SLIP_PODMAN_PATH").unwrap_or_else(|_| "podman".to_string());
+
+        Ok(Self {
+            client,
+            podman_path,
+        })
     }
 
     fn find_socket() -> Option<String> {
@@ -335,6 +345,106 @@ impl RuntimeBackend for PodmanBackend {
         })
     }
 
+    // ── Pod operations (shell out to podman CLI) ───────────────────────────
+
+    fn deploy_pod<'a>(
+        &'a self,
+        manifest: &'a Path,
+        name: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<PodInfo, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            info!(name, manifest = %manifest.display(), "deploying pod via podman kube play");
+
+            let output = tokio::process::Command::new(&self.podman_path)
+                .args(["kube", "play", "--start"])
+                .arg(manifest)
+                .output()
+                .await
+                .map_err(|e| {
+                    RuntimeError::ContainerError(format!("failed to run podman kube play: {e}"))
+                })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(RuntimeError::ContainerError(format!(
+                    "podman kube play failed (exit {}): {stderr}",
+                    output.status.code().unwrap_or(-1)
+                )));
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let pod_info = parse_kube_play_output(&stdout, name)?;
+
+            info!(
+                name,
+                containers = pod_info.containers.len(),
+                "pod deployed successfully"
+            );
+            Ok(pod_info)
+        })
+    }
+
+    fn teardown_pod<'a>(
+        &'a self,
+        manifest: &'a Path,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            info!(manifest = %manifest.display(), "tearing down pod via podman kube play --down");
+
+            let output = tokio::process::Command::new(&self.podman_path)
+                .args(["kube", "play", "--down"])
+                .arg(manifest)
+                .output()
+                .await
+                .map_err(|e| {
+                    RuntimeError::ContainerError(format!(
+                        "failed to run podman kube play --down: {e}"
+                    ))
+                })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(RuntimeError::ContainerError(format!(
+                    "podman kube play --down failed (exit {}): {stderr}",
+                    output.status.code().unwrap_or(-1)
+                )));
+            }
+
+            info!(manifest = %manifest.display(), "pod torn down successfully");
+            Ok(())
+        })
+    }
+
+    fn pod_container_port<'a>(
+        &'a self,
+        pod: &'a str,
+        container: &'a str,
+        container_port: u16,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<u16, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Podman names pod containers as "<pod>-<container>"
+            let full_name = format!("{pod}-{container}");
+            let port_spec = format!("{container_port}/tcp");
+
+            debug!(full_name, port_spec, "querying pod container port");
+
+            let output = tokio::process::Command::new(&self.podman_path)
+                .args(["port", &full_name, &port_spec])
+                .output()
+                .await
+                .map_err(|e| {
+                    RuntimeError::ContainerError(format!("failed to run podman port: {e}"))
+                })?;
+
+            if !output.status.success() {
+                return Err(RuntimeError::NoPortAssigned);
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            parse_port_output(&stdout)
+        })
+    }
+
     fn extract_file<'a>(
         &'a self,
         image: &'a str,
@@ -432,5 +542,190 @@ impl RuntimeBackend for PodmanBackend {
             extract_file_from_tar(&bytes, path)
                 .map_err(|e| RuntimeError::ContainerError(e.to_string()))
         })
+    }
+}
+
+// ─── Pod CLI output parsers ──────────────────────────────────────────────────
+
+/// Parse `podman kube play` stdout to extract pod info.
+///
+/// Podman outputs lines like:
+/// ```text
+/// Pod:
+/// 52182abc...
+/// Containers:
+/// d53fabc...
+/// abc1234...
+/// ```
+///
+/// We parse the pod ID and container IDs from this output.
+fn parse_kube_play_output(stdout: &str, pod_name: &str) -> Result<PodInfo, RuntimeError> {
+    let mut containers: Vec<String> = Vec::new();
+    let mut in_containers = false;
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed.eq_ignore_ascii_case("containers:") || trimmed.eq_ignore_ascii_case("container:")
+        {
+            in_containers = true;
+            continue;
+        }
+
+        if trimmed.ends_with(':') {
+            // New section header — stop collecting containers
+            in_containers = false;
+            continue;
+        }
+
+        if in_containers {
+            containers.push(trimmed.to_string());
+        }
+    }
+
+    Ok(PodInfo {
+        name: pod_name.to_string(),
+        containers,
+    })
+}
+
+/// Parse `podman port` stdout to extract a host port.
+///
+/// Output format: `0.0.0.0:54321\n` or `[::]:54321\n`
+/// We take the last `:` and parse the port number after it.
+fn parse_port_output(stdout: &str) -> Result<u16, RuntimeError> {
+    let trimmed = stdout.trim();
+
+    // Handle multiple lines — take the first valid one
+    for line in trimmed.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(colon_pos) = line.rfind(':')
+            && let Ok(port) = line[colon_pos + 1..].parse::<u16>()
+        {
+            return Ok(port);
+        }
+    }
+
+    Err(RuntimeError::NoPortAssigned)
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_kube_play_output ────────────────────────────────────────────
+
+    #[test]
+    fn parse_kube_play_single_container() {
+        let output = "\
+Pod:
+52182abcdef0123456789
+Containers:
+d53fabc123456789
+";
+        let info = parse_kube_play_output(output, "my-pod-01abc").unwrap();
+        assert_eq!(info.name, "my-pod-01abc");
+        assert_eq!(info.containers, vec!["d53fabc123456789"]);
+    }
+
+    #[test]
+    fn parse_kube_play_multiple_containers() {
+        let output = "\
+Pod:
+52182abcdef0
+Containers:
+d53fabc12345
+abc123456789
+fff000111222
+";
+        let info = parse_kube_play_output(output, "stat-stream-01abc").unwrap();
+        assert_eq!(info.name, "stat-stream-01abc");
+        assert_eq!(info.containers.len(), 3);
+        assert_eq!(info.containers[0], "d53fabc12345");
+        assert_eq!(info.containers[1], "abc123456789");
+        assert_eq!(info.containers[2], "fff000111222");
+    }
+
+    #[test]
+    fn parse_kube_play_empty_output() {
+        let info = parse_kube_play_output("", "my-pod").unwrap();
+        assert_eq!(info.name, "my-pod");
+        assert!(info.containers.is_empty());
+    }
+
+    #[test]
+    fn parse_kube_play_with_extra_sections() {
+        let output = "\
+Pod:
+52182abcdef0
+Containers:
+d53fabc12345
+Volumes:
+
+Secrets:
+";
+        let info = parse_kube_play_output(output, "my-pod").unwrap();
+        assert_eq!(info.containers, vec!["d53fabc12345"]);
+    }
+
+    #[test]
+    fn parse_kube_play_with_whitespace() {
+        let output = "  Pod:  \n  52182abc  \n  Containers:  \n  d53fabc  \n  abc123  \n";
+        let info = parse_kube_play_output(output, "test").unwrap();
+        assert_eq!(info.containers, vec!["d53fabc", "abc123"]);
+    }
+
+    // ── parse_port_output ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_port_ipv4() {
+        let port = parse_port_output("0.0.0.0:54321\n").unwrap();
+        assert_eq!(port, 54321);
+    }
+
+    #[test]
+    fn parse_port_ipv6() {
+        let port = parse_port_output("[::]:8080\n").unwrap();
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn parse_port_127001() {
+        let port = parse_port_output("127.0.0.1:3000\n").unwrap();
+        assert_eq!(port, 3000);
+    }
+
+    #[test]
+    fn parse_port_multiple_lines() {
+        // podman port can output both IPv4 and IPv6 bindings
+        let output = "0.0.0.0:54321\n[::]:54321\n";
+        let port = parse_port_output(output).unwrap();
+        assert_eq!(port, 54321);
+    }
+
+    #[test]
+    fn parse_port_empty_fails() {
+        let result = parse_port_output("");
+        assert!(matches!(result, Err(RuntimeError::NoPortAssigned)));
+    }
+
+    #[test]
+    fn parse_port_no_colon_fails() {
+        let result = parse_port_output("garbage");
+        assert!(matches!(result, Err(RuntimeError::NoPortAssigned)));
+    }
+
+    #[test]
+    fn parse_port_non_numeric_fails() {
+        let result = parse_port_output("0.0.0.0:notaport\n");
+        assert!(matches!(result, Err(RuntimeError::NoPortAssigned)));
     }
 }
