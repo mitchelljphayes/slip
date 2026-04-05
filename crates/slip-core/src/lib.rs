@@ -6,6 +6,7 @@ pub mod deploy;
 pub mod docker;
 pub mod error;
 pub mod health;
+pub mod manifest;
 pub mod merge;
 pub mod podman;
 pub mod repo_config;
@@ -27,6 +28,7 @@ pub use deploy::{
 pub use docker::{DockerClient, parse_cpu_limit, parse_memory_limit};
 pub use error::{CaddyError, ConfigError, HealthError, RuntimeError};
 pub use health::{HealthCheck, HealthChecker};
+pub use manifest::{ManifestError, RenderContext, render_manifest};
 pub use merge::{MergedConfig, merge_config};
 pub use podman::PodmanBackend;
 pub use repo_config::{PreviewConfig, RepoConfig, parse_repo_config};
