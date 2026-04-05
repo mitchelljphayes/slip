@@ -1,7 +1,7 @@
 //! Persistent state for deployed apps — JSON file-based storage and startup reconciliation.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,12 @@ pub struct PersistedAppState {
     pub current_container_id: Option<String>,
     pub current_port: Option<u16>,
     pub deployed_at: Option<DateTime<Utc>>,
+    /// Pod name for pod-mode apps (persisted for teardown on next deploy).
+    #[serde(default)]
+    pub current_pod_name: Option<String>,
+    /// Path to the rendered manifest for the current pod.
+    #[serde(default)]
+    pub current_manifest_path: Option<PathBuf>,
 }
 
 impl From<&AppRuntimeState> for PersistedAppState {
@@ -35,14 +41,16 @@ impl From<&AppRuntimeState> for PersistedAppState {
             current_container_id: s.current_container_id.clone(),
             current_port: s.current_port,
             deployed_at: s.deployed_at,
+            current_pod_name: s.current_pod_name.clone(),
+            current_manifest_path: s.current_manifest_path.clone(),
         }
     }
 }
 
 impl From<PersistedAppState> for AppRuntimeState {
     fn from(p: PersistedAppState) -> Self {
-        // Assume Running if we have a container ID; otherwise NotDeployed.
-        let status = if p.current_container_id.is_some() {
+        // Assume Running if we have a container ID or pod name; otherwise NotDeployed.
+        let status = if p.current_container_id.is_some() || p.current_pod_name.is_some() {
             AppStatus::Running
         } else {
             AppStatus::NotDeployed
@@ -56,6 +64,8 @@ impl From<PersistedAppState> for AppRuntimeState {
             current_port: p.current_port,
             deployed_at: p.deployed_at,
             deploy_id: None,
+            current_pod_name: p.current_pod_name,
+            current_manifest_path: p.current_manifest_path,
         }
     }
 }
@@ -145,6 +155,14 @@ pub async fn verify_containers(
     let mut verified = HashMap::with_capacity(states.len());
 
     for (app_name, mut state) in states {
+        // Pod-based apps: skip container existence check — pods are managed
+        // differently (via `podman kube play`) and don't use container IDs.
+        if state.current_pod_name.is_some() {
+            tracing::info!(app = %app_name, "pod-based app, skipping container verification");
+            verified.insert(app_name, state);
+            continue;
+        }
+
         match &state.current_container_id {
             None => {
                 // Nothing to verify — keep as-is.
@@ -249,6 +267,8 @@ mod tests {
             current_port: Some(54321),
             deployed_at: Some(Utc::now()),
             deploy_id: Some("dep_01abc".to_string()),
+            current_pod_name: None,
+            current_manifest_path: None,
         }
     }
 

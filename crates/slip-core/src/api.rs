@@ -857,6 +857,8 @@ mod tests {
             triggered_by: TriggerSource::Webhook,
             new_container_id: Some("ctr456".to_string()),
             new_port: Some(9000),
+            new_pod_name: None,
+            new_manifest_path: None,
         };
         state.deploys.insert(ctx.id.clone(), ctx);
 
