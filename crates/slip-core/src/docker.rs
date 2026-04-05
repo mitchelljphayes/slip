@@ -1,6 +1,7 @@
 //! Docker client wrapper around bollard for container lifecycle management.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 
 use bollard::Docker;
 use bollard::auth::DockerCredentials;
@@ -15,101 +16,8 @@ use futures_util::StreamExt;
 use tracing::{debug, info, warn};
 
 use crate::config::ResourceConfig;
-use crate::error::DockerError;
-
-// ─── Trait ────────────────────────────────────────────────────────────────────
-
-/// Abstraction over Docker container lifecycle operations used by the deploy
-/// orchestrator. Implemented by [`DockerClient`]; can be mocked in tests.
-pub trait ContainerRuntime: Send + Sync {
-    /// Pull `image:tag` from a registry.
-    fn pull_image<'a>(
-        &'a self,
-        image: &'a str,
-        tag: &'a str,
-        credentials: Option<bollard::auth::DockerCredentials>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>;
-
-    /// Create and start a container; returns `(container_id, host_port)`.
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn create_and_start<'a>(
-        &'a self,
-        app_name: &'a str,
-        image: &'a str,
-        tag: &'a str,
-        container_port: u16,
-        env_vars: Vec<String>,
-        network: &'a str,
-        resources: &'a ResourceConfig,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(String, u16), DockerError>> + Send + 'a>,
-    >;
-
-    /// Stop and remove a container by ID.
-    fn stop_and_remove<'a>(
-        &'a self,
-        container_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>;
-
-    /// Check if a container is currently running.
-    fn container_is_running<'a>(
-        &'a self,
-        container_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, DockerError>> + Send + 'a>>;
-}
-
-impl ContainerRuntime for DockerClient {
-    fn pull_image<'a>(
-        &'a self,
-        image: &'a str,
-        tag: &'a str,
-        credentials: Option<bollard::auth::DockerCredentials>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>
-    {
-        Box::pin(DockerClient::pull_image(self, image, tag, credentials))
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn create_and_start<'a>(
-        &'a self,
-        app_name: &'a str,
-        image: &'a str,
-        tag: &'a str,
-        container_port: u16,
-        env_vars: Vec<String>,
-        network: &'a str,
-        resources: &'a ResourceConfig,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(String, u16), DockerError>> + Send + 'a>,
-    > {
-        Box::pin(DockerClient::create_and_start(
-            self,
-            app_name,
-            image,
-            tag,
-            container_port,
-            env_vars,
-            network,
-            resources,
-        ))
-    }
-
-    fn stop_and_remove<'a>(
-        &'a self,
-        container_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>
-    {
-        Box::pin(DockerClient::stop_and_remove(self, container_id))
-    }
-
-    fn container_is_running<'a>(
-        &'a self,
-        container_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, DockerError>> + Send + 'a>>
-    {
-        Box::pin(DockerClient::container_is_running(self, container_id))
-    }
-}
+use crate::error::{DockerError, RuntimeError};
+use crate::runtime::{RegistryCredentials, RuntimeBackend};
 
 /// A thin wrapper around [`bollard::Docker`] providing higher-level container
 /// lifecycle operations used by the slip deploy daemon.
@@ -148,7 +56,7 @@ impl DockerClient {
         &self,
         image: &str,
         tag: &str,
-        credentials: Option<DockerCredentials>,
+        credentials: Option<RegistryCredentials>,
     ) -> Result<(), DockerError> {
         info!(image, tag, "pulling image");
 
@@ -158,7 +66,13 @@ impl DockerClient {
             ..Default::default()
         });
 
-        let mut stream = self.docker.create_image(options, None, credentials);
+        let docker_creds = credentials.map(|c| DockerCredentials {
+            username: Some(c.username),
+            password: Some(c.password),
+            ..Default::default()
+        });
+
+        let mut stream = self.docker.create_image(options, None, docker_creds);
 
         while let Some(item) = stream.next().await {
             match item {
@@ -330,6 +244,93 @@ impl DockerClient {
         Ok(running)
     }
 
+    /// Extract a file from an image without starting a container.
+    ///
+    /// 1. Creates a temporary container from the image (not started).
+    /// 2. Downloads the file via the archive API (returns a tar stream).
+    /// 3. Extracts the file from the tar archive.
+    /// 4. Removes the temporary container (always, even on error).
+    ///
+    /// Returns `Ok(None)` if the file does not exist in the image.
+    pub async fn extract_file(
+        &self,
+        image: &str,
+        tag: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, DockerError> {
+        let image_ref = format!("{image}:{tag}");
+        let suffix = &ulid::Ulid::new().to_string()[..8];
+        let container_name = format!("slip-extract-{suffix}");
+
+        debug!(
+            image_ref,
+            container_name, path, "creating temp container for file extraction"
+        );
+
+        let config = bollard::container::Config::<String> {
+            image: Some(image_ref),
+            ..Default::default()
+        };
+        let create_opts = CreateContainerOptions {
+            name: container_name.clone(),
+            platform: None::<String>,
+        };
+
+        let response = self
+            .docker
+            .create_container(Some(create_opts), config)
+            .await?;
+        let container_id = response.id;
+
+        debug!(container_id, path, "downloading file from temp container");
+
+        // Download, then always clean up
+        let result = self.download_file_from_container(&container_id, path).await;
+
+        let _ = self
+            .docker
+            .remove_container(
+                &container_id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        debug!(container_id, "temp container removed");
+        result
+    }
+
+    async fn download_file_from_container(
+        &self,
+        container_id: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, DockerError> {
+        let mut download = self.docker.download_from_container(
+            container_id,
+            Some(bollard::container::DownloadFromContainerOptions { path }),
+        );
+
+        // Collect the Bytes chunks from the stream into a single Vec<u8>
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            match download.next().await {
+                Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                Some(Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })) => {
+                    return Ok(None);
+                }
+                Some(Err(e)) => return Err(DockerError::Api(e)),
+                None => break,
+            }
+        }
+
+        extract_file_from_tar(&buf, path)
+    }
+
     /// Ensure a Docker bridge network with the given name exists.
     ///
     /// If the network already exists this is a no-op.
@@ -367,6 +368,160 @@ impl DockerClient {
 
         info!(name, "network created");
         Ok(())
+    }
+}
+
+// ─── Tar extraction helper ────────────────────────────────────────────────────
+
+/// Extract a single file from a tar archive by matching the filename component
+/// of `path`.
+///
+/// Docker's download archive API wraps a single file in a tar, so we look for
+/// the first entry whose filename matches the basename of `path`.
+pub(crate) fn extract_file_from_tar(
+    tar_bytes: &[u8],
+    path: &str,
+) -> Result<Option<Vec<u8>>, DockerError> {
+    let mut archive = tar::Archive::new(tar_bytes);
+    let filename = std::path::Path::new(path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(path);
+
+    for entry in archive
+        .entries()
+        .map_err(|e| DockerError::PullFailed(format!("tar read error: {e}")))?
+    {
+        let mut entry =
+            entry.map_err(|e| DockerError::PullFailed(format!("tar entry error: {e}")))?;
+        let entry_path = entry
+            .path()
+            .map_err(|e| DockerError::PullFailed(format!("tar path error: {e}")))?;
+
+        if entry_path.file_name().and_then(|f| f.to_str()) == Some(filename) {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut buf)
+                .map_err(|e| DockerError::PullFailed(format!("tar read error: {e}")))?;
+            return Ok(Some(buf));
+        }
+    }
+
+    Ok(None)
+}
+
+// ─── RuntimeBackend impl ──────────────────────────────────────────────────────
+
+impl RuntimeBackend for DockerClient {
+    fn name(&self) -> &str {
+        "docker"
+    }
+
+    fn ping(
+        &self,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + '_>> {
+        Box::pin(async {
+            DockerClient::ping(self)
+                .await
+                .map_err(|e| RuntimeError::Connection(e.to_string()))
+        })
+    }
+
+    fn ensure_network<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            DockerClient::ensure_network(self, name)
+                .await
+                .map_err(|e| RuntimeError::NetworkError(e.to_string()))
+        })
+    }
+
+    fn pull_image<'a>(
+        &'a self,
+        image: &'a str,
+        tag: &'a str,
+        credentials: Option<RegistryCredentials>,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            DockerClient::pull_image(self, image, tag, credentials)
+                .await
+                .map_err(|e| RuntimeError::PullFailed(e.to_string()))
+        })
+    }
+
+    fn create_and_start<'a>(
+        &'a self,
+        app_name: &'a str,
+        image: &'a str,
+        tag: &'a str,
+        container_port: u16,
+        env_vars: Vec<String>,
+        network: &'a str,
+        resources: &'a ResourceConfig,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(String, u16), RuntimeError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            DockerClient::create_and_start(
+                self,
+                app_name,
+                image,
+                tag,
+                container_port,
+                env_vars,
+                network,
+                resources,
+            )
+            .await
+            .map_err(RuntimeError::from)
+        })
+    }
+
+    fn stop_and_remove<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            DockerClient::stop_and_remove(self, container_id)
+                .await
+                .map_err(RuntimeError::from)
+        })
+    }
+
+    fn container_is_running<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<bool, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            DockerClient::container_is_running(self, container_id)
+                .await
+                .map_err(RuntimeError::from)
+        })
+    }
+
+    fn container_exists<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<bool, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            DockerClient::container_exists(self, container_id)
+                .await
+                .map_err(RuntimeError::from)
+        })
+    }
+
+    fn extract_file<'a>(
+        &'a self,
+        image: &'a str,
+        tag: &'a str,
+        path: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>, RuntimeError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            DockerClient::extract_file(self, image, tag, path)
+                .await
+                .map_err(RuntimeError::from)
+        })
     }
 }
 
@@ -419,7 +574,7 @@ pub fn parse_cpu_limit(cpus: &Option<String>) -> Option<i64> {
 
 /// Extract the host port Docker assigned for `container_port/tcp` from an
 /// [`ContainerInspectResponse`].
-pub fn extract_host_port(
+pub(crate) fn extract_host_port(
     info: &ContainerInspectResponse,
     container_port: u16,
 ) -> Result<u16, DockerError> {

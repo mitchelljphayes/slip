@@ -123,6 +123,28 @@ pub struct SlipConfig {
     pub auth: AuthConfig,
     pub registry: RegistryConfig,
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
+}
+
+/// Container runtime backend settings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuntimeConfig {
+    /// Which runtime backend to use: "docker", "podman", or "auto" (default).
+    #[serde(default = "default_runtime_backend")]
+    pub backend: String,
+}
+
+fn default_runtime_backend() -> String {
+    "auto".to_string()
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_runtime_backend(),
+        }
+    }
 }
 
 /// HTTP server settings.
@@ -272,7 +294,7 @@ pub struct ResourceConfig {
     pub cpus: Option<String>,
 }
 
-/// Docker network settings.
+/// Container network settings.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NetworkConfig {
     #[serde(default = "default_network_name")]
@@ -474,6 +496,7 @@ secret = "s"
         assert_eq!(cfg.caddy.admin_api, "http://localhost:2019");
         assert_eq!(cfg.storage.path, PathBuf::from("/var/lib/slip"));
         assert!(cfg.registry.ghcr_token.is_none());
+        assert_eq!(cfg.runtime.backend, "auto");
     }
 
     // ── AppConfig parsing ────────────────────────────────────────────────────

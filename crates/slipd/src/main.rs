@@ -4,9 +4,10 @@ use std::sync::Arc;
 use chrono::Utc;
 use clap::Parser;
 use dashmap::DashMap;
+use slip_core::runtime::RuntimeBackend;
 use slip_core::{
-    AppState, CaddyClient, DockerClient, HealthChecker, build_router, load_app_states, load_config,
-    reconcile_routes, verify_containers,
+    AppState, CaddyClient, DockerClient, HealthChecker, PodmanBackend, build_router,
+    load_app_states, load_config, reconcile_routes, verify_containers,
 };
 use tokio::sync::RwLock;
 
@@ -76,25 +77,61 @@ async fn main() -> anyhow::Result<()> {
         "config loaded"
     );
 
-    // ── Connect to Docker ────────────────────────────────────────────────────
-    let docker = DockerClient::new().map_err(|e| {
-        tracing::error!(error = %e, "failed to connect to Docker daemon");
-        anyhow::anyhow!("Docker connection error: {e}")
+    // ── Connect to container runtime ─────────────────────────────────────────
+    let runtime: Arc<dyn RuntimeBackend> = match slip_config.runtime.backend.as_str() {
+        "docker" => Arc::new(DockerClient::new().map_err(|e| {
+            tracing::error!(error = %e, "failed to connect to Docker daemon");
+            anyhow::anyhow!("Docker connection error: {e}")
+        })?),
+        "podman" => Arc::new(PodmanBackend::new().map_err(|e| {
+            tracing::error!(error = %e, "failed to connect to Podman");
+            anyhow::anyhow!("Podman connection error: {e}")
+        })?),
+        "auto" => {
+            // Try Podman first, then Docker
+            if let Ok(podman) = PodmanBackend::new() {
+                if podman.ping().await.is_ok() {
+                    tracing::info!("auto-detected Podman runtime");
+                    Arc::new(podman)
+                } else if let Ok(docker) = DockerClient::new() {
+                    tracing::info!("auto-detected Docker runtime");
+                    Arc::new(docker)
+                } else {
+                    tracing::error!("no container runtime found (tried Podman and Docker)");
+                    return Err(anyhow::anyhow!(
+                        "no container runtime found (tried Podman and Docker)"
+                    ));
+                }
+            } else if let Ok(docker) = DockerClient::new() {
+                tracing::info!("auto-detected Docker runtime");
+                Arc::new(docker)
+            } else {
+                tracing::error!("no container runtime found");
+                return Err(anyhow::anyhow!("no container runtime found"));
+            }
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "unknown runtime backend '{other}': valid values are \"docker\", \"podman\", \"auto\""
+            ));
+        }
+    };
+
+    // Verify runtime is reachable (fail fast if not)
+    runtime.ping().await.map_err(|e| {
+        tracing::error!(error = %e, "runtime daemon is not responding");
+        anyhow::anyhow!("runtime ping error: {e}")
     })?;
 
-    // Verify Docker is reachable (fail fast if not)
-    docker.ping().await.map_err(|e| {
-        tracing::error!(error = %e, "Docker daemon is not responding");
-        anyhow::anyhow!("Docker ping error: {e}")
-    })?;
+    tracing::info!(backend = runtime.name(), "runtime connected");
 
     // ── Connect to Caddy ─────────────────────────────────────────────────────
     let caddy = CaddyClient::new(slip_config.caddy.admin_api.clone());
 
     // ── Bootstrap infrastructure (before state reconciliation) ───────────────
-    docker.ensure_network("slip").await.map_err(|e| {
-        tracing::error!(error = %e, "failed to create Docker network");
-        anyhow::anyhow!("Docker network error: {e}")
+    runtime.ensure_network("slip").await.map_err(|e| {
+        tracing::error!(error = %e, "failed to create network");
+        anyhow::anyhow!("network error: {e}")
     })?;
 
     caddy.bootstrap().await.map_err(|e| {
@@ -107,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Load and reconcile persisted state ───────────────────────────────────
     let state_dir = slip_config.storage.path.join("state");
     let raw_states = load_app_states(&state_dir).unwrap_or_default();
-    let verified_states = verify_containers(&docker, raw_states).await;
+    let verified_states = verify_containers(runtime.as_ref(), raw_states).await;
 
     if let Err(e) = reconcile_routes(&caddy, &verified_states, &apps).await {
         tracing::warn!(error = %e, "caddy route reconciliation failed on startup (non-fatal)");
@@ -118,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
         config: slip_config,
         apps,
         deploy_locks: DashMap::new(),
-        docker,
+        runtime,
         caddy,
         health: HealthChecker::new(),
         app_states: RwLock::new(verified_states),

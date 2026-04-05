@@ -17,8 +17,8 @@ use crate::auth::{resolve_secret, verify_signature};
 use crate::caddy::CaddyClient;
 use crate::config::{AppConfig, SlipConfig};
 use crate::deploy::{AppRuntimeState, DeployContext, TriggerSource, execute_deploy};
-use crate::docker::DockerClient;
 use crate::health::HealthChecker;
+use crate::runtime::{RegistryCredentials, RuntimeBackend};
 
 // ─── Request / Response types ─────────────────────────────────────────────────
 
@@ -51,7 +51,7 @@ pub struct StatusResponse {
     pub daemon: String,
     pub uptime_seconds: i64,
     pub caddy: String,
-    pub docker: String,
+    pub runtime: String,
     pub apps: HashMap<String, AppStatusResponse>,
 }
 
@@ -118,8 +118,8 @@ pub struct AppState {
     ///
     /// TODO(Phase 2): Add cleanup when apps are removed during hot-reload.
     pub deploy_locks: DashMap<String, Arc<Mutex<()>>>,
-    /// Docker daemon client.
-    pub docker: DockerClient,
+    /// Container runtime backend (Docker, Podman, etc.).
+    pub runtime: Arc<dyn RuntimeBackend>,
     /// Caddy admin API client.
     pub caddy: CaddyClient,
     /// HTTP health checker.
@@ -138,16 +138,15 @@ impl AppState {
         crate::deploy::record_deploy(&self.deploys, ctx);
     }
 
-    /// Build Docker registry credentials from the configured GHCR token, if any.
-    pub fn docker_credentials(&self) -> Option<bollard::auth::DockerCredentials> {
+    /// Build registry credentials from the configured GHCR token, if any.
+    pub fn registry_credentials(&self) -> Option<RegistryCredentials> {
         self.config
             .registry
             .ghcr_token
             .as_ref()
-            .map(|token| bollard::auth::DockerCredentials {
-                username: Some("slip".to_string()),
-                password: Some(token.clone()),
-                ..Default::default()
+            .map(|token| RegistryCredentials {
+                username: "slip".to_string(),
+                password: token.clone(),
             })
     }
 }
@@ -296,13 +295,13 @@ async fn handle_deploy(
 async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<StatusResponse>) {
     let uptime_seconds = (Utc::now() - state.started_at).num_seconds();
 
-    // Check Caddy and Docker health
+    // Check Caddy and runtime health
     let caddy_health = if state.caddy.ping().await.is_ok() {
         "ok"
     } else {
         "error"
     };
-    let docker_health = if state.docker.ping().await.is_ok() {
+    let runtime_health = if state.runtime.ping().await.is_ok() {
         "ok"
     } else {
         "error"
@@ -348,7 +347,7 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
             daemon: "slipd".to_string(),
             uptime_seconds,
             caddy: caddy_health.to_string(),
-            docker: docker_health.to_string(),
+            runtime: runtime_health.to_string(),
             apps,
         }),
     )
@@ -371,6 +370,7 @@ async fn handle_deploy_status(
     let status_str = match ctx.status {
         crate::deploy::DeployStatus::Accepted => "accepted",
         crate::deploy::DeployStatus::Pulling => "pulling",
+        crate::deploy::DeployStatus::Configuring => "configuring",
         crate::deploy::DeployStatus::Starting => "starting",
         crate::deploy::DeployStatus::HealthChecking => "health_checking",
         crate::deploy::DeployStatus::Switching => "switching",
@@ -411,7 +411,8 @@ mod tests {
     use crate::caddy::CaddyClient;
     use crate::config::{
         AppConfig, AppInfo, AuthConfig, CaddyConfig, DeployConfig, HealthConfig, NetworkConfig,
-        RegistryConfig, ResourceConfig, RoutingConfig, ServerConfig, SlipConfig, StorageConfig,
+        RegistryConfig, ResourceConfig, RoutingConfig, RuntimeConfig, ServerConfig, SlipConfig,
+        StorageConfig,
     };
     use crate::deploy::{AppRuntimeState, AppStatus, DeployContext, DeployStatus, TriggerSource};
     use crate::docker::DockerClient;
@@ -432,6 +433,7 @@ mod tests {
             },
             registry: RegistryConfig { ghcr_token: None },
             storage: StorageConfig::default(),
+            runtime: RuntimeConfig::default(),
         }
     }
 
@@ -465,8 +467,9 @@ mod tests {
             config: test_slip_config(),
             apps,
             deploy_locks: DashMap::new(),
-            docker: DockerClient::new_with_url("http://127.0.0.1:19998")
-                .expect("DockerClient::new"),
+            runtime: Arc::new(
+                DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            ),
             caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
@@ -686,8 +689,9 @@ mod tests {
             config: test_slip_config(),
             apps,
             deploy_locks,
-            docker: DockerClient::new_with_url("http://127.0.0.1:19998")
-                .expect("DockerClient::new"),
+            runtime: Arc::new(
+                DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            ),
             caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
@@ -730,8 +734,9 @@ mod tests {
             config: test_slip_config(),
             apps,
             deploy_locks: DashMap::new(),
-            docker: DockerClient::new_with_url("http://127.0.0.1:19998")
-                .expect("DockerClient::new"),
+            runtime: Arc::new(
+                DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            ),
             caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),

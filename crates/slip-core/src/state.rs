@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::caddy::{CaddyClient, RouteInfo};
 use crate::config::AppConfig;
 use crate::deploy::{AppRuntimeState, AppStatus};
-use crate::docker::DockerClient;
 use crate::error::CaddyError;
+use crate::runtime::RuntimeBackend;
 
 // ─── Persisted state shape ────────────────────────────────────────────────────
 
@@ -133,13 +133,13 @@ pub fn load_app_states(
 
 // ─── Verify containers ────────────────────────────────────────────────────────
 
-/// Verify that persisted containers still exist in Docker.
+/// Verify that persisted containers still exist in the runtime.
 ///
 /// For each app state that has a `current_container_id`, calls
-/// [`DockerClient::container_exists`]. If the container is gone, the state is
+/// [`RuntimeBackend::container_exists`]. If the container is gone, the state is
 /// cleaned up and the status set to [`AppStatus::NotDeployed`].
 pub async fn verify_containers(
-    docker: &DockerClient,
+    runtime: &dyn RuntimeBackend,
     states: HashMap<String, AppRuntimeState>,
 ) -> HashMap<String, AppRuntimeState> {
     let mut verified = HashMap::with_capacity(states.len());
@@ -151,7 +151,7 @@ pub async fn verify_containers(
                 verified.insert(app_name, state);
             }
             Some(container_id) => {
-                match docker.container_exists(container_id).await {
+                match runtime.container_exists(container_id).await {
                     Ok(true) => {
                         tracing::info!(app = %app_name, container_id, "container verified running");
                         verified.insert(app_name, state);

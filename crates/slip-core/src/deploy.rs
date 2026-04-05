@@ -11,8 +11,8 @@ use tokio::sync::RwLock;
 use crate::api::AppState;
 use crate::caddy::ReverseProxy;
 use crate::config::{AppConfig, SlipConfig};
-use crate::docker::ContainerRuntime;
 use crate::health::HealthCheck;
+use crate::runtime::{RegistryCredentials, RuntimeBackend};
 use crate::state;
 
 // ─── Status types ─────────────────────────────────────────────────────────────
@@ -22,6 +22,8 @@ use crate::state;
 pub enum DeployStatus {
     Accepted,
     Pulling,
+    /// Extracting and merging repo config from the image.
+    Configuring,
     Starting,
     HealthChecking,
     Switching,
@@ -125,7 +127,7 @@ pub(crate) struct DeploySharedState<'a> {
     pub apps: &'a HashMap<String, AppConfig>,
     pub app_states: &'a RwLock<HashMap<String, AppRuntimeState>>,
     pub deploys: &'a DashMap<String, DeployContext>,
-    pub credentials: Option<bollard::auth::DockerCredentials>,
+    pub credentials: Option<RegistryCredentials>,
 }
 
 // ─── Core orchestrator ────────────────────────────────────────────────────────
@@ -141,16 +143,23 @@ pub async fn execute_deploy(state: Arc<AppState>, ctx: DeployContext) {
         apps: &state.apps,
         app_states: &state.app_states,
         deploys: &state.deploys,
-        credentials: state.docker_credentials(),
+        credentials: state.registry_credentials(),
     };
-    execute_deploy_inner(shared, &state.docker, &state.caddy, &state.health, ctx).await;
+    execute_deploy_inner(
+        shared,
+        state.runtime.as_ref(),
+        &state.caddy,
+        &state.health,
+        ctx,
+    )
+    .await;
 }
 
 /// Inner deploy state machine — generic over trait objects so it can be driven
 /// from tests with mock implementations.
 pub(crate) async fn execute_deploy_inner(
     shared: DeploySharedState<'_>,
-    docker: &dyn ContainerRuntime,
+    runtime: &dyn RuntimeBackend,
     caddy: &dyn ReverseProxy,
     health: &dyn HealthCheck,
     mut ctx: DeployContext,
@@ -184,7 +193,7 @@ pub(crate) async fn execute_deploy_inner(
         "pulling image"
     );
 
-    if let Err(e) = docker
+    if let Err(e) = runtime
         .pull_image(&ctx.image, &ctx.tag, shared.credentials)
         .await
     {
@@ -194,20 +203,76 @@ pub(crate) async fn execute_deploy_inner(
         return;
     }
 
+    // ── EXTRACT + MERGE CONFIG ────────────────────────────────────────────────
+    ctx.status = DeployStatus::Configuring;
+    record_deploy(shared.deploys, &ctx);
+
+    let merged = match runtime
+        .extract_file(&ctx.image, &ctx.tag, "/slip/slip.toml")
+        .await
+    {
+        Ok(Some(bytes)) => {
+            tracing::info!(app = %app_name, "found repo config in image");
+            match crate::repo_config::parse_repo_config(&bytes) {
+                Ok(repo_config) => {
+                    if repo_config.app.name != app_name {
+                        ctx.fail(&format!(
+                            "repo config app name '{}' does not match deploy app '{}'",
+                            repo_config.app.name, app_name
+                        ));
+                        record_deploy(shared.deploys, &ctx);
+                        set_app_failed(shared.app_states, &app_name);
+                        return;
+                    }
+                    Some(crate::merge::merge_config(&app_config, &repo_config))
+                }
+                Err(e) => {
+                    ctx.fail(&format!("failed to parse repo config: {e}"));
+                    record_deploy(shared.deploys, &ctx);
+                    set_app_failed(shared.app_states, &app_name);
+                    return;
+                }
+            }
+        }
+        Ok(None) => {
+            tracing::debug!(app = %app_name, "no repo config in image, using server config only");
+            None
+        }
+        Err(crate::error::RuntimeError::Unsupported(_)) => {
+            tracing::debug!(
+                app = %app_name,
+                "extract_file not supported by runtime, using server config only"
+            );
+            None
+        }
+        Err(e) => {
+            ctx.fail(&format!("failed to extract config from image: {e}"));
+            record_deploy(shared.deploys, &ctx);
+            set_app_failed(shared.app_states, &app_name);
+            return;
+        }
+    };
+
+    // Use merged config if available, otherwise fall back to server-only config.
+    let effective_config = match &merged {
+        Some(m) => m.app.clone(),
+        None => app_config.clone(),
+    };
+
     // ── START NEW ────────────────────────────────────────────────────────────
     ctx.status = DeployStatus::Starting;
     record_deploy(shared.deploys, &ctx);
 
-    let env_vars = resolve_env_vars_for_app(&app_config);
-    match docker
+    let env_vars = resolve_env_vars_for_app(&effective_config);
+    match runtime
         .create_and_start(
             &app_name,
             &ctx.image,
             &ctx.tag,
-            app_config.routing.port,
+            effective_config.routing.port,
             env_vars,
-            &app_config.network.name,
-            &app_config.resources,
+            &effective_config.network.name,
+            &effective_config.resources,
         )
         .await
     {
@@ -237,10 +302,10 @@ pub(crate) async fn execute_deploy_inner(
         }
     };
 
-    if let Err(e) = health.check(new_port, &app_config.health).await {
+    if let Err(e) = health.check(new_port, &effective_config.health).await {
         tracing::error!(app = %app_name, error = %e, "health check failed");
         if let Some(ref id) = ctx.new_container_id {
-            let _ = docker.stop_and_remove(id).await;
+            let _ = runtime.stop_and_remove(id).await;
         }
         ctx.fail(&format!("health check failed: {e}"));
         record_deploy(shared.deploys, &ctx);
@@ -251,7 +316,7 @@ pub(crate) async fn execute_deploy_inner(
     // Verify container is still running after health check wait
     // (container could have crashed during start_period wait)
     if let Some(ref id) = ctx.new_container_id {
-        match docker.container_is_running(id).await {
+        match runtime.container_is_running(id).await {
             Ok(true) => {}
             Ok(false) => {
                 tracing::error!(app = %app_name, container_id = %id, "container not running after health check");
@@ -282,12 +347,12 @@ pub(crate) async fn execute_deploy_inner(
     };
 
     if let Err(e) = caddy
-        .set_route(&app_name, &app_config.routing.domain, new_port)
+        .set_route(&app_name, &effective_config.routing.domain, new_port)
         .await
     {
         tracing::error!(app = %app_name, error = %e, "caddy route update failed");
         if let Some(ref id) = ctx.new_container_id {
-            let _ = docker.stop_and_remove(id).await;
+            let _ = runtime.stop_and_remove(id).await;
         }
         ctx.fail(&format!("caddy route update failed: {e}"));
         record_deploy(shared.deploys, &ctx);
@@ -319,8 +384,8 @@ pub(crate) async fn execute_deploy_inner(
     // ── DRAIN + STOP OLD ─────────────────────────────────────────────────────
     if let Some(old_id) = old_container_id {
         tracing::info!(app = %app_name, "draining old container");
-        tokio::time::sleep(app_config.deploy.drain_timeout).await;
-        if let Err(e) = docker.stop_and_remove(&old_id).await {
+        tokio::time::sleep(effective_config.deploy.drain_timeout).await;
+        if let Err(e) = runtime.stop_and_remove(&old_id).await {
             tracing::warn!(
                 app = %app_name,
                 error = %e,
@@ -410,13 +475,13 @@ mod tests {
         AppConfig, AppInfo, AuthConfig, CaddyConfig, DeployConfig, HealthConfig, RegistryConfig,
         ResourceConfig, RoutingConfig, ServerConfig, SlipConfig, StorageConfig,
     };
-    use crate::docker::ContainerRuntime;
-    use crate::error::{CaddyError, DockerError, HealthError};
+    use crate::error::{CaddyError, HealthError, RuntimeError};
     use crate::health::HealthCheck;
+    use crate::runtime::{RegistryCredentials, RuntimeBackend};
 
-    // ── Mock: ContainerRuntime ────────────────────────────────────────────────
+    // ── Mock: RuntimeBackend ──────────────────────────────────────────────────
 
-    /// Configurable mock for `ContainerRuntime`.
+    /// Configurable mock for `RuntimeBackend`.
     struct MockDocker {
         /// Whether `pull_image` should succeed.
         pull_ok: bool,
@@ -425,6 +490,11 @@ mod tests {
         container_port: u16,
         /// Tracks how many times `stop_and_remove` was called.
         stop_count: Arc<AtomicU32>,
+        /// Result returned by `extract_file`:
+        /// - `Ok(Some(bytes))` → file found with content
+        /// - `Ok(None)` → file not found
+        /// - `Err(e)` → extraction error (including Unsupported)
+        extract_result: Result<Option<Vec<u8>>, RuntimeError>,
     }
 
     impl MockDocker {
@@ -434,6 +504,10 @@ mod tests {
                 container_id: "mock-container-id".to_string(),
                 container_port: 54321,
                 stop_count: Arc::new(AtomicU32::new(0)),
+                // Default: extract_file returns Unsupported (same as the trait default)
+                extract_result: Err(RuntimeError::Unsupported(
+                    "mock does not implement extract_file".to_string(),
+                )),
             }
         }
 
@@ -444,23 +518,66 @@ mod tests {
             }
         }
 
+        fn with_repo_config(bytes: Vec<u8>) -> Self {
+            Self {
+                extract_result: Ok(Some(bytes)),
+                ..Self::new()
+            }
+        }
+
+        fn with_no_repo_config() -> Self {
+            Self {
+                extract_result: Ok(None),
+                ..Self::new()
+            }
+        }
+
+        fn with_extract_error(e: RuntimeError) -> Self {
+            Self {
+                extract_result: Err(e),
+                ..Self::new()
+            }
+        }
+
         fn stop_count(&self) -> Arc<AtomicU32> {
             self.stop_count.clone()
         }
     }
 
-    impl ContainerRuntime for MockDocker {
+    impl RuntimeBackend for MockDocker {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn ping(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + '_>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn ensure_network<'a>(
+            &'a self,
+            _name: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
         fn pull_image<'a>(
             &'a self,
             _image: &'a str,
             _tag: &'a str,
-            _credentials: Option<bollard::auth::DockerCredentials>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>
-        {
+            _credentials: Option<RegistryCredentials>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
+        > {
             let result = if self.pull_ok {
                 Ok(())
             } else {
-                Err(DockerError::PullFailed("mock pull failure".to_string()))
+                Err(RuntimeError::PullFailed("mock pull failure".to_string()))
             };
             Box::pin(async move { result })
         }
@@ -475,7 +592,7 @@ mod tests {
             _network: &'a str,
             _resources: &'a crate::config::ResourceConfig,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(String, u16), DockerError>> + Send + 'a>,
+            Box<dyn std::future::Future<Output = Result<(String, u16), RuntimeError>> + Send + 'a>,
         > {
             let result = Ok((self.container_id.clone(), self.container_port));
             Box::pin(async move { result })
@@ -484,8 +601,9 @@ mod tests {
         fn stop_and_remove<'a>(
             &'a self,
             _container_id: &'a str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DockerError>> + Send + 'a>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
+        > {
             self.stop_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
@@ -494,10 +612,49 @@ mod tests {
             &'a self,
             _container_id: &'a str,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<bool, DockerError>> + Send + 'a>,
+            Box<dyn std::future::Future<Output = Result<bool, RuntimeError>> + Send + 'a>,
         > {
             // Mock containers are always running unless explicitly set otherwise
             Box::pin(async { Ok(true) })
+        }
+
+        fn container_exists<'a>(
+            &'a self,
+            _container_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, RuntimeError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(true) })
+        }
+
+        fn extract_file<'a>(
+            &'a self,
+            _image: &'a str,
+            _tag: &'a str,
+            _path: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Option<Vec<u8>>, RuntimeError>> + Send + 'a,
+            >,
+        > {
+            // Clone the stored result to return it
+            let result = match &self.extract_result {
+                Ok(opt) => Ok(opt.clone()),
+                Err(RuntimeError::Unsupported(msg)) => Err(RuntimeError::Unsupported(msg.clone())),
+                Err(RuntimeError::Connection(msg)) => Err(RuntimeError::Connection(msg.clone())),
+                Err(RuntimeError::PullFailed(msg)) => Err(RuntimeError::PullFailed(msg.clone())),
+                Err(RuntimeError::ContainerError(msg)) => {
+                    Err(RuntimeError::ContainerError(msg.clone()))
+                }
+                Err(RuntimeError::NetworkError(msg)) => {
+                    Err(RuntimeError::NetworkError(msg.clone()))
+                }
+                Err(RuntimeError::ContainerNotRunning(msg)) => {
+                    Err(RuntimeError::ContainerNotRunning(msg.clone()))
+                }
+                Err(RuntimeError::NoPortAssigned) => Err(RuntimeError::NoPortAssigned),
+            };
+            Box::pin(async move { result })
         }
     }
 
@@ -582,6 +739,7 @@ mod tests {
             },
             registry: RegistryConfig { ghcr_token: None },
             storage: StorageConfig { path: storage_path },
+            runtime: crate::config::RuntimeConfig::default(),
         }
     }
 
@@ -935,6 +1093,229 @@ mod tests {
             app.current_container_id.as_deref(),
             Some("old-container-keep"),
             "old container should be preserved"
+        );
+    }
+
+    // ── Config extraction integration tests ───────────────────────────────────
+
+    fn valid_repo_config_bytes(app_name: &str) -> Vec<u8> {
+        format!(
+            r#"
+[app]
+name = "{app_name}"
+kind = "container"
+
+[health]
+path = "/healthz"
+
+[defaults.resources]
+memory = "256m"
+"#
+        )
+        .into_bytes()
+    }
+
+    /// Deploy with a valid repo config in the image: merged config should be used.
+    #[tokio::test]
+    async fn test_deploy_with_repo_config_uses_merged_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        // Server config has no health path
+        apps.insert("testapp".to_string(), test_app_config());
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::with_repo_config(valid_repo_config_bytes("testapp"));
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let ctx = test_deploy_ctx();
+        let deploy_id = ctx.id.clone();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            ctx,
+        )
+        .await;
+
+        // Deploy should succeed even with a repo config present
+        let recorded = deploys.get(&deploy_id).unwrap();
+        assert_eq!(recorded.status, DeployStatus::Completed);
+        assert!(recorded.error.is_none());
+    }
+
+    /// Deploy with no repo config in the image: server config used (backwards compat).
+    #[tokio::test]
+    async fn test_deploy_without_repo_config_uses_server_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        // extract_file returns None (file not found in image)
+        let docker = MockDocker::with_no_repo_config();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let ctx = test_deploy_ctx();
+        let deploy_id = ctx.id.clone();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            ctx,
+        )
+        .await;
+
+        // Deploy should succeed using server config only
+        let recorded = deploys.get(&deploy_id).unwrap();
+        assert_eq!(recorded.status, DeployStatus::Completed);
+        assert!(recorded.error.is_none());
+    }
+
+    /// Deploy with invalid TOML in the repo config: deploy fails with parse error.
+    #[tokio::test]
+    async fn test_deploy_with_invalid_repo_config_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        // extract_file returns Some(invalid TOML bytes)
+        let docker = MockDocker::with_repo_config(b"[app\ninvalid toml!!!".to_vec());
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            test_deploy_ctx(),
+        )
+        .await;
+
+        let recorded = deploys.get("dep_test001").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Failed);
+        assert!(
+            recorded
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("failed to parse repo config")
+        );
+    }
+
+    /// Deploy with `extract_file` returning `Unsupported`: deploy continues
+    /// with server config (backwards compat for runtimes without extraction).
+    #[tokio::test]
+    async fn test_deploy_with_unsupported_extract_file_continues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        // MockDocker::new() returns Unsupported by default
+        let docker = MockDocker::new();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let ctx = test_deploy_ctx();
+        let deploy_id = ctx.id.clone();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            ctx,
+        )
+        .await;
+
+        // Should complete successfully using server config
+        let recorded = deploys.get(&deploy_id).unwrap();
+        assert_eq!(recorded.status, DeployStatus::Completed);
+        assert!(recorded.error.is_none());
+    }
+
+    /// Deploy where `extract_file` returns a non-Unsupported error: deploy fails.
+    #[tokio::test]
+    async fn test_deploy_with_extract_file_fatal_error_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        // A connection error — not Unsupported — should abort the deploy
+        let docker = MockDocker::with_extract_error(RuntimeError::Connection(
+            "network unreachable".to_string(),
+        ));
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            test_deploy_ctx(),
+        )
+        .await;
+
+        let recorded = deploys.get("dep_test001").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Failed);
+        assert!(
+            recorded
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("failed to extract config from image")
+        );
+    }
+
+    /// Deploy where repo config's app name doesn't match the deploy app: fails.
+    #[tokio::test]
+    async fn test_deploy_repo_config_name_mismatch_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        // Repo config has a different app name
+        let docker = MockDocker::with_repo_config(valid_repo_config_bytes("differentapp"));
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            test_deploy_ctx(),
+        )
+        .await;
+
+        let recorded = deploys.get("dep_test001").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Failed);
+        assert!(
+            recorded
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("does not match deploy app")
         );
     }
 }

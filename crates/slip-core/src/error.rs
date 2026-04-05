@@ -59,3 +59,33 @@ pub enum DockerError {
     #[error("container {0} is not running after start")]
     ContainerNotRunning(String),
 }
+
+/// Runtime-agnostic errors for container/pod operations.
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeError {
+    #[error("runtime connection error: {0}")]
+    Connection(String),
+    #[error("image pull failed: {0}")]
+    PullFailed(String),
+    #[error("container operation failed: {0}")]
+    ContainerError(String),
+    #[error("no host port assigned")]
+    NoPortAssigned,
+    #[error("container {0} is not running")]
+    ContainerNotRunning(String),
+    #[error("network error: {0}")]
+    NetworkError(String),
+    #[error("operation not supported by this runtime: {0}")]
+    Unsupported(String),
+}
+
+impl From<DockerError> for RuntimeError {
+    fn from(e: DockerError) -> Self {
+        match e {
+            DockerError::Api(e) => RuntimeError::ContainerError(e.to_string()),
+            DockerError::PullFailed(msg) => RuntimeError::PullFailed(msg),
+            DockerError::NoPortAssigned => RuntimeError::NoPortAssigned,
+            DockerError::ContainerNotRunning(id) => RuntimeError::ContainerNotRunning(id),
+        }
+    }
+}

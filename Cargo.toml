@@ -55,6 +55,9 @@ clap = { version = "4", features = ["derive"] }
 # Async utilities
 futures-util = "0.3"
 
+# Tar archive parsing (for image file extraction)
+tar = "0.4"
+
 # Regex (for env var resolution)
 regex = "1"
 
