@@ -20,7 +20,9 @@ use futures_util::StreamExt;
 use tracing::{debug, info, warn};
 
 use crate::config::ResourceConfig;
-use crate::docker::{extract_host_port, parse_cpu_limit, parse_memory_limit};
+use crate::docker::{
+    extract_file_from_tar, extract_host_port, parse_cpu_limit, parse_memory_limit,
+};
 use crate::error::RuntimeError;
 use crate::runtime::{RegistryCredentials, RuntimeBackend};
 
@@ -330,6 +332,105 @@ impl RuntimeBackend for PodmanBackend {
                 }) => Ok(false),
                 Err(e) => Err(RuntimeError::ContainerError(e.to_string())),
             }
+        })
+    }
+
+    fn extract_file<'a>(
+        &'a self,
+        image: &'a str,
+        tag: &'a str,
+        path: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>, RuntimeError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let image_ref = format!("{image}:{tag}");
+            let suffix = &ulid::Ulid::new().to_string()[..8];
+            let container_name = format!("slip-extract-{suffix}");
+
+            debug!(
+                image_ref,
+                container_name, path, "creating temp container for file extraction (podman)"
+            );
+
+            let config = bollard::container::Config::<String> {
+                image: Some(image_ref),
+                ..Default::default()
+            };
+            let create_opts = bollard::container::CreateContainerOptions {
+                name: container_name.clone(),
+                platform: None::<String>,
+            };
+
+            let response = self
+                .client
+                .create_container(Some(create_opts), config)
+                .await
+                .map_err(|e| RuntimeError::ContainerError(e.to_string()))?;
+            let container_id = response.id;
+
+            debug!(
+                container_id,
+                path, "downloading file from temp container (podman)"
+            );
+
+            // Download the file as a tar archive — collect Bytes chunks manually
+            let mut download = self.client.download_from_container(
+                &container_id,
+                Some(bollard::container::DownloadFromContainerOptions { path }),
+            );
+
+            let mut tar_buf: Vec<u8> = Vec::new();
+            let mut download_err: Option<RuntimeError> = None;
+            loop {
+                match download.next().await {
+                    Some(Ok(chunk)) => tar_buf.extend_from_slice(&chunk),
+                    Some(Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    })) => {
+                        // File doesn't exist — clean up and return None
+                        let _ = self
+                            .client
+                            .remove_container(
+                                &container_id,
+                                Some(bollard::container::RemoveContainerOptions {
+                                    force: true,
+                                    ..Default::default()
+                                }),
+                            )
+                            .await;
+                        return Ok(None);
+                    }
+                    Some(Err(e)) => {
+                        download_err = Some(RuntimeError::ContainerError(e.to_string()));
+                        break;
+                    }
+                    None => break,
+                }
+            }
+
+            let bytes_result: Result<Vec<u8>, RuntimeError> = match download_err {
+                Some(e) => Err(e),
+                None => Ok(tar_buf),
+            };
+
+            // Always clean up the temp container
+            let _ = self
+                .client
+                .remove_container(
+                    &container_id,
+                    Some(bollard::container::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+
+            debug!(container_id, "temp container removed (podman)");
+
+            let bytes = bytes_result?;
+            extract_file_from_tar(&bytes, path)
+                .map_err(|e| RuntimeError::ContainerError(e.to_string()))
         })
     }
 }

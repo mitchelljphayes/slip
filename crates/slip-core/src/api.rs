@@ -370,6 +370,7 @@ async fn handle_deploy_status(
     let status_str = match ctx.status {
         crate::deploy::DeployStatus::Accepted => "accepted",
         crate::deploy::DeployStatus::Pulling => "pulling",
+        crate::deploy::DeployStatus::Configuring => "configuring",
         crate::deploy::DeployStatus::Starting => "starting",
         crate::deploy::DeployStatus::HealthChecking => "health_checking",
         crate::deploy::DeployStatus::Switching => "switching",

@@ -56,7 +56,7 @@ impl DockerClient {
         &self,
         image: &str,
         tag: &str,
-        credentials: Option<DockerCredentials>,
+        credentials: Option<RegistryCredentials>,
     ) -> Result<(), DockerError> {
         info!(image, tag, "pulling image");
 
@@ -66,7 +66,13 @@ impl DockerClient {
             ..Default::default()
         });
 
-        let mut stream = self.docker.create_image(options, None, credentials);
+        let docker_creds = credentials.map(|c| DockerCredentials {
+            username: Some(c.username),
+            password: Some(c.password),
+            ..Default::default()
+        });
+
+        let mut stream = self.docker.create_image(options, None, docker_creds);
 
         while let Some(item) = stream.next().await {
             match item {
@@ -238,6 +244,93 @@ impl DockerClient {
         Ok(running)
     }
 
+    /// Extract a file from an image without starting a container.
+    ///
+    /// 1. Creates a temporary container from the image (not started).
+    /// 2. Downloads the file via the archive API (returns a tar stream).
+    /// 3. Extracts the file from the tar archive.
+    /// 4. Removes the temporary container (always, even on error).
+    ///
+    /// Returns `Ok(None)` if the file does not exist in the image.
+    pub async fn extract_file(
+        &self,
+        image: &str,
+        tag: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, DockerError> {
+        let image_ref = format!("{image}:{tag}");
+        let suffix = &ulid::Ulid::new().to_string()[..8];
+        let container_name = format!("slip-extract-{suffix}");
+
+        debug!(
+            image_ref,
+            container_name, path, "creating temp container for file extraction"
+        );
+
+        let config = bollard::container::Config::<String> {
+            image: Some(image_ref),
+            ..Default::default()
+        };
+        let create_opts = CreateContainerOptions {
+            name: container_name.clone(),
+            platform: None::<String>,
+        };
+
+        let response = self
+            .docker
+            .create_container(Some(create_opts), config)
+            .await?;
+        let container_id = response.id;
+
+        debug!(container_id, path, "downloading file from temp container");
+
+        // Download, then always clean up
+        let result = self.download_file_from_container(&container_id, path).await;
+
+        let _ = self
+            .docker
+            .remove_container(
+                &container_id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        debug!(container_id, "temp container removed");
+        result
+    }
+
+    async fn download_file_from_container(
+        &self,
+        container_id: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, DockerError> {
+        let mut download = self.docker.download_from_container(
+            container_id,
+            Some(bollard::container::DownloadFromContainerOptions { path }),
+        );
+
+        // Collect the Bytes chunks from the stream into a single Vec<u8>
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            match download.next().await {
+                Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                Some(Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })) => {
+                    return Ok(None);
+                }
+                Some(Err(e)) => return Err(DockerError::Api(e)),
+                None => break,
+            }
+        }
+
+        extract_file_from_tar(&buf, path)
+    }
+
     /// Ensure a Docker bridge network with the given name exists.
     ///
     /// If the network already exists this is a no-op.
@@ -278,6 +371,44 @@ impl DockerClient {
     }
 }
 
+// ─── Tar extraction helper ────────────────────────────────────────────────────
+
+/// Extract a single file from a tar archive by matching the filename component
+/// of `path`.
+///
+/// Docker's download archive API wraps a single file in a tar, so we look for
+/// the first entry whose filename matches the basename of `path`.
+pub(crate) fn extract_file_from_tar(
+    tar_bytes: &[u8],
+    path: &str,
+) -> Result<Option<Vec<u8>>, DockerError> {
+    let mut archive = tar::Archive::new(tar_bytes);
+    let filename = std::path::Path::new(path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(path);
+
+    for entry in archive
+        .entries()
+        .map_err(|e| DockerError::PullFailed(format!("tar read error: {e}")))?
+    {
+        let mut entry =
+            entry.map_err(|e| DockerError::PullFailed(format!("tar entry error: {e}")))?;
+        let entry_path = entry
+            .path()
+            .map_err(|e| DockerError::PullFailed(format!("tar path error: {e}")))?;
+
+        if entry_path.file_name().and_then(|f| f.to_str()) == Some(filename) {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut buf)
+                .map_err(|e| DockerError::PullFailed(format!("tar read error: {e}")))?;
+            return Ok(Some(buf));
+        }
+    }
+
+    Ok(None)
+}
+
 // ─── RuntimeBackend impl ──────────────────────────────────────────────────────
 
 impl RuntimeBackend for DockerClient {
@@ -313,12 +444,7 @@ impl RuntimeBackend for DockerClient {
         credentials: Option<RegistryCredentials>,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
         Box::pin(async move {
-            let creds = credentials.map(|c| DockerCredentials {
-                username: Some(c.username),
-                password: Some(c.password),
-                ..Default::default()
-            });
-            DockerClient::pull_image(self, image, tag, creds)
+            DockerClient::pull_image(self, image, tag, credentials)
                 .await
                 .map_err(|e| RuntimeError::PullFailed(e.to_string()))
         })
@@ -383,6 +509,20 @@ impl RuntimeBackend for DockerClient {
                 .map_err(RuntimeError::from)
         })
     }
+
+    fn extract_file<'a>(
+        &'a self,
+        image: &'a str,
+        tag: &'a str,
+        path: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>, RuntimeError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            DockerClient::extract_file(self, image, tag, path)
+                .await
+                .map_err(RuntimeError::from)
+        })
+    }
 }
 
 // ─── Helper functions ─────────────────────────────────────────────────────────
@@ -434,7 +574,7 @@ pub fn parse_cpu_limit(cpus: &Option<String>) -> Option<i64> {
 
 /// Extract the host port Docker assigned for `container_port/tcp` from an
 /// [`ContainerInspectResponse`].
-pub fn extract_host_port(
+pub(crate) fn extract_host_port(
     info: &ContainerInspectResponse,
     container_port: u16,
 ) -> Result<u16, DockerError> {
