@@ -1,6 +1,7 @@
 //! Deploy orchestrator — the state machine that coordinates a full blue-green deploy.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -55,6 +56,12 @@ pub struct DeployContext {
     pub triggered_by: TriggerSource,
     pub new_container_id: Option<String>,
     pub new_port: Option<u16>,
+    /// Pod name created during pod deploys (None for container deploys).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_pod_name: Option<String>,
+    /// Path to the rendered manifest written during pod deploys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_manifest_path: Option<PathBuf>,
 }
 
 impl DeployContext {
@@ -77,6 +84,8 @@ impl DeployContext {
             triggered_by,
             new_container_id: None,
             new_port: None,
+            new_pod_name: None,
+            new_manifest_path: None,
         }
     }
 
@@ -107,6 +116,10 @@ pub struct AppRuntimeState {
     pub current_port: Option<u16>,
     pub deployed_at: Option<DateTime<Utc>>,
     pub deploy_id: Option<String>,
+    /// Current pod name (for pod-mode deploys).
+    pub current_pod_name: Option<String>,
+    /// Path to the rendered manifest for the current pod (for pod-mode deploys).
+    pub current_manifest_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -264,133 +277,328 @@ pub(crate) async fn execute_deploy_inner(
     record_deploy(shared.deploys, &ctx);
 
     let env_vars = resolve_env_vars_for_app(&effective_config);
-    match runtime
-        .create_and_start(
-            &app_name,
-            &ctx.image,
-            &ctx.tag,
-            effective_config.routing.port,
-            env_vars,
-            &effective_config.network.name,
-            &effective_config.resources,
-        )
-        .await
-    {
-        Ok((container_id, port)) => {
-            ctx.new_container_id = Some(container_id);
-            ctx.new_port = Some(port);
-        }
-        Err(e) => {
-            ctx.fail(&format!("container start failed: {e}"));
-            record_deploy(shared.deploys, &ctx);
-            set_app_failed(shared.app_states, &app_name);
-            return;
-        }
-    }
 
-    // ── HEALTH CHECK ─────────────────────────────────────────────────────────
-    ctx.status = DeployStatus::HealthChecking;
-    record_deploy(shared.deploys, &ctx);
+    // Determine if this is a pod or container deploy.
+    let is_pod = merged.as_ref().map(|m| m.kind == "pod").unwrap_or(false);
 
-    let new_port = match ctx.new_port {
-        Some(port) => port,
-        None => {
-            ctx.fail("internal error: port not set after container start");
-            record_deploy(shared.deploys, &ctx);
-            set_app_failed(shared.app_states, &app_name);
-            return;
-        }
-    };
+    if is_pod {
+        // ── POD DEPLOY FLOW ───────────────────────────────────────────────
 
-    if let Err(e) = health.check(new_port, &effective_config.health).await {
-        tracing::error!(app = %app_name, error = %e, "health check failed");
-        if let Some(ref id) = ctx.new_container_id {
-            let _ = runtime.stop_and_remove(id).await;
-        }
-        ctx.fail(&format!("health check failed: {e}"));
-        record_deploy(shared.deploys, &ctx);
-        set_app_failed(shared.app_states, &app_name);
-        return;
-    }
+        // Get the merged config — required for pod deploys.
+        let merged_cfg = merged.as_ref().expect("merged is Some when is_pod is true");
 
-    // Verify container is still running after health check wait
-    // (container could have crashed during start_period wait)
-    if let Some(ref id) = ctx.new_container_id {
-        match runtime.container_is_running(id).await {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::error!(app = %app_name, container_id = %id, "container not running after health check");
-                ctx.fail("container exited during health check");
+        // Get the manifest path from repo config.
+        let manifest_in_image = match &merged_cfg.manifest {
+            Some(p) => p.clone(),
+            None => {
+                ctx.fail("pod deploy requires [app].manifest in repo config (slip.toml)");
+                record_deploy(shared.deploys, &ctx);
+                set_app_failed(shared.app_states, &app_name);
+                return;
+            }
+        };
+
+        // Extract pod.yaml (or custom path) from the image.
+        let manifest_bytes = match runtime
+            .extract_file(&ctx.image, &ctx.tag, &manifest_in_image)
+            .await
+        {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                ctx.fail(&format!(
+                    "manifest '{manifest_in_image}' not found in image"
+                ));
                 record_deploy(shared.deploys, &ctx);
                 set_app_failed(shared.app_states, &app_name);
                 return;
             }
             Err(e) => {
-                tracing::error!(app = %app_name, error = %e, "failed to verify container state");
-                ctx.fail(&format!("container state check failed: {e}"));
+                ctx.fail(&format!("failed to extract manifest from image: {e}"));
+                record_deploy(shared.deploys, &ctx);
+                set_app_failed(shared.app_states, &app_name);
+                return;
+            }
+        };
+
+        // Generate a unique pod suffix from a ULID fragment.
+        let pod_suffix = ulid::Ulid::new().to_string()[..8].to_lowercase();
+        let pod_name = format!("{app_name}-{pod_suffix}");
+
+        // Render the manifest with deploy-time transformations.
+        let render_ctx = crate::manifest::RenderContext {
+            app_name: app_name.clone(),
+            tag: ctx.tag.clone(),
+            primary_image: effective_config.app.image.clone(),
+            pod_suffix: pod_suffix.clone(),
+            env_vars: env_vars.clone(),
+            image_overrides: std::collections::HashMap::new(),
+        };
+
+        let rendered_yaml = match crate::manifest::render_manifest(&manifest_bytes, &render_ctx) {
+            Ok(yaml) => yaml,
+            Err(e) => {
+                ctx.fail(&format!("failed to render manifest: {e}"));
+                record_deploy(shared.deploys, &ctx);
+                set_app_failed(shared.app_states, &app_name);
+                return;
+            }
+        };
+
+        // Write rendered manifest to storage dir.
+        let manifests_dir = shared.config.storage.path.join("manifests");
+        if let Err(e) = std::fs::create_dir_all(&manifests_dir) {
+            ctx.fail(&format!("failed to create manifests directory: {e}"));
+            record_deploy(shared.deploys, &ctx);
+            set_app_failed(shared.app_states, &app_name);
+            return;
+        }
+        let manifest_path = manifests_dir.join(format!("{app_name}-{}.yaml", ctx.id));
+        if let Err(e) = std::fs::write(&manifest_path, &rendered_yaml) {
+            ctx.fail(&format!("failed to write manifest file: {e}"));
+            record_deploy(shared.deploys, &ctx);
+            set_app_failed(shared.app_states, &app_name);
+            return;
+        }
+
+        // Deploy the pod via `podman kube play`.
+        if let Err(e) = runtime.deploy_pod(&manifest_path, &pod_name).await {
+            ctx.fail(&format!("pod deploy failed: {e}"));
+            record_deploy(shared.deploys, &ctx);
+            set_app_failed(shared.app_states, &app_name);
+            return;
+        }
+
+        // Record pod name and manifest path in context for later steps.
+        ctx.new_pod_name = Some(pod_name.clone());
+        ctx.new_manifest_path = Some(manifest_path.clone());
+
+        // Discover the host port for the routing container.
+        let routing_container = merged_cfg.routing_container.as_deref().unwrap_or("web");
+        let routing_port = effective_config.routing.port;
+
+        let host_port = match runtime
+            .pod_container_port(&pod_name, routing_container, routing_port)
+            .await
+        {
+            Ok(port) => port,
+            Err(e) => {
+                ctx.fail(&format!("failed to get pod container port: {e}"));
+                record_deploy(shared.deploys, &ctx);
+                set_app_failed(shared.app_states, &app_name);
+                // Tear down the new pod on failure.
+                if let Err(te) = runtime.teardown_pod(&manifest_path).await {
+                    tracing::warn!(app = %app_name, error = %te, "failed to teardown pod after port lookup failure (non-fatal)");
+                }
+                return;
+            }
+        };
+
+        ctx.new_port = Some(host_port);
+
+        // ── HEALTH CHECK (pod) ────────────────────────────────────────────
+        ctx.status = DeployStatus::HealthChecking;
+        record_deploy(shared.deploys, &ctx);
+
+        if let Err(e) = health.check(host_port, &effective_config.health).await {
+            tracing::error!(app = %app_name, error = %e, "health check failed");
+            if let Err(te) = runtime.teardown_pod(&manifest_path).await {
+                tracing::warn!(app = %app_name, error = %te, "failed to teardown pod after health check failure (non-fatal)");
+            }
+            ctx.fail(&format!("health check failed: {e}"));
+            record_deploy(shared.deploys, &ctx);
+            set_app_failed(shared.app_states, &app_name);
+            return;
+        }
+
+        // ── SWITCH (pod) ──────────────────────────────────────────────────
+        ctx.status = DeployStatus::Switching;
+        record_deploy(shared.deploys, &ctx);
+
+        let old_pod_manifest = {
+            let states = shared.app_states.read().await;
+            states
+                .get(&app_name)
+                .and_then(|s| s.current_manifest_path.clone())
+        };
+
+        if let Err(e) = caddy
+            .set_route(&app_name, &effective_config.routing.domain, host_port)
+            .await
+        {
+            tracing::error!(app = %app_name, error = %e, "caddy route update failed");
+            if let Err(te) = runtime.teardown_pod(&manifest_path).await {
+                tracing::warn!(app = %app_name, error = %te, "failed to teardown pod after caddy failure (non-fatal)");
+            }
+            ctx.fail(&format!("caddy route update failed: {e}"));
+            record_deploy(shared.deploys, &ctx);
+            set_app_failed(shared.app_states, &app_name);
+            return;
+        }
+
+        // Update app runtime state for pod.
+        let state_snapshot = {
+            let mut states = shared.app_states.write().await;
+            let app_state = states.entry(app_name.clone()).or_default();
+            app_state.previous_tag = app_state.current_tag.take();
+            app_state.current_tag = Some(ctx.tag.clone());
+            app_state.current_pod_name = Some(pod_name.clone());
+            app_state.current_manifest_path = Some(manifest_path.clone());
+            app_state.current_port = Some(host_port);
+            app_state.deployed_at = Some(Utc::now());
+            app_state.deploy_id = Some(ctx.id.clone());
+            app_state.status = AppStatus::Running;
+            app_state.clone()
+        };
+
+        // Persist state to disk (non-fatal).
+        let state_dir = shared.config.storage.path.join("state");
+        if let Err(e) = state::save_app_state(&state_dir, &app_name, &state_snapshot) {
+            tracing::warn!(app = %app_name, error = %e, "failed to persist app state (non-fatal)");
+        }
+
+        // ── DRAIN + TEARDOWN OLD POD ──────────────────────────────────────
+        if let Some(old_manifest) = old_pod_manifest {
+            tracing::info!(app = %app_name, "draining old pod");
+            tokio::time::sleep(effective_config.deploy.drain_timeout).await;
+            if let Err(e) = runtime.teardown_pod(&old_manifest).await {
+                tracing::warn!(
+                    app = %app_name,
+                    error = %e,
+                    "failed to teardown old pod (non-fatal)"
+                );
+            }
+        }
+    } else {
+        // ── CONTAINER DEPLOY FLOW (unchanged) ────────────────────────────
+
+        match runtime
+            .create_and_start(
+                &app_name,
+                &ctx.image,
+                &ctx.tag,
+                effective_config.routing.port,
+                env_vars,
+                &effective_config.network.name,
+                &effective_config.resources,
+            )
+            .await
+        {
+            Ok((container_id, port)) => {
+                ctx.new_container_id = Some(container_id);
+                ctx.new_port = Some(port);
+            }
+            Err(e) => {
+                ctx.fail(&format!("container start failed: {e}"));
                 record_deploy(shared.deploys, &ctx);
                 set_app_failed(shared.app_states, &app_name);
                 return;
             }
         }
-    }
 
-    // ── SWITCH ───────────────────────────────────────────────────────────────
-    ctx.status = DeployStatus::Switching;
-    record_deploy(shared.deploys, &ctx);
-
-    let old_container_id = {
-        let states = shared.app_states.read().await;
-        states
-            .get(&app_name)
-            .and_then(|s| s.current_container_id.clone())
-    };
-
-    if let Err(e) = caddy
-        .set_route(&app_name, &effective_config.routing.domain, new_port)
-        .await
-    {
-        tracing::error!(app = %app_name, error = %e, "caddy route update failed");
-        if let Some(ref id) = ctx.new_container_id {
-            let _ = runtime.stop_and_remove(id).await;
-        }
-        ctx.fail(&format!("caddy route update failed: {e}"));
+        // ── HEALTH CHECK ─────────────────────────────────────────────────
+        ctx.status = DeployStatus::HealthChecking;
         record_deploy(shared.deploys, &ctx);
-        set_app_failed(shared.app_states, &app_name);
-        return;
-    }
 
-    // Update app runtime state
-    let state_snapshot = {
-        let mut states = shared.app_states.write().await;
-        let app_state = states.entry(app_name.clone()).or_default();
-        app_state.previous_tag = app_state.current_tag.take();
-        app_state.previous_container_id = app_state.current_container_id.take();
-        app_state.current_tag = Some(ctx.tag.clone());
-        app_state.current_container_id = ctx.new_container_id.clone();
-        app_state.current_port = ctx.new_port;
-        app_state.deployed_at = Some(Utc::now());
-        app_state.deploy_id = Some(ctx.id.clone());
-        app_state.status = AppStatus::Running;
-        app_state.clone()
-    };
+        let new_port = match ctx.new_port {
+            Some(port) => port,
+            None => {
+                ctx.fail("internal error: port not set after container start");
+                record_deploy(shared.deploys, &ctx);
+                set_app_failed(shared.app_states, &app_name);
+                return;
+            }
+        };
 
-    // Persist state to disk (non-fatal)
-    let state_dir = shared.config.storage.path.join("state");
-    if let Err(e) = state::save_app_state(&state_dir, &app_name, &state_snapshot) {
-        tracing::warn!(app = %app_name, error = %e, "failed to persist app state (non-fatal)");
-    }
+        if let Err(e) = health.check(new_port, &effective_config.health).await {
+            tracing::error!(app = %app_name, error = %e, "health check failed");
+            if let Some(ref id) = ctx.new_container_id {
+                let _ = runtime.stop_and_remove(id).await;
+            }
+            ctx.fail(&format!("health check failed: {e}"));
+            record_deploy(shared.deploys, &ctx);
+            set_app_failed(shared.app_states, &app_name);
+            return;
+        }
 
-    // ── DRAIN + STOP OLD ─────────────────────────────────────────────────────
-    if let Some(old_id) = old_container_id {
-        tracing::info!(app = %app_name, "draining old container");
-        tokio::time::sleep(effective_config.deploy.drain_timeout).await;
-        if let Err(e) = runtime.stop_and_remove(&old_id).await {
-            tracing::warn!(
-                app = %app_name,
-                error = %e,
-                "failed to stop old container (non-fatal)"
-            );
+        // Verify container is still running after health check wait
+        // (container could have crashed during start_period wait)
+        if let Some(ref id) = ctx.new_container_id {
+            match runtime.container_is_running(id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::error!(app = %app_name, container_id = %id, "container not running after health check");
+                    ctx.fail("container exited during health check");
+                    record_deploy(shared.deploys, &ctx);
+                    set_app_failed(shared.app_states, &app_name);
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(app = %app_name, error = %e, "failed to verify container state");
+                    ctx.fail(&format!("container state check failed: {e}"));
+                    record_deploy(shared.deploys, &ctx);
+                    set_app_failed(shared.app_states, &app_name);
+                    return;
+                }
+            }
+        }
+
+        // ── SWITCH ───────────────────────────────────────────────────────
+        ctx.status = DeployStatus::Switching;
+        record_deploy(shared.deploys, &ctx);
+
+        let old_container_id = {
+            let states = shared.app_states.read().await;
+            states
+                .get(&app_name)
+                .and_then(|s| s.current_container_id.clone())
+        };
+
+        if let Err(e) = caddy
+            .set_route(&app_name, &effective_config.routing.domain, new_port)
+            .await
+        {
+            tracing::error!(app = %app_name, error = %e, "caddy route update failed");
+            if let Some(ref id) = ctx.new_container_id {
+                let _ = runtime.stop_and_remove(id).await;
+            }
+            ctx.fail(&format!("caddy route update failed: {e}"));
+            record_deploy(shared.deploys, &ctx);
+            set_app_failed(shared.app_states, &app_name);
+            return;
+        }
+
+        // Update app runtime state
+        let state_snapshot = {
+            let mut states = shared.app_states.write().await;
+            let app_state = states.entry(app_name.clone()).or_default();
+            app_state.previous_tag = app_state.current_tag.take();
+            app_state.previous_container_id = app_state.current_container_id.take();
+            app_state.current_tag = Some(ctx.tag.clone());
+            app_state.current_container_id = ctx.new_container_id.clone();
+            app_state.current_port = ctx.new_port;
+            app_state.deployed_at = Some(Utc::now());
+            app_state.deploy_id = Some(ctx.id.clone());
+            app_state.status = AppStatus::Running;
+            app_state.clone()
+        };
+
+        // Persist state to disk (non-fatal)
+        let state_dir = shared.config.storage.path.join("state");
+        if let Err(e) = state::save_app_state(&state_dir, &app_name, &state_snapshot) {
+            tracing::warn!(app = %app_name, error = %e, "failed to persist app state (non-fatal)");
+        }
+
+        // ── DRAIN + STOP OLD ─────────────────────────────────────────────
+        if let Some(old_id) = old_container_id {
+            tracing::info!(app = %app_name, "draining old container");
+            tokio::time::sleep(effective_config.deploy.drain_timeout).await;
+            if let Err(e) = runtime.stop_and_remove(&old_id).await {
+                tracing::warn!(
+                    app = %app_name,
+                    error = %e,
+                    "failed to stop old container (non-fatal)"
+                );
+            }
         }
     }
 
@@ -490,11 +698,20 @@ mod tests {
         container_port: u16,
         /// Tracks how many times `stop_and_remove` was called.
         stop_count: Arc<AtomicU32>,
-        /// Result returned by `extract_file`:
+        /// Result returned by `extract_file` for `/slip/slip.toml`:
         /// - `Ok(Some(bytes))` → file found with content
         /// - `Ok(None)` → file not found
         /// - `Err(e)` → extraction error (including Unsupported)
         extract_result: Result<Option<Vec<u8>>, RuntimeError>,
+        /// Optional result returned by `extract_file` for manifest paths.
+        /// When `Some`, the mock is in "pod support" mode:
+        ///   - `/slip/slip.toml` calls return `extract_result`
+        ///   - all other paths return `manifest_extract_result`
+        manifest_extract_result: Option<Result<Option<Vec<u8>>, RuntimeError>>,
+        /// Port returned by `pod_container_port` (None = Unsupported).
+        pod_port: Option<u16>,
+        /// Tracks how many times `teardown_pod` was called.
+        teardown_count: Arc<AtomicU32>,
     }
 
     impl MockDocker {
@@ -508,6 +725,9 @@ mod tests {
                 extract_result: Err(RuntimeError::Unsupported(
                     "mock does not implement extract_file".to_string(),
                 )),
+                manifest_extract_result: None,
+                pod_port: None,
+                teardown_count: Arc::new(AtomicU32::new(0)),
             }
         }
 
@@ -539,8 +759,44 @@ mod tests {
             }
         }
 
+        /// Create a mock with pod support.
+        ///
+        /// - `slip_toml_bytes`: returned when `/slip/slip.toml` is extracted
+        /// - `manifest_bytes`: returned when the manifest path is extracted
+        /// - `pod_port`: returned by `pod_container_port`
+        fn with_pod_support(
+            slip_toml_bytes: Vec<u8>,
+            manifest_bytes: Vec<u8>,
+            pod_port: u16,
+        ) -> Self {
+            Self {
+                extract_result: Ok(Some(slip_toml_bytes)),
+                manifest_extract_result: Some(Ok(Some(manifest_bytes))),
+                pod_port: Some(pod_port),
+                ..Self::new()
+            }
+        }
+
         fn stop_count(&self) -> Arc<AtomicU32> {
             self.stop_count.clone()
+        }
+
+        fn teardown_count(&self) -> Arc<AtomicU32> {
+            self.teardown_count.clone()
+        }
+    }
+
+    fn clone_runtime_error(e: &RuntimeError) -> RuntimeError {
+        match e {
+            RuntimeError::Unsupported(msg) => RuntimeError::Unsupported(msg.clone()),
+            RuntimeError::Connection(msg) => RuntimeError::Connection(msg.clone()),
+            RuntimeError::PullFailed(msg) => RuntimeError::PullFailed(msg.clone()),
+            RuntimeError::ContainerError(msg) => RuntimeError::ContainerError(msg.clone()),
+            RuntimeError::NetworkError(msg) => RuntimeError::NetworkError(msg.clone()),
+            RuntimeError::ContainerNotRunning(msg) => {
+                RuntimeError::ContainerNotRunning(msg.clone())
+            }
+            RuntimeError::NoPortAssigned => RuntimeError::NoPortAssigned,
         }
     }
 
@@ -631,28 +887,89 @@ mod tests {
             &'a self,
             _image: &'a str,
             _tag: &'a str,
-            _path: &'a str,
+            path: &'a str,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<Output = Result<Option<Vec<u8>>, RuntimeError>> + Send + 'a,
             >,
         > {
-            // Clone the stored result to return it
-            let result = match &self.extract_result {
-                Ok(opt) => Ok(opt.clone()),
-                Err(RuntimeError::Unsupported(msg)) => Err(RuntimeError::Unsupported(msg.clone())),
-                Err(RuntimeError::Connection(msg)) => Err(RuntimeError::Connection(msg.clone())),
-                Err(RuntimeError::PullFailed(msg)) => Err(RuntimeError::PullFailed(msg.clone())),
-                Err(RuntimeError::ContainerError(msg)) => {
-                    Err(RuntimeError::ContainerError(msg.clone()))
+            // When in pod-support mode, route /slip/slip.toml to extract_result
+            // and all other paths (e.g. the manifest) to manifest_extract_result.
+            let result = if let Some(ref manifest_result) = self.manifest_extract_result
+                && path != "/slip/slip.toml"
+            {
+                // Manifest extraction path
+                match manifest_result {
+                    Ok(opt) => Ok(opt.clone()),
+                    Err(e) => Err(clone_runtime_error(e)),
                 }
-                Err(RuntimeError::NetworkError(msg)) => {
-                    Err(RuntimeError::NetworkError(msg.clone()))
+            } else {
+                // slip.toml or default path
+                match &self.extract_result {
+                    Ok(opt) => Ok(opt.clone()),
+                    Err(e) => Err(clone_runtime_error(e)),
                 }
-                Err(RuntimeError::ContainerNotRunning(msg)) => {
-                    Err(RuntimeError::ContainerNotRunning(msg.clone()))
-                }
-                Err(RuntimeError::NoPortAssigned) => Err(RuntimeError::NoPortAssigned),
+            };
+            Box::pin(async move { result })
+        }
+
+        fn deploy_pod<'a>(
+            &'a self,
+            _manifest: &'a std::path::Path,
+            _name: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::runtime::PodInfo, RuntimeError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            if self.pod_port.is_some() {
+                let info = crate::runtime::PodInfo {
+                    name: _name.to_string(),
+                    containers: vec!["web".to_string()],
+                };
+                Box::pin(async move { Ok(info) })
+            } else {
+                Box::pin(async {
+                    Err(RuntimeError::Unsupported(
+                        "pod operations require Podman".to_string(),
+                    ))
+                })
+            }
+        }
+
+        fn teardown_pod<'a>(
+            &'a self,
+            _manifest: &'a std::path::Path,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
+        > {
+            if self.pod_port.is_some() {
+                self.teardown_count.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            } else {
+                Box::pin(async {
+                    Err(RuntimeError::Unsupported(
+                        "pod operations require Podman".to_string(),
+                    ))
+                })
+            }
+        }
+
+        fn pod_container_port<'a>(
+            &'a self,
+            _pod: &'a str,
+            _container: &'a str,
+            _container_port: u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<u16, RuntimeError>> + Send + 'a>,
+        > {
+            let result = match self.pod_port {
+                Some(port) => Ok(port),
+                None => Err(RuntimeError::Unsupported(
+                    "pod operations require Podman".to_string(),
+                )),
             };
             Box::pin(async move { result })
         }
@@ -1316,6 +1633,325 @@ memory = "256m"
                 .as_deref()
                 .unwrap_or("")
                 .contains("does not match deploy app")
+        );
+    }
+
+    // ── Pod deploy helpers ────────────────────────────────────────────────────
+
+    /// A minimal Kubernetes Pod YAML suitable for pod deploy tests.
+    const POD_YAML_FIXTURE: &str = r#"apiVersion: v1
+kind: Pod
+metadata:
+  name: testapp
+  labels:
+    app: testapp
+spec:
+  containers:
+    - name: web
+      image: ghcr.io/org/testapp:latest
+      ports:
+        - containerPort: 3000
+          hostPort: 3000
+"#;
+
+    /// Build a pod-kind repo config TOML for `app_name`, pointing to `pod.yaml`.
+    fn pod_repo_config_bytes(app_name: &str) -> Vec<u8> {
+        format!(
+            r#"
+[app]
+name = "{app_name}"
+kind = "pod"
+manifest = "/slip/pod.yaml"
+
+[routing]
+container = "web"
+
+[health]
+path = "/health"
+"#
+        )
+        .into_bytes()
+    }
+
+    /// A `DeployContext` for pod tests (same app, different deploy id).
+    fn pod_deploy_ctx() -> DeployContext {
+        DeployContext::new(
+            "dep_pod001".to_string(),
+            "testapp".to_string(),
+            "ghcr.io/org/testapp".to_string(),
+            "v2.0.0".to_string(),
+            TriggerSource::Webhook,
+        )
+    }
+
+    // ── Pod deploy tests ──────────────────────────────────────────────────────
+
+    /// Happy-path pod blue-green deploy: should complete, record pod name, and
+    /// set `current_pod_name` + `current_port` on the app state.
+    #[tokio::test]
+    async fn test_pod_deploy_happy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::with_pod_support(
+            pod_repo_config_bytes("testapp"),
+            POD_YAML_FIXTURE.as_bytes().to_vec(),
+            44444,
+        );
+        let teardown_count = docker.teardown_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let ctx = pod_deploy_ctx();
+        let deploy_id = ctx.id.clone();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            ctx,
+        )
+        .await;
+
+        // Deploy should be Completed.
+        let recorded = deploys.get(&deploy_id).unwrap();
+        assert_eq!(recorded.status, DeployStatus::Completed);
+        assert!(recorded.error.is_none());
+        assert!(recorded.new_pod_name.is_some(), "pod name should be set");
+        assert!(
+            recorded.new_manifest_path.is_some(),
+            "manifest path should be set"
+        );
+        assert_eq!(recorded.new_port, Some(44444));
+
+        // App state should have pod fields set.
+        let states = app_states.read().await;
+        let app = states.get("testapp").expect("app state should exist");
+        assert_eq!(app.status, AppStatus::Running);
+        assert_eq!(app.current_tag.as_deref(), Some("v2.0.0"));
+        assert!(
+            app.current_pod_name.is_some(),
+            "current_pod_name should be set"
+        );
+        assert!(
+            app.current_manifest_path.is_some(),
+            "current_manifest_path should be set"
+        );
+        assert_eq!(app.current_port, Some(44444));
+        // No teardown of old pod since this is a first deploy.
+        assert_eq!(teardown_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// Pod deploy health failure: new pod should be torn down, deploy fails.
+    #[tokio::test]
+    async fn test_pod_deploy_health_failure_tears_down_new_pod() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::with_pod_support(
+            pod_repo_config_bytes("testapp"),
+            POD_YAML_FIXTURE.as_bytes().to_vec(),
+            44444,
+        );
+        let teardown_count = docker.teardown_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::failing(); // health check fails
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            pod_deploy_ctx(),
+        )
+        .await;
+
+        // Deploy should be Failed.
+        let recorded = deploys.get("dep_pod001").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Failed);
+        assert!(
+            recorded
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("health check failed")
+        );
+
+        // New pod should have been torn down.
+        assert_eq!(
+            teardown_count.load(Ordering::SeqCst),
+            1,
+            "new pod should be torn down on health failure"
+        );
+
+        // App state should not have been updated.
+        let states = app_states.read().await;
+        assert!(
+            states.get("testapp").is_none(),
+            "app state should not have been set on failure"
+        );
+    }
+
+    /// Pod deploy: kind=pod but repo config has no `manifest` field → fails.
+    #[tokio::test]
+    async fn test_pod_deploy_missing_manifest_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        // Repo config is pod kind but has no manifest path.
+        let no_manifest_toml = br#"
+[app]
+name = "testapp"
+kind = "pod"
+
+[routing]
+container = "web"
+"#
+        .to_vec();
+
+        let docker = MockDocker::with_pod_support(
+            no_manifest_toml,
+            POD_YAML_FIXTURE.as_bytes().to_vec(),
+            44444,
+        );
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            pod_deploy_ctx(),
+        )
+        .await;
+
+        let recorded = deploys.get("dep_pod001").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Failed);
+        assert!(
+            recorded.error.as_deref().unwrap_or("").contains("manifest"),
+            "error should mention manifest: {:?}",
+            recorded.error
+        );
+    }
+
+    /// First pod deploy with no old pod: teardown should NOT be called.
+    #[tokio::test]
+    async fn test_pod_first_deploy_no_old_pod() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+        // No pre-existing pod state.
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::with_pod_support(
+            pod_repo_config_bytes("testapp"),
+            POD_YAML_FIXTURE.as_bytes().to_vec(),
+            55555,
+        );
+        let teardown_count = docker.teardown_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            pod_deploy_ctx(),
+        )
+        .await;
+
+        let recorded = deploys.get("dep_pod001").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Completed);
+        // teardown_pod should NOT have been called (no old pod).
+        assert_eq!(
+            teardown_count.load(Ordering::SeqCst),
+            0,
+            "teardown_pod should not be called on first pod deploy"
+        );
+    }
+
+    /// Subsequent pod deploy: old pod manifest should be torn down after new pod is live.
+    #[tokio::test]
+    async fn test_pod_subsequent_deploy_tears_down_old_pod() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+
+        // Pre-populate app state with an existing pod.
+        let old_manifest_path = tmp.path().join("manifests").join("testapp-old.yaml");
+        std::fs::create_dir_all(old_manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(&old_manifest_path, b"old manifest content").unwrap();
+
+        let mut initial_states = HashMap::new();
+        initial_states.insert(
+            "testapp".to_string(),
+            AppRuntimeState {
+                status: AppStatus::Running,
+                current_tag: Some("v1.0.0".to_string()),
+                current_pod_name: Some("testapp-oldpod".to_string()),
+                current_manifest_path: Some(old_manifest_path.clone()),
+                current_port: Some(40000),
+                ..Default::default()
+            },
+        );
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(initial_states);
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::with_pod_support(
+            pod_repo_config_bytes("testapp"),
+            POD_YAML_FIXTURE.as_bytes().to_vec(),
+            55556,
+        );
+        let teardown_count = docker.teardown_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            pod_deploy_ctx(),
+        )
+        .await;
+
+        let recorded = deploys.get("dep_pod001").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Completed);
+
+        // teardown_pod should have been called exactly once (old pod).
+        assert_eq!(
+            teardown_count.load(Ordering::SeqCst),
+            1,
+            "old pod should be torn down after successful deploy"
+        );
+
+        // New pod should now be current.
+        let states = app_states.read().await;
+        let app = states.get("testapp").unwrap();
+        assert_eq!(app.current_port, Some(55556));
+        assert!(app.current_pod_name.is_some());
+        // New pod name should be different from old.
+        assert_ne!(
+            app.current_pod_name.as_deref(),
+            Some("testapp-oldpod"),
+            "new pod should have a different name"
         );
     }
 }
