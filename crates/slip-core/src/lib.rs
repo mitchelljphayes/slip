@@ -37,5 +37,6 @@ pub use repo_config::{PreviewConfig, RepoConfig, parse_repo_config};
 pub use runtime::{PodInfo, RegistryCredentials, RuntimeBackend};
 pub use state::{
     PersistedAppState, delete_preview_state, load_app_states, load_preview_states,
-    reconcile_routes, save_app_state, save_preview_state, verify_containers,
+    reconcile_preview_routes, reconcile_routes, save_app_state, save_preview_state,
+    verify_containers,
 };

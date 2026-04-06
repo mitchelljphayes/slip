@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::caddy::ReverseProxy;
-use crate::config::{AppConfig, SlipConfig};
+use crate::config::{AppConfig, AppPreviewConfig, ServerPreviewConfig, SlipConfig};
 use crate::deploy::{AppStatus, DeployStatus};
 use crate::error::RuntimeError;
 use crate::health::HealthCheck;
@@ -142,6 +142,40 @@ impl From<crate::error::CaddyError> for DeployError {
     }
 }
 
+// ─── Domain resolution ────────────────────────────────────────────────────────
+
+/// Resolve the fully-qualified preview domain for a preview deployment.
+///
+/// Domain priority (highest to lowest):
+/// 1. App-level override: `app_preview.domain` (from `apps/<name>.toml`)
+/// 2. Server-level default: `server_preview.domain` (from `slip.toml`)
+/// 3. Error — preview domain is not configured.
+///
+/// Returns `"{preview_id}.{domain}"`.
+pub(crate) fn resolve_preview_domain(
+    preview_id: &str,
+    _app_name: &str,
+    server_preview: &Option<ServerPreviewConfig>,
+    app_preview: &Option<AppPreviewConfig>,
+) -> Result<String, DeployError> {
+    // 1. Check app-level domain override first.
+    if let Some(app_cfg) = app_preview
+        && let Some(ref domain) = app_cfg.domain
+    {
+        return Ok(format!("{preview_id}.{domain}"));
+    }
+
+    // 2. Fall back to server-level domain.
+    if let Some(server_cfg) = server_preview {
+        return Ok(format!("{preview_id}.{}", server_cfg.domain));
+    }
+
+    // 3. Neither configured — reject with a clear error.
+    Err(DeployError(
+        "preview domain not configured: set [preview].domain in slip.toml or [preview].domain in the app config".to_string(),
+    ))
+}
+
 // ─── Preview deploy context and shared state ──────────────────────────────────
 
 /// Context for a single preview deploy.
@@ -157,8 +191,7 @@ pub struct PreviewDeployContext {
 
 /// The parts of `AppState` that the preview deploy orchestrator needs.
 pub(crate) struct PreviewSharedState {
-    /// Server-level config; used in Phase 3 for domain resolution.
-    #[allow(dead_code)]
+    /// Server-level config; provides preview domain and other server-wide settings.
     pub config: SlipConfig,
     pub app_config: AppConfig,
     pub preview_states: Arc<DashMap<String, PreviewState>>,
@@ -264,6 +297,15 @@ pub(crate) async fn execute_preview_deploy_inner(
         .get(&state_key)
         .and_then(|s| s.manifest_path.clone());
 
+    // Resolve the preview domain before inserting initial state.
+    let resolved_domain = resolve_preview_domain(
+        preview_id,
+        app_name,
+        &shared.config.preview,
+        &shared.app_config.preview,
+    )
+    .map_err(|e| DeployError(format!("domain resolution failed: {e}")))?;
+
     // Insert initial preview state entry (Deploying).
     {
         let initial = PreviewState {
@@ -277,7 +319,7 @@ pub(crate) async fn execute_preview_deploy_inner(
             tag: Some(ctx.tag.clone()),
             deployed_at: Utc::now(),
             expires_at: None,
-            domain: format!("{preview_id}.preview.example.com"), // placeholder — Phase 3 resolves real domain
+            domain: resolved_domain.clone(),
             manifest_path: None,
             deploy_id: Some(ctx.deploy_id.clone()),
         };
@@ -578,17 +620,9 @@ pub(crate) async fn execute_preview_deploy_inner(
     // ── SET CADDY ROUTE ───────────────────────────────────────────────────────
     update_preview_deploy_status(&shared.preview_states, &state_key, DeployStatus::Switching);
 
-    // Phase 2: use a placeholder domain. Phase 3 will wire up real domain resolution.
-    let preview_domain = {
-        let guard = shared.preview_states.get(&state_key);
-        guard
-            .as_ref()
-            .map(|s| s.domain.clone())
-            .unwrap_or_else(|| format!("{preview_id}.preview.example.com"))
-    };
-
+    // Use the resolved domain from earlier (set on initial state insert).
     if let Err(e) = caddy
-        .set_route(&preview_app_name, &preview_domain, host_port)
+        .set_route(&preview_app_name, &resolved_domain, host_port)
         .await
     {
         tracing::error!(
@@ -753,8 +787,9 @@ mod tests {
     use super::*;
     use crate::caddy::ReverseProxy;
     use crate::config::{
-        AppConfig, AppInfo, AuthConfig, CaddyConfig, DeployConfig, HealthConfig, RegistryConfig,
-        ResourceConfig, RoutingConfig, RuntimeConfig, ServerConfig, SlipConfig, StorageConfig,
+        AppConfig, AppInfo, AppPreviewConfig, AuthConfig, CaddyConfig, DeployConfig, HealthConfig,
+        RegistryConfig, ResourceConfig, RoutingConfig, RuntimeConfig, ServerConfig,
+        ServerPreviewConfig, SlipConfig, StorageConfig,
     };
     use crate::error::{CaddyError, HealthError, RuntimeError};
     use crate::health::HealthCheck;
@@ -1099,7 +1134,15 @@ mod tests {
             registry: RegistryConfig { ghcr_token: None },
             storage: StorageConfig { path: storage_path },
             runtime: RuntimeConfig::default(),
-            preview: None,
+            // Include a default server preview config so existing tests work.
+            // Tests that need to verify "no domain configured" create their own config.
+            preview: Some(ServerPreviewConfig {
+                domain: "preview.example.com".to_string(),
+                max_per_app: None,
+                default_ttl: None,
+                max_memory: None,
+                max_cpus: None,
+            }),
         }
     }
 
@@ -1576,5 +1619,270 @@ enabled = {enabled}
 
         assert_eq!(deserialized.preview_id, "pr-42");
         assert_eq!(deserialized.container_id.as_deref(), Some("ctr-abc123"));
+    }
+
+    // ── Phase 3: resolve_preview_domain tests ─────────────────────────────────
+
+    fn server_preview_config(domain: &str) -> Option<ServerPreviewConfig> {
+        Some(ServerPreviewConfig {
+            domain: domain.to_string(),
+            max_per_app: None,
+            default_ttl: None,
+            max_memory: None,
+            max_cpus: None,
+        })
+    }
+
+    fn app_preview_config(domain: Option<&str>) -> Option<AppPreviewConfig> {
+        Some(AppPreviewConfig {
+            domain: domain.map(|d| d.to_string()),
+            max: None,
+        })
+    }
+
+    /// App-level domain override takes precedence over server-level.
+    #[test]
+    fn test_resolve_domain_app_override_wins() {
+        let result = resolve_preview_domain(
+            "pr-42",
+            "testapp",
+            &server_preview_config("preview.server.com"),
+            &app_preview_config(Some("preview.app.com")),
+        );
+        assert_eq!(result.unwrap(), "pr-42.preview.app.com");
+    }
+
+    /// Server-level domain is used when app has no domain override.
+    #[test]
+    fn test_resolve_domain_server_fallback() {
+        let result = resolve_preview_domain(
+            "pr-42",
+            "testapp",
+            &server_preview_config("preview.server.com"),
+            &None, // no app preview config
+        );
+        assert_eq!(result.unwrap(), "pr-42.preview.server.com");
+    }
+
+    /// App-level config exists but without domain → falls back to server.
+    #[test]
+    fn test_resolve_domain_app_config_no_domain_falls_back_to_server() {
+        let result = resolve_preview_domain(
+            "pr-7",
+            "testapp",
+            &server_preview_config("preview.server.com"),
+            &app_preview_config(None), // app config exists but domain is None
+        );
+        assert_eq!(result.unwrap(), "pr-7.preview.server.com");
+    }
+
+    /// Neither app nor server has preview domain → error.
+    #[test]
+    fn test_resolve_domain_neither_configured_returns_error() {
+        let result = resolve_preview_domain(
+            "pr-42", "testapp", &None, // no server preview config
+            &None, // no app preview config
+        );
+        assert!(
+            result.is_err(),
+            "should return error when no domain configured"
+        );
+        let err = result.unwrap_err().0;
+        assert!(
+            err.contains("not configured") || err.contains("domain"),
+            "error should mention domain config: {err}"
+        );
+    }
+
+    /// Preview ID is correctly included as subdomain prefix.
+    #[test]
+    fn test_resolve_domain_uses_preview_id_as_subdomain() {
+        let result = resolve_preview_domain(
+            "feature-foo-bar",
+            "testapp",
+            &server_preview_config("preview.example.com"),
+            &None,
+        );
+        assert_eq!(result.unwrap(), "feature-foo-bar.preview.example.com");
+    }
+
+    // ── Phase 3: deploy uses correct domain ──────────────────────────────────
+
+    /// execute_preview_deploy_inner sets the correct domain when server preview config
+    /// has a domain set.
+    #[tokio::test]
+    async fn test_deploy_sets_correct_domain_from_server_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_config_bytes = make_preview_repo_config_toml(true);
+        let docker = MockDocker::with_repo_config(repo_config_bytes);
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let preview_states = Arc::new(DashMap::new());
+
+        // Build shared state with server-level preview domain configured.
+        let mut config = test_slip_config(tmp.path().to_path_buf());
+        config.preview = Some(ServerPreviewConfig {
+            domain: "preview.example.com".to_string(),
+            max_per_app: None,
+            default_ttl: None,
+            max_memory: None,
+            max_cpus: None,
+        });
+
+        let shared = PreviewSharedState {
+            config,
+            app_config: test_app_config(),
+            preview_states: preview_states.clone(),
+            storage_path: tmp.path().to_path_buf(),
+            credentials: None,
+        };
+        let ctx = test_preview_ctx(); // preview_id = "pr-42"
+
+        let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
+
+        assert!(result.is_ok(), "deploy should succeed: {result:?}");
+
+        // State domain should be resolved correctly.
+        let state = preview_states.get("testapp:pr-42").unwrap();
+        assert_eq!(
+            state.domain, "pr-42.preview.example.com",
+            "domain should be pr-42.preview.example.com"
+        );
+
+        // Caddy route should have been set.
+        assert_eq!(caddy.set_route_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// App-level domain override is used when set.
+    #[tokio::test]
+    async fn test_deploy_uses_app_level_domain_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_config_bytes = make_preview_repo_config_toml(true);
+        let docker = MockDocker::with_repo_config(repo_config_bytes);
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let preview_states = Arc::new(DashMap::new());
+
+        let mut config = test_slip_config(tmp.path().to_path_buf());
+        config.preview = Some(ServerPreviewConfig {
+            domain: "preview.server.com".to_string(),
+            max_per_app: None,
+            default_ttl: None,
+            max_memory: None,
+            max_cpus: None,
+        });
+
+        let mut app_config = test_app_config();
+        app_config.preview = Some(AppPreviewConfig {
+            domain: Some("preview.app.com".to_string()),
+            max: None,
+        });
+
+        let shared = PreviewSharedState {
+            config,
+            app_config,
+            preview_states: preview_states.clone(),
+            storage_path: tmp.path().to_path_buf(),
+            credentials: None,
+        };
+        let ctx = test_preview_ctx(); // preview_id = "pr-42"
+
+        let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
+
+        assert!(result.is_ok(), "deploy should succeed: {result:?}");
+
+        let state = preview_states.get("testapp:pr-42").unwrap();
+        assert_eq!(
+            state.domain, "pr-42.preview.app.com",
+            "app-level domain should override server domain"
+        );
+    }
+
+    /// No preview domain configured → deploy fails with DeployError.
+    #[tokio::test]
+    async fn test_deploy_fails_when_no_preview_domain_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_config_bytes = make_preview_repo_config_toml(true);
+        let docker = MockDocker::with_repo_config(repo_config_bytes);
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let preview_states = Arc::new(DashMap::new());
+
+        // Explicitly build shared state with NO preview config on server or app.
+        let mut config = test_slip_config(tmp.path().to_path_buf());
+        config.preview = None; // override the default preview config
+        let shared = PreviewSharedState {
+            config,
+            app_config: test_app_config(),
+            preview_states: preview_states.clone(),
+            storage_path: tmp.path().to_path_buf(),
+            credentials: None,
+        };
+        let ctx = test_preview_ctx();
+
+        let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
+
+        assert!(result.is_err(), "should fail when no domain configured");
+        let err = result.unwrap_err().0;
+        assert!(
+            err.contains("domain") || err.contains("not configured"),
+            "error should mention domain configuration: {err}"
+        );
+        // Caddy should not have been called.
+        assert_eq!(caddy.set_route_count.load(Ordering::SeqCst), 0);
+    }
+
+    // ── Phase 3: teardown uses correct route name ─────────────────────────────
+
+    /// teardown_preview calls remove_route with "{app}-preview-{preview_id}" as the route name.
+    #[tokio::test]
+    async fn test_teardown_calls_remove_route_with_correct_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let docker = MockDocker::new();
+        let caddy = MockCaddy::success();
+        let remove_count = caddy.remove_count();
+        let preview_states: DashMap<String, PreviewState> = DashMap::new();
+
+        // Insert a running preview.
+        preview_states.insert(
+            "testapp:pr-42".to_string(),
+            PreviewState {
+                preview_id: "pr-42".to_string(),
+                app: "testapp".to_string(),
+                sha: "abc".to_string(),
+                status: AppStatus::Running,
+                container_id: Some("ctr-001".to_string()),
+                pod_name: None,
+                port: Some(54000),
+                tag: Some("v1".to_string()),
+                deployed_at: Utc::now(),
+                expires_at: None,
+                domain: "pr-42.preview.example.com".to_string(),
+                manifest_path: None,
+                deploy_id: None,
+            },
+        );
+
+        let result = teardown_preview(
+            &docker,
+            &caddy,
+            &preview_states,
+            tmp.path(),
+            "testapp",
+            "pr-42",
+        )
+        .await;
+
+        assert!(result.is_ok(), "teardown should succeed: {result:?}");
+
+        // remove_route should have been called exactly once.
+        assert_eq!(
+            remove_count.load(Ordering::SeqCst),
+            1,
+            "remove_route should be called once"
+        );
+
+        // State should be cleared.
+        assert!(preview_states.get("testapp:pr-42").is_none());
     }
 }

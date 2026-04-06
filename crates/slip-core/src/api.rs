@@ -19,7 +19,8 @@ use crate::config::{AppConfig, SlipConfig};
 use crate::deploy::{AppRuntimeState, DeployContext, TriggerSource, execute_deploy};
 use crate::health::HealthChecker;
 use crate::preview::{
-    PreviewDeployContext, PreviewState, execute_preview_deploy, teardown_preview,
+    PreviewDeployContext, PreviewState, execute_preview_deploy, resolve_preview_domain,
+    teardown_preview,
 };
 use crate::runtime::{RegistryCredentials, RuntimeBackend};
 
@@ -55,6 +56,12 @@ pub struct DeployResponse {
     pub app: String,
     pub tag: String,
     pub status: String,
+    /// Expected preview URL for preview deploys. `None` for production deploys.
+    ///
+    /// This is computed from config at request time as a hint. The actual URL
+    /// becomes live after the background deploy task completes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_url: Option<String>,
 }
 
 /// Error response body.
@@ -302,6 +309,22 @@ async fn handle_deploy(
             ));
         }
 
+        // Pre-flight: verify preview domain is configured (server or app level).
+        // This gives a fast 400 before spawning any background task.
+        let preview_url = match resolve_preview_domain(
+            &preview_info.id,
+            &request.app,
+            &state.config.preview,
+            &app_cfg.preview,
+        ) {
+            Ok(domain) => Some(format!("https://{domain}")),
+            Err(_) => {
+                return Err(AppError::BadRequest(
+                        "preview deployments not configured for this server: set [preview].domain in slip.toml".to_string(),
+                    ));
+            }
+        };
+
         // Acquire per-preview deploy lock (allows concurrent preview deploys).
         let preview_lock_key = format!("{}:{}", request.app, preview_info.id);
         let lock = {
@@ -335,6 +358,7 @@ async fn handle_deploy(
             app: request.app.clone(),
             tag: request.tag.clone(),
             status: "accepted".to_string(),
+            preview_url,
         };
 
         let preview_ctx = PreviewDeployContext {
@@ -386,6 +410,7 @@ async fn handle_deploy(
         app: request.app.clone(),
         tag: request.tag.clone(),
         status: "accepted".to_string(),
+        preview_url: None,
     };
 
     // 11. Spawn deploy orchestrator.
@@ -1174,7 +1199,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_deploy_with_preview_field_returns_202() {
-        let state = create_test_state();
+        use crate::config::ServerPreviewConfig;
+
+        let mut apps = HashMap::new();
+        apps.insert(APP_NAME.to_string(), test_app_config(Some(APP_SECRET)));
+
+        let mut config = test_slip_config();
+        config.preview = Some(ServerPreviewConfig {
+            domain: "preview.example.com".to_string(),
+            max_per_app: None,
+            default_ttl: None,
+            max_memory: None,
+            max_cpus: None,
+        });
+
+        let state = Arc::new(AppState {
+            config,
+            apps,
+            deploy_locks: DashMap::new(),
+            runtime: Arc::new(
+                DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            ),
+            caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
+            health: HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
+            started_at: Utc::now(),
+            preview_states: DashMap::new(),
+            preview_locks: DashMap::new(),
+        });
+
         let app = build_router(state);
 
         let body_json = serde_json::json!({
@@ -1472,6 +1526,163 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── POST /v1/deploy with preview but no server preview config → 400 ────────
+
+    #[tokio::test]
+    async fn test_deploy_preview_no_domain_config_returns_400() {
+        // State has no server preview config (preview: None in SlipConfig).
+        let state = create_test_state(); // uses test_slip_config() which has preview: None
+        let app = build_router(state);
+
+        let body_json = serde_json::json!({
+            "app": APP_NAME,
+            "image": APP_IMAGE,
+            "tag": "sha-abc123",
+            "preview": {
+                "id": "pr-42",
+                "sha": "abc123def456"
+            }
+        })
+        .to_string();
+        let body_bytes = body_json.as_bytes().to_vec();
+        let sig = sig_header(&body_bytes, APP_SECRET);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/deploy")
+            .header("Content-Type", "application/json")
+            .header("X-Slip-Signature", sig)
+            .body(Body::from(body_bytes))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "should reject preview deploy when no domain is configured"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            payload.error.contains("not configured") || payload.error.contains("domain"),
+            "error should mention preview not configured: {}",
+            payload.error
+        );
+    }
+
+    // ── POST /v1/deploy with preview + server config → 202 with preview_url ──
+
+    #[tokio::test]
+    async fn test_deploy_preview_with_server_config_returns_preview_url() {
+        use crate::config::ServerPreviewConfig;
+
+        let mut apps = HashMap::new();
+        apps.insert(APP_NAME.to_string(), test_app_config(Some(APP_SECRET)));
+
+        let mut config = test_slip_config();
+        config.preview = Some(ServerPreviewConfig {
+            domain: "preview.example.com".to_string(),
+            max_per_app: None,
+            default_ttl: None,
+            max_memory: None,
+            max_cpus: None,
+        });
+
+        let state = Arc::new(AppState {
+            config,
+            apps,
+            deploy_locks: DashMap::new(),
+            runtime: Arc::new(
+                DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            ),
+            caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
+            health: HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
+            started_at: Utc::now(),
+            preview_states: DashMap::new(),
+            preview_locks: DashMap::new(),
+        });
+
+        let app = build_router(state);
+
+        let body_json = serde_json::json!({
+            "app": APP_NAME,
+            "image": APP_IMAGE,
+            "tag": "sha-abc123",
+            "preview": {
+                "id": "pr-42",
+                "sha": "abc123def456"
+            }
+        })
+        .to_string();
+        let body_bytes = body_json.as_bytes().to_vec();
+        let sig = sig_header(&body_bytes, APP_SECRET);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/deploy")
+            .header("Content-Type", "application/json")
+            .header("X-Slip-Signature", sig)
+            .body(Body::from(body_bytes))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(payload["app"], APP_NAME);
+        assert_eq!(payload["status"], "accepted");
+        // preview_url should be included and point to the expected subdomain.
+        let preview_url = payload["preview_url"]
+            .as_str()
+            .expect("preview_url should be present");
+        assert!(
+            preview_url.contains("pr-42.preview.example.com"),
+            "preview_url should contain subdomain: {preview_url}"
+        );
+    }
+
+    // ── POST /v1/deploy (production) → no preview_url in response ─────────────
+
+    #[tokio::test]
+    async fn test_deploy_production_response_has_no_preview_url() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let body = deploy_body(APP_NAME, APP_IMAGE, "v1.2.3");
+        let sig = sig_header(&body, APP_SECRET);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/deploy")
+            .header("Content-Type", "application/json")
+            .header("X-Slip-Signature", sig)
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // preview_url should be absent from the JSON (skip_serializing_if = None).
+        assert!(
+            payload["preview_url"].is_null(),
+            "preview_url should not be present in production deploy response"
+        );
     }
 
     // ── DELETE /v1/previews/:app/:preview_id — valid, no preview → 200 ────────

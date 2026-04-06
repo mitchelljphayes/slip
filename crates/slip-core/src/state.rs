@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::caddy::{CaddyClient, RouteInfo};
@@ -243,6 +244,50 @@ pub async fn reconcile_routes(
     }
 
     tracing::info!(route_count = routes.len(), "reconciling caddy routes");
+    caddy.reconcile(&routes).await
+}
+
+// ─── Reconcile preview Caddy routes ──────────────────────────────────────────
+
+/// Reconcile Caddy routes for all running preview deployments on startup.
+///
+/// For each preview state with status `Running` and a non-empty domain, calls
+/// `set_route` to ensure the Caddy route exists. This recovers routes that were
+/// lost due to a Caddy restart while slipd was down.
+pub async fn reconcile_preview_routes(
+    caddy: &CaddyClient,
+    preview_states: &DashMap<String, PreviewState>,
+) -> Result<(), CaddyError> {
+    let routes: Vec<RouteInfo> = preview_states
+        .iter()
+        .filter_map(|entry| {
+            let state = entry.value();
+            if state.status != AppStatus::Running {
+                return None;
+            }
+            let port = state.port?;
+            if state.domain.is_empty() {
+                return None;
+            }
+            // The Caddy route app_name for previews is "{app}-preview-{preview_id}".
+            let preview_app_name = format!("{}-preview-{}", state.app, state.preview_id);
+            Some(RouteInfo {
+                app_name: preview_app_name,
+                domain: state.domain.clone(),
+                port,
+            })
+        })
+        .collect();
+
+    if routes.is_empty() {
+        tracing::debug!("no running preview deploys to reconcile");
+        return Ok(());
+    }
+
+    tracing::info!(
+        route_count = routes.len(),
+        "reconciling caddy routes for preview deployments"
+    );
     caddy.reconcile(&routes).await
 }
 
@@ -865,5 +910,126 @@ mod tests {
                 .exists(),
             "file should be created even when parent dirs are missing"
         );
+    }
+
+    // ── reconcile_preview_routes tests ───────────────────────────────────────
+
+    use crate::preview::PreviewState as PS;
+
+    fn running_preview(app: &str, preview_id: &str, port: u16, domain: &str) -> PS {
+        PS {
+            preview_id: preview_id.to_string(),
+            app: app.to_string(),
+            sha: "sha".to_string(),
+            status: AppStatus::Running,
+            container_id: Some(format!("ctr-{preview_id}")),
+            pod_name: None,
+            port: Some(port),
+            tag: Some("v1".to_string()),
+            deployed_at: Utc::now(),
+            expires_at: None,
+            domain: domain.to_string(),
+            manifest_path: None,
+            deploy_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_preview_routes_reconciles_running_previews() {
+        let (port, caddy_state) = start_mock_caddy_for_reconcile().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let caddy = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        caddy.bootstrap().await.unwrap();
+
+        let preview_states: DashMap<String, PS> = DashMap::new();
+        preview_states.insert(
+            "myapp:pr-1".to_string(),
+            running_preview("myapp", "pr-1", 54001, "pr-1.preview.example.com"),
+        );
+        preview_states.insert(
+            "myapp:pr-2".to_string(),
+            running_preview("myapp", "pr-2", 54002, "pr-2.preview.example.com"),
+        );
+
+        reconcile_preview_routes(&caddy, &preview_states)
+            .await
+            .unwrap();
+
+        let map = caddy_state.lock().await;
+        assert!(
+            map.contains_key("slip-myapp-preview-pr-1"),
+            "route for pr-1 should be reconciled"
+        );
+        assert!(
+            map.contains_key("slip-myapp-preview-pr-2"),
+            "route for pr-2 should be reconciled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_preview_routes_skips_non_running() {
+        let (port, caddy_state) = start_mock_caddy_for_reconcile().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let caddy = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        caddy.bootstrap().await.unwrap();
+
+        let preview_states: DashMap<String, PS> = DashMap::new();
+
+        // Running preview — should be reconciled.
+        preview_states.insert(
+            "myapp:pr-1".to_string(),
+            running_preview("myapp", "pr-1", 54001, "pr-1.preview.example.com"),
+        );
+
+        // Failed preview — should NOT be reconciled.
+        preview_states.insert(
+            "myapp:pr-2".to_string(),
+            PS {
+                preview_id: "pr-2".to_string(),
+                app: "myapp".to_string(),
+                sha: "sha".to_string(),
+                status: AppStatus::Failed,
+                container_id: None,
+                pod_name: None,
+                port: Some(54002),
+                tag: None,
+                deployed_at: Utc::now(),
+                expires_at: None,
+                domain: "pr-2.preview.example.com".to_string(),
+                manifest_path: None,
+                deploy_id: None,
+            },
+        );
+
+        reconcile_preview_routes(&caddy, &preview_states)
+            .await
+            .unwrap();
+
+        let map = caddy_state.lock().await;
+        assert!(
+            map.contains_key("slip-myapp-preview-pr-1"),
+            "running preview route should be reconciled"
+        );
+        assert!(
+            !map.contains_key("slip-myapp-preview-pr-2"),
+            "failed preview route should NOT be reconciled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_preview_routes_empty_map_is_ok() {
+        let (port, _caddy_state) = start_mock_caddy_for_reconcile().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let caddy = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        caddy.bootstrap().await.unwrap();
+
+        let preview_states: DashMap<String, PS> = DashMap::new();
+
+        // Should succeed with no routes to reconcile.
+        let result = reconcile_preview_routes(&caddy, &preview_states).await;
+        assert!(result.is_ok(), "empty reconcile should succeed");
     }
 }
