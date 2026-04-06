@@ -12,10 +12,12 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::caddy::ReverseProxy;
-use crate::config::{AppConfig, AppPreviewConfig, ServerPreviewConfig, SlipConfig};
+use crate::config::{AppConfig, AppPreviewConfig, ResourceConfig, ServerPreviewConfig, SlipConfig};
 use crate::deploy::{AppStatus, DeployStatus};
+use crate::docker::parse_memory_limit;
 use crate::error::RuntimeError;
 use crate::health::HealthCheck;
+use crate::repo_config::RepoResourceConfig;
 use crate::runtime::{RegistryCredentials, RuntimeBackend};
 use crate::state;
 
@@ -123,23 +125,40 @@ impl From<PersistedPreviewState> for PreviewState {
 
 /// Error type for preview deploy failures.
 #[derive(Debug)]
-pub struct DeployError(pub String);
+pub enum DeployError {
+    /// General string-wrapped error (used throughout).
+    Message(String),
+    /// A post-deploy hook command exited with a non-zero status.
+    HookFailed(String),
+}
+
+impl DeployError {
+    /// Unwrap the inner message string (for tests).
+    pub fn message(&self) -> &str {
+        match self {
+            DeployError::Message(s) | DeployError::HookFailed(s) => s,
+        }
+    }
+}
 
 impl std::fmt::Display for DeployError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        match self {
+            DeployError::Message(s) => write!(f, "{s}"),
+            DeployError::HookFailed(s) => write!(f, "hook failed: {s}"),
+        }
     }
 }
 
 impl From<RuntimeError> for DeployError {
     fn from(e: RuntimeError) -> Self {
-        DeployError(e.to_string())
+        DeployError::Message(e.to_string())
     }
 }
 
 impl From<crate::error::CaddyError> for DeployError {
     fn from(e: crate::error::CaddyError) -> Self {
-        DeployError(e.to_string())
+        DeployError::Message(e.to_string())
     }
 }
 
@@ -172,7 +191,7 @@ pub(crate) fn resolve_preview_domain(
     }
 
     // 3. Neither configured — reject with a clear error.
-    Err(DeployError(
+    Err(DeployError::Message(
         "preview domain not configured: set [preview].domain in slip.toml or [preview].domain in the app config".to_string(),
     ))
 }
@@ -193,39 +212,35 @@ pub fn parse_ttl(s: &str) -> Result<ChronoDuration, DeployError> {
 
     // Try suffixes in order: days first (to avoid `d` being misread as digits).
     if let Some(rest) = s.strip_suffix('d') {
-        let days: i64 = rest
-            .trim()
-            .parse()
-            .map_err(|_| DeployError(format!("invalid TTL '{s}': expected integer before 'd'")))?;
+        let days: i64 = rest.trim().parse().map_err(|_| {
+            DeployError::Message(format!("invalid TTL '{s}': expected integer before 'd'"))
+        })?;
         return ChronoDuration::try_days(days)
-            .ok_or_else(|| DeployError(format!("TTL '{s}' overflows chrono::Duration")));
+            .ok_or_else(|| DeployError::Message(format!("TTL '{s}' overflows chrono::Duration")));
     }
     if let Some(rest) = s.strip_suffix('h') {
-        let hours: i64 = rest
-            .trim()
-            .parse()
-            .map_err(|_| DeployError(format!("invalid TTL '{s}': expected integer before 'h'")))?;
+        let hours: i64 = rest.trim().parse().map_err(|_| {
+            DeployError::Message(format!("invalid TTL '{s}': expected integer before 'h'"))
+        })?;
         return ChronoDuration::try_hours(hours)
-            .ok_or_else(|| DeployError(format!("TTL '{s}' overflows chrono::Duration")));
+            .ok_or_else(|| DeployError::Message(format!("TTL '{s}' overflows chrono::Duration")));
     }
     if let Some(rest) = s.strip_suffix('m') {
-        let mins: i64 = rest
-            .trim()
-            .parse()
-            .map_err(|_| DeployError(format!("invalid TTL '{s}': expected integer before 'm'")))?;
+        let mins: i64 = rest.trim().parse().map_err(|_| {
+            DeployError::Message(format!("invalid TTL '{s}': expected integer before 'm'"))
+        })?;
         return ChronoDuration::try_minutes(mins)
-            .ok_or_else(|| DeployError(format!("TTL '{s}' overflows chrono::Duration")));
+            .ok_or_else(|| DeployError::Message(format!("TTL '{s}' overflows chrono::Duration")));
     }
     if let Some(rest) = s.strip_suffix('s') {
-        let secs: i64 = rest
-            .trim()
-            .parse()
-            .map_err(|_| DeployError(format!("invalid TTL '{s}': expected integer before 's'")))?;
+        let secs: i64 = rest.trim().parse().map_err(|_| {
+            DeployError::Message(format!("invalid TTL '{s}': expected integer before 's'"))
+        })?;
         return ChronoDuration::try_seconds(secs)
-            .ok_or_else(|| DeployError(format!("TTL '{s}' overflows chrono::Duration")));
+            .ok_or_else(|| DeployError::Message(format!("TTL '{s}' overflows chrono::Duration")));
     }
 
-    Err(DeployError(format!(
+    Err(DeployError::Message(format!(
         "invalid TTL '{s}': expected suffix 'd', 'h', 'm', or 's'"
     )))
 }
@@ -244,7 +259,7 @@ pub(crate) fn compute_expires_at(
     // 1. Repo TTL takes priority.
     if let Some(std_dur) = repo_ttl {
         let chrono_dur = ChronoDuration::from_std(std_dur)
-            .map_err(|e| DeployError(format!("repo TTL out of range for chrono: {e}")))?;
+            .map_err(|e| DeployError::Message(format!("repo TTL out of range for chrono: {e}")))?;
         return Ok(Some(deployed_at + chrono_dur));
     }
 
@@ -284,6 +299,99 @@ pub(crate) fn resolve_max_limit(
         return Some(m);
     }
     None
+}
+
+// ─── Resource capping (SLIP-58) ───────────────────────────────────────────────
+
+/// Compute the effective resource limits for a preview container.
+///
+/// Combines three sources (highest precedence first):
+///
+/// 1. `repo_resources` — preview-specific limits from the image's `slip.toml`
+///    (`[preview.resources]`).
+/// 2. `server_config` — server-imposed maxima (`max_memory`, `max_cpus`).
+///    Each value is treated as a ceiling: if the repo requests more, the server
+///    cap wins.
+/// 3. `app_default_resources` — the `[resources]` block from the server-side
+///    `AppConfig` — used as the base when nothing else is set.
+///
+/// The function **never** returns limits higher than `server_config` allows.
+pub(crate) fn effective_preview_resources(
+    repo_resources: &Option<RepoResourceConfig>,
+    server_config: &Option<ServerPreviewConfig>,
+    app_default_resources: &ResourceConfig,
+) -> ResourceConfig {
+    // Start from the app defaults.
+    let mut result = app_default_resources.clone();
+
+    // Apply repo preview-specific overrides.
+    if let Some(repo) = repo_resources {
+        if let Some(ref mem) = repo.memory {
+            result.memory = Some(mem.clone());
+        }
+        if let Some(ref cpus) = repo.cpus {
+            result.cpus = Some(cpus.clone());
+        }
+    }
+
+    // Cap at server limits.
+    if let Some(server) = server_config {
+        if let Some(ref max_mem) = server.max_memory {
+            result.memory = Some(cap_memory(&result.memory, max_mem));
+        }
+        if let Some(ref max_cpus) = server.max_cpus {
+            result.cpus = Some(cap_cpus(&result.cpus, max_cpus));
+        }
+    }
+
+    result
+}
+
+/// Return the lesser of `requested` and `cap` as a human-readable memory string.
+///
+/// Both values are parsed to bytes via [`parse_memory_limit`]. If either cannot
+/// be parsed, `cap` is returned unchanged (fail-safe: always honour the cap).
+fn cap_memory(requested: &Option<String>, cap: &str) -> String {
+    let cap_bytes = match parse_memory_limit(&Some(cap.to_string())) {
+        Some(v) => v,
+        None => return cap.to_string(),
+    };
+
+    let req_bytes = match parse_memory_limit(requested) {
+        Some(v) => v,
+        // No valid request — use cap as-is.
+        None => return cap.to_string(),
+    };
+
+    if req_bytes <= cap_bytes {
+        // Requested is within the cap — keep the original (human-readable) string.
+        requested.clone().unwrap_or_else(|| cap.to_string())
+    } else {
+        // Requested exceeds cap — use cap string.
+        cap.to_string()
+    }
+}
+
+/// Return the lesser of `requested` and `cap` as a CPU fraction string.
+///
+/// Both values are parsed to `f64`. If either cannot be parsed, `cap` is returned
+/// unchanged (fail-safe).
+fn cap_cpus(requested: &Option<String>, cap: &str) -> String {
+    let cap_val: f64 = match cap.trim().parse() {
+        Ok(v) => v,
+        Err(_) => return cap.to_string(),
+    };
+
+    let req_val: f64 = match requested.as_deref().and_then(|s| s.trim().parse().ok()) {
+        Some(v) => v,
+        None => return cap.to_string(),
+    };
+
+    if req_val <= cap_val {
+        requested.clone().unwrap_or_else(|| cap.to_string())
+    } else {
+        cap.to_string()
+    }
 }
 
 // ─── Preview deploy context and shared state ──────────────────────────────────
@@ -414,7 +522,7 @@ pub(crate) async fn execute_preview_deploy_inner(
         &shared.config.preview,
         &shared.app_config.preview,
     )
-    .map_err(|e| DeployError(format!("domain resolution failed: {e}")))?;
+    .map_err(|e| DeployError::Message(format!("domain resolution failed: {e}")))?;
 
     // Record the deploy timestamp once so it's consistent.
     let deployed_at = Utc::now();
@@ -456,7 +564,7 @@ pub(crate) async fn execute_preview_deploy_inner(
         .await
         .map_err(|e| {
             fail_preview(&shared.preview_states, &state_key);
-            DeployError(format!("image pull failed: {e}"))
+            DeployError::Message(format!("image pull failed: {e}"))
         })?;
 
     // ── EXTRACT + MERGE CONFIG ────────────────────────────────────────────────
@@ -476,7 +584,7 @@ pub(crate) async fn execute_preview_deploy_inner(
                 Ok(repo_config) => {
                     if repo_config.app.name != *app_name {
                         fail_preview(&shared.preview_states, &state_key);
-                        return Err(DeployError(format!(
+                        return Err(DeployError::Message(format!(
                             "repo config app name '{}' does not match deploy app '{}'",
                             repo_config.app.name, app_name
                         )));
@@ -486,13 +594,13 @@ pub(crate) async fn execute_preview_deploy_inner(
                         Some(preview_cfg) if preview_cfg.enabled => {}
                         Some(_) => {
                             fail_preview(&shared.preview_states, &state_key);
-                            return Err(DeployError(
+                            return Err(DeployError::Message(
                                 "preview deployments are disabled in repo config (preview.enabled = false)".to_string()
                             ));
                         }
                         None => {
                             fail_preview(&shared.preview_states, &state_key);
-                            return Err(DeployError(
+                            return Err(DeployError::Message(
                                 "no [preview] section in repo config — preview deployments not configured".to_string()
                             ));
                         }
@@ -501,32 +609,43 @@ pub(crate) async fn execute_preview_deploy_inner(
                 }
                 Err(e) => {
                     fail_preview(&shared.preview_states, &state_key);
-                    return Err(DeployError(format!("failed to parse repo config: {e}")));
+                    return Err(DeployError::Message(format!(
+                        "failed to parse repo config: {e}"
+                    )));
                 }
             }
         }
         Ok(None) => {
             fail_preview(&shared.preview_states, &state_key);
-            return Err(DeployError(
+            return Err(DeployError::Message(
                 "no /slip/slip.toml found in image — preview requires repo config".to_string(),
             ));
         }
         Err(RuntimeError::Unsupported(_)) => {
             fail_preview(&shared.preview_states, &state_key);
-            return Err(DeployError(
+            return Err(DeployError::Message(
                 "extract_file not supported by this runtime — cannot read preview config"
                     .to_string(),
             ));
         }
         Err(e) => {
             fail_preview(&shared.preview_states, &state_key);
-            return Err(DeployError(format!(
+            return Err(DeployError::Message(format!(
                 "failed to extract config from image: {e}"
             )));
         }
     };
 
-    let effective_config = merged.app.clone();
+    let mut effective_config = merged.app.clone();
+
+    // ── RESOURCE CAPPING (SLIP-58) ────────────────────────────────────────────
+    // Compute preview-specific resource limits, capped at server maximums.
+    let preview_resources = effective_preview_resources(
+        &merged.preview.as_ref().and_then(|p| p.resources.clone()),
+        &shared.config.preview,
+        &effective_config.resources,
+    );
+    effective_config.resources = preview_resources;
 
     // ── COMPUTE EXPIRES_AT (TTL) ──────────────────────────────────────────────
     // Priority: repo preview.ttl → server preview.default_ttl → None
@@ -540,7 +659,7 @@ pub(crate) async fn execute_preview_deploy_inner(
     let expires_at =
         compute_expires_at(deployed_at, repo_ttl, server_default_ttl).map_err(|e| {
             fail_preview(&shared.preview_states, &state_key);
-            DeployError(format!("TTL computation failed: {e}"))
+            DeployError::Message(format!("TTL computation failed: {e}"))
         })?;
 
     // Update the state entry with the computed expires_at.
@@ -670,7 +789,7 @@ pub(crate) async fn execute_preview_deploy_inner(
             Some(p) => p.clone(),
             None => {
                 fail_preview(&shared.preview_states, &state_key);
-                return Err(DeployError(
+                return Err(DeployError::Message(
                     "pod deploy requires [app].manifest in repo config".to_string(),
                 ));
             }
@@ -683,13 +802,13 @@ pub(crate) async fn execute_preview_deploy_inner(
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
                 fail_preview(&shared.preview_states, &state_key);
-                return Err(DeployError(format!(
+                return Err(DeployError::Message(format!(
                     "manifest '{manifest_in_image}' not found in image"
                 )));
             }
             Err(e) => {
                 fail_preview(&shared.preview_states, &state_key);
-                return Err(DeployError(format!(
+                return Err(DeployError::Message(format!(
                     "failed to extract manifest from image: {e}"
                 )));
             }
@@ -711,14 +830,16 @@ pub(crate) async fn execute_preview_deploy_inner(
             Ok(yaml) => yaml,
             Err(e) => {
                 fail_preview(&shared.preview_states, &state_key);
-                return Err(DeployError(format!("failed to render manifest: {e}")));
+                return Err(DeployError::Message(format!(
+                    "failed to render manifest: {e}"
+                )));
             }
         };
 
         let manifests_dir = shared.storage_path.join("manifests");
         if let Err(e) = std::fs::create_dir_all(&manifests_dir) {
             fail_preview(&shared.preview_states, &state_key);
-            return Err(DeployError(format!(
+            return Err(DeployError::Message(format!(
                 "failed to create manifests directory: {e}"
             )));
         }
@@ -726,12 +847,14 @@ pub(crate) async fn execute_preview_deploy_inner(
             manifests_dir.join(format!("{preview_app_name}-{}.yaml", ctx.deploy_id));
         if let Err(e) = std::fs::write(&manifest_path, &rendered_yaml) {
             fail_preview(&shared.preview_states, &state_key);
-            return Err(DeployError(format!("failed to write manifest file: {e}")));
+            return Err(DeployError::Message(format!(
+                "failed to write manifest file: {e}"
+            )));
         }
 
         if let Err(e) = runtime.deploy_pod(&manifest_path, &pod_name).await {
             fail_preview(&shared.preview_states, &state_key);
-            return Err(DeployError(format!("pod deploy failed: {e}")));
+            return Err(DeployError::Message(format!("pod deploy failed: {e}")));
         }
 
         let routing_container = merged.routing_container.as_deref().unwrap_or("web");
@@ -747,7 +870,7 @@ pub(crate) async fn execute_preview_deploy_inner(
                 if let Err(te) = runtime.teardown_pod(&manifest_path).await {
                     tracing::warn!(error = %te, "failed to teardown pod after port lookup failure");
                 }
-                return Err(DeployError(format!(
+                return Err(DeployError::Message(format!(
                     "failed to get pod container port: {e}"
                 )));
             }
@@ -771,7 +894,7 @@ pub(crate) async fn execute_preview_deploy_inner(
             Ok(result) => result,
             Err(e) => {
                 fail_preview(&shared.preview_states, &state_key);
-                return Err(DeployError(format!("container start failed: {e}")));
+                return Err(DeployError::Message(format!("container start failed: {e}")));
             }
         };
 
@@ -810,7 +933,81 @@ pub(crate) async fn execute_preview_deploy_inner(
         if let Some(ref manifest) = manifest_path {
             let _ = runtime.teardown_pod(manifest).await;
         }
-        return Err(DeployError(format!("health check failed: {e}")));
+        return Err(DeployError::Message(format!("health check failed: {e}")));
+    }
+
+    // ── POST-DEPLOY HOOKS (SLIP-57) ───────────────────────────────────────────
+    // Hooks run inside the container after it passes the health check.
+    // Only supported in container mode (not pod mode — hook target is unclear).
+    if let Some(ref preview_config) = merged.preview
+        && let Some(ref hooks) = preview_config.hooks
+        && let Some(ref cid) = container_id
+    {
+        if let Some(ref migrate_cmd) = hooks.migrate {
+            tracing::info!(
+                app = %app_name,
+                preview_id = %preview_id,
+                cmd = %migrate_cmd,
+                "preview deploy: running migrate hook"
+            );
+            match runtime
+                .exec_in_container(cid, &["/bin/sh", "-c", migrate_cmd])
+                .await
+            {
+                Ok(output) => {
+                    tracing::info!(
+                        app = %app_name,
+                        preview_id = %preview_id,
+                        output = %output,
+                        "migrate hook completed"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        app = %app_name,
+                        preview_id = %preview_id,
+                        error = %e,
+                        "migrate hook failed"
+                    );
+                    fail_preview(&shared.preview_states, &state_key);
+                    let _ = runtime.stop_and_remove(cid).await;
+                    return Err(DeployError::HookFailed(format!("migrate: {e}")));
+                }
+            }
+        }
+
+        if let Some(ref seed_cmd) = hooks.seed {
+            tracing::info!(
+                app = %app_name,
+                preview_id = %preview_id,
+                cmd = %seed_cmd,
+                "preview deploy: running seed hook"
+            );
+            match runtime
+                .exec_in_container(cid, &["/bin/sh", "-c", seed_cmd])
+                .await
+            {
+                Ok(output) => {
+                    tracing::info!(
+                        app = %app_name,
+                        preview_id = %preview_id,
+                        output = %output,
+                        "seed hook completed"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        app = %app_name,
+                        preview_id = %preview_id,
+                        error = %e,
+                        "seed hook failed"
+                    );
+                    fail_preview(&shared.preview_states, &state_key);
+                    let _ = runtime.stop_and_remove(cid).await;
+                    return Err(DeployError::HookFailed(format!("seed: {e}")));
+                }
+            }
+        }
     }
 
     // ── SET CADDY ROUTE ───────────────────────────────────────────────────────
@@ -834,7 +1031,9 @@ pub(crate) async fn execute_preview_deploy_inner(
         if let Some(ref manifest) = manifest_path {
             let _ = runtime.teardown_pod(manifest).await;
         }
-        return Err(DeployError(format!("caddy route update failed: {e}")));
+        return Err(DeployError::Message(format!(
+            "caddy route update failed: {e}"
+        )));
     }
 
     // ── COMPLETED ─────────────────────────────────────────────────────────────
@@ -1053,6 +1252,7 @@ mod tests {
     };
     use crate::error::{CaddyError, HealthError, RuntimeError};
     use crate::health::HealthCheck;
+    use crate::repo_config::RepoResourceConfig;
     use crate::runtime::{PodInfo, RegistryCredentials, RuntimeBackend};
 
     // ── Mock: RuntimeBackend ──────────────────────────────────────────────────
@@ -1066,6 +1266,12 @@ mod tests {
         manifest_extract_result: Option<Result<Option<Vec<u8>>, RuntimeError>>,
         pod_port: Option<u16>,
         teardown_count: Arc<AtomicU32>,
+        /// Queued results for `exec_in_container` calls (front = next call).
+        exec_results: std::sync::Mutex<std::collections::VecDeque<Result<String, RuntimeError>>>,
+        /// Count of `exec_in_container` calls made.
+        exec_call_count: Arc<AtomicU32>,
+        /// Commands received by `exec_in_container` (for ordering tests).
+        exec_commands: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
     }
 
     impl MockDocker {
@@ -1079,6 +1285,9 @@ mod tests {
                 manifest_extract_result: None,
                 pod_port: None,
                 teardown_count: Arc::new(AtomicU32::new(0)),
+                exec_results: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                exec_call_count: Arc::new(AtomicU32::new(0)),
+                exec_commands: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -1096,6 +1305,25 @@ mod tests {
             }
         }
 
+        /// Build a mock with queued exec results.
+        ///
+        /// Results are consumed in order (first result → first call, etc.).
+        /// If the queue is exhausted, subsequent calls return `Ok("")`.
+        fn with_exec_results(
+            repo_config_bytes: Vec<u8>,
+            exec_results: Vec<Result<String, RuntimeError>>,
+        ) -> Self {
+            let mut deque = std::collections::VecDeque::new();
+            for r in exec_results {
+                deque.push_back(r);
+            }
+            Self {
+                extract_result: Ok(Some(repo_config_bytes)),
+                exec_results: std::sync::Mutex::new(deque),
+                ..Self::new()
+            }
+        }
+
         fn stop_count(&self) -> Arc<AtomicU32> {
             self.stop_count.clone()
         }
@@ -1103,6 +1331,14 @@ mod tests {
         #[allow(dead_code)]
         fn teardown_count(&self) -> Arc<AtomicU32> {
             self.teardown_count.clone()
+        }
+
+        fn exec_call_count(&self) -> Arc<AtomicU32> {
+            self.exec_call_count.clone()
+        }
+
+        fn exec_commands(&self) -> Arc<std::sync::Mutex<Vec<Vec<String>>>> {
+            self.exec_commands.clone()
         }
     }
 
@@ -1282,6 +1518,27 @@ mod tests {
                 None => Err(RuntimeError::Unsupported(
                     "pod operations require Podman".to_string(),
                 )),
+            };
+            Box::pin(async move { result })
+        }
+
+        fn exec_in_container<'a>(
+            &'a self,
+            _container_id: &'a str,
+            command: &'a [&'a str],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<String, RuntimeError>> + Send + 'a>,
+        > {
+            self.exec_call_count.fetch_add(1, Ordering::SeqCst);
+            // Record the command for ordering verification.
+            {
+                let mut cmds = self.exec_commands.lock().unwrap();
+                cmds.push(command.iter().map(|s| s.to_string()).collect());
+            }
+            // Pop the next queued result, defaulting to Ok("") if exhausted.
+            let result = {
+                let mut queue = self.exec_results.lock().unwrap();
+                queue.pop_front().unwrap_or(Ok(String::new()))
             };
             Box::pin(async move { result })
         }
@@ -1537,7 +1794,7 @@ enabled = {enabled}
         let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
 
         assert!(result.is_err(), "should fail when preview is disabled");
-        let err_msg = result.unwrap_err().0;
+        let err_msg = result.unwrap_err().message().to_string();
         assert!(
             err_msg.contains("disabled"),
             "error should mention 'disabled': {err_msg}"
@@ -1640,7 +1897,7 @@ enabled = {enabled}
         let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
 
         assert!(result.is_err());
-        let err = result.unwrap_err().0;
+        let err = result.unwrap_err().message().to_string();
         assert!(err.contains("image pull failed"), "error: {err}");
 
         let state = preview_states.get("testapp:pr-42").unwrap();
@@ -1664,7 +1921,7 @@ enabled = {enabled}
         let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
 
         assert!(result.is_err());
-        let err = result.unwrap_err().0;
+        let err = result.unwrap_err().message().to_string();
         assert!(err.contains("health check failed"), "error: {err}");
 
         // Container should have been stopped on health failure.
@@ -1947,7 +2204,7 @@ enabled = {enabled}
             result.is_err(),
             "should return error when no domain configured"
         );
-        let err = result.unwrap_err().0;
+        let err = result.unwrap_err().message().to_string();
         assert!(
             err.contains("not configured") || err.contains("domain"),
             "error should mention domain config: {err}"
@@ -2083,7 +2340,7 @@ enabled = {enabled}
         let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
 
         assert!(result.is_err(), "should fail when no domain configured");
-        let err = result.unwrap_err().0;
+        let err = result.unwrap_err().message().to_string();
         assert!(
             err.contains("domain") || err.contains("not configured"),
             "error should mention domain configuration: {err}"
@@ -2176,9 +2433,9 @@ enabled = {enabled}
     fn test_parse_ttl_invalid() {
         let err = parse_ttl("invalid").unwrap_err();
         assert!(
-            err.0.contains("invalid TTL"),
+            err.message().contains("invalid TTL"),
             "error should mention TTL: {}",
-            err.0
+            err.message()
         );
     }
 
@@ -2559,6 +2816,334 @@ max = {max}
         assert!(
             state.expires_at.is_none(),
             "no expires_at when no TTL configured"
+        );
+    }
+
+    // ── Phase 5: effective_preview_resources tests ────────────────────────────
+
+    fn make_resource_config(memory: Option<&str>, cpus: Option<&str>) -> ResourceConfig {
+        ResourceConfig {
+            memory: memory.map(|s| s.to_string()),
+            cpus: cpus.map(|s| s.to_string()),
+        }
+    }
+
+    fn make_repo_resource(memory: Option<&str>, cpus: Option<&str>) -> Option<RepoResourceConfig> {
+        Some(RepoResourceConfig {
+            memory: memory.map(|s| s.to_string()),
+            cpus: cpus.map(|s| s.to_string()),
+        })
+    }
+
+    fn make_server_preview_config_with_limits(
+        max_memory: Option<&str>,
+        max_cpus: Option<&str>,
+    ) -> Option<ServerPreviewConfig> {
+        Some(ServerPreviewConfig {
+            domain: "preview.example.com".to_string(),
+            max_per_app: None,
+            default_ttl: None,
+            max_memory: max_memory.map(|s| s.to_string()),
+            max_cpus: max_cpus.map(|s| s.to_string()),
+        })
+    }
+
+    /// Only repo resources set — no server caps — should use repo values.
+    #[test]
+    fn test_effective_preview_resources_repo_only() {
+        let result = effective_preview_resources(
+            &make_repo_resource(Some("256m"), Some("0.5")),
+            &None, // no server caps
+            &make_resource_config(Some("512m"), Some("1.0")),
+        );
+        assert_eq!(result.memory.as_deref(), Some("256m"));
+        assert_eq!(result.cpus.as_deref(), Some("0.5"));
+    }
+
+    /// Repo requests more than server allows → capped at server maximum.
+    #[test]
+    fn test_effective_preview_resources_server_caps_memory() {
+        let result = effective_preview_resources(
+            &make_repo_resource(Some("1g"), Some("2.0")),
+            &make_server_preview_config_with_limits(Some("512m"), Some("1.0")),
+            &make_resource_config(None, None),
+        );
+        // 1g > 512m → capped to 512m
+        assert_eq!(result.memory.as_deref(), Some("512m"));
+        // 2.0 > 1.0 → capped to 1.0
+        assert_eq!(result.cpus.as_deref(), Some("1.0"));
+    }
+
+    /// Neither repo nor server limits set → falls back to app defaults.
+    #[test]
+    fn test_effective_preview_resources_neither() {
+        let app_default = make_resource_config(Some("128m"), Some("0.25"));
+        let result = effective_preview_resources(
+            &None, // no repo preview resources
+            &None, // no server caps
+            &app_default,
+        );
+        assert_eq!(result.memory.as_deref(), Some("128m"));
+        assert_eq!(result.cpus.as_deref(), Some("0.25"));
+    }
+
+    /// Repo requests less than server cap → repo value is used (no artificial lowering).
+    #[test]
+    fn test_effective_preview_resources_repo_under_cap() {
+        let result = effective_preview_resources(
+            &make_repo_resource(Some("256m"), Some("0.5")),
+            &make_server_preview_config_with_limits(Some("1g"), Some("2.0")),
+            &make_resource_config(Some("512m"), Some("1.0")),
+        );
+        // repo (256m) < cap (1g) → use repo value
+        assert_eq!(result.memory.as_deref(), Some("256m"));
+        // repo (0.5) < cap (2.0) → use repo value
+        assert_eq!(result.cpus.as_deref(), Some("0.5"));
+    }
+
+    /// No repo resources, server has a cap → cap applies to app default.
+    #[test]
+    fn test_effective_preview_resources_no_repo_cap_on_default() {
+        // App default is 2g, server cap is 512m → result is 512m
+        let result = effective_preview_resources(
+            &None,
+            &make_server_preview_config_with_limits(Some("512m"), None),
+            &make_resource_config(Some("2g"), Some("1.0")),
+        );
+        assert_eq!(result.memory.as_deref(), Some("512m"));
+        // No CPU cap set → keeps app default
+        assert_eq!(result.cpus.as_deref(), Some("1.0"));
+    }
+
+    // ── Phase 5: hook tests ───────────────────────────────────────────────────
+
+    fn make_repo_config_with_hooks_toml(migrate: Option<&str>, seed: Option<&str>) -> Vec<u8> {
+        let mut toml = r#"
+[app]
+name = "testapp"
+
+[preview]
+enabled = true
+"#
+        .to_string();
+
+        if migrate.is_some() || seed.is_some() {
+            toml.push_str("\n[preview.hooks]\n");
+            if let Some(m) = migrate {
+                toml.push_str(&format!("migrate = \"{m}\"\n"));
+            }
+            if let Some(s) = seed {
+                toml.push_str(&format!("seed = \"{s}\"\n"));
+            }
+        }
+
+        toml.into_bytes()
+    }
+
+    /// Both migrate and seed succeed → preview reaches Running.
+    #[tokio::test]
+    async fn test_preview_deploy_hooks_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_config_bytes =
+            make_repo_config_with_hooks_toml(Some("rails db:migrate"), Some("rails db:seed"));
+        let docker = MockDocker::with_exec_results(
+            repo_config_bytes,
+            vec![Ok("Migrated OK".to_string()), Ok("Seeded OK".to_string())],
+        );
+        let exec_count = docker.exec_call_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let preview_states = Arc::new(DashMap::new());
+
+        let shared = make_shared(&tmp, test_app_config(), preview_states.clone());
+        let ctx = test_preview_ctx();
+
+        let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
+
+        assert!(result.is_ok(), "should succeed when hooks pass: {result:?}");
+
+        let state = preview_states.get("testapp:pr-42").unwrap();
+        assert_eq!(state.status, AppStatus::Running);
+
+        // Both hooks should have been called.
+        assert_eq!(
+            exec_count.load(Ordering::SeqCst),
+            2,
+            "both hooks should be executed"
+        );
+    }
+
+    /// Migrate hook fails → preview not Running, container stopped.
+    #[tokio::test]
+    async fn test_preview_deploy_migrate_hook_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_config_bytes =
+            make_repo_config_with_hooks_toml(Some("rails db:migrate"), Some("rails db:seed"));
+        let docker = MockDocker::with_exec_results(
+            repo_config_bytes,
+            vec![Err(RuntimeError::ExecFailed("migration error".to_string()))],
+        );
+        let stop_count = docker.stop_count();
+        let exec_count = docker.exec_call_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let preview_states = Arc::new(DashMap::new());
+
+        let shared = make_shared(&tmp, test_app_config(), preview_states.clone());
+        let ctx = test_preview_ctx();
+
+        let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
+
+        assert!(result.is_err(), "should fail when migrate hook fails");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, DeployError::HookFailed(_)),
+            "error should be HookFailed"
+        );
+        assert!(
+            err.message().contains("migrate"),
+            "error should mention 'migrate': {}",
+            err.message()
+        );
+
+        // Container should be stopped on hook failure.
+        assert!(
+            stop_count.load(Ordering::SeqCst) >= 1,
+            "container should be stopped after hook failure"
+        );
+
+        // Only migrate should have been called (seed should not run after failure).
+        assert_eq!(
+            exec_count.load(Ordering::SeqCst),
+            1,
+            "only migrate hook should be called"
+        );
+
+        // Preview should be in Failed state.
+        let state = preview_states.get("testapp:pr-42").unwrap();
+        assert_eq!(state.status, AppStatus::Failed);
+
+        // Caddy route should NOT have been set.
+        assert_eq!(caddy.set_route_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// Seed hook fails after migrate succeeds → preview not Running.
+    #[tokio::test]
+    async fn test_preview_deploy_seed_hook_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_config_bytes =
+            make_repo_config_with_hooks_toml(Some("rails db:migrate"), Some("rails db:seed"));
+        let docker = MockDocker::with_exec_results(
+            repo_config_bytes,
+            vec![
+                Ok("Migrated OK".to_string()),
+                Err(RuntimeError::ExecFailed("seed error".to_string())),
+            ],
+        );
+        let stop_count = docker.stop_count();
+        let exec_count = docker.exec_call_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let preview_states = Arc::new(DashMap::new());
+
+        let shared = make_shared(&tmp, test_app_config(), preview_states.clone());
+        let ctx = test_preview_ctx();
+
+        let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
+
+        assert!(result.is_err(), "should fail when seed hook fails");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, DeployError::HookFailed(_)),
+            "error should be HookFailed"
+        );
+        assert!(
+            err.message().contains("seed"),
+            "error should mention 'seed': {}",
+            err.message()
+        );
+
+        // Both hooks should have been called (migrate succeeded, seed failed).
+        assert_eq!(
+            exec_count.load(Ordering::SeqCst),
+            2,
+            "migrate and seed hooks should both be called"
+        );
+
+        // Container should be stopped after seed failure.
+        assert!(
+            stop_count.load(Ordering::SeqCst) >= 1,
+            "container should be stopped after seed failure"
+        );
+
+        // Caddy route should NOT have been set.
+        assert_eq!(caddy.set_route_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// No hooks configured → deploy succeeds without any exec calls.
+    #[tokio::test]
+    async fn test_preview_deploy_no_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Repo config with preview enabled but no hooks section.
+        let repo_config_bytes = make_preview_repo_config_toml(true);
+        let docker = MockDocker::with_repo_config(repo_config_bytes);
+        let exec_count = docker.exec_call_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let preview_states = Arc::new(DashMap::new());
+
+        let shared = make_shared(&tmp, test_app_config(), preview_states.clone());
+        let ctx = test_preview_ctx();
+
+        let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
+
+        assert!(result.is_ok(), "should succeed with no hooks: {result:?}");
+        assert_eq!(
+            exec_count.load(Ordering::SeqCst),
+            0,
+            "no exec calls when no hooks configured"
+        );
+
+        let state = preview_states.get("testapp:pr-42").unwrap();
+        assert_eq!(state.status, AppStatus::Running);
+    }
+
+    /// Migrate runs before seed (ordering guarantee).
+    #[tokio::test]
+    async fn test_hook_ordering_migrate_before_seed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_config_bytes =
+            make_repo_config_with_hooks_toml(Some("migrate-cmd"), Some("seed-cmd"));
+        let docker = MockDocker::with_exec_results(
+            repo_config_bytes,
+            vec![Ok("ok".to_string()), Ok("ok".to_string())],
+        );
+        let exec_commands = docker.exec_commands();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let preview_states = Arc::new(DashMap::new());
+
+        let shared = make_shared(&tmp, test_app_config(), preview_states.clone());
+        let ctx = test_preview_ctx();
+
+        let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
+        assert!(result.is_ok(), "should succeed: {result:?}");
+
+        let commands = exec_commands.lock().unwrap();
+        assert_eq!(commands.len(), 2, "exactly two exec calls");
+
+        // First command should contain the migrate command.
+        let first = &commands[0];
+        assert!(
+            first.last().map(|s| s.as_str()) == Some("migrate-cmd"),
+            "first exec should be migrate: {first:?}"
+        );
+
+        // Second command should contain the seed command.
+        let second = &commands[1];
+        assert!(
+            second.last().map(|s| s.as_str()) == Some("seed-cmd"),
+            "second exec should be seed: {second:?}"
         );
     }
 }

@@ -9,6 +9,7 @@ use bollard::container::{
     Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
     StopContainerOptions,
 };
+use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use bollard::models::{ContainerInspectResponse, HostConfig, PortBinding};
 use bollard::network::CreateNetworkOptions;
@@ -521,6 +522,70 @@ impl RuntimeBackend for DockerClient {
             DockerClient::extract_file(self, image, tag, path)
                 .await
                 .map_err(RuntimeError::from)
+        })
+    }
+
+    fn exec_in_container<'a>(
+        &'a self,
+        container_id: &'a str,
+        command: &'a [&'a str],
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<String, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Create the exec instance.
+            let exec = self
+                .docker
+                .create_exec(
+                    container_id,
+                    CreateExecOptions {
+                        cmd: Some(command.iter().map(|s| s.to_string()).collect()),
+                        attach_stdout: Some(true),
+                        attach_stderr: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| RuntimeError::ExecFailed(e.to_string()))?;
+
+            // Start the exec and collect output.
+            let mut output_buf = String::new();
+            match self
+                .docker
+                .start_exec(&exec.id, None::<bollard::exec::StartExecOptions>)
+                .await
+                .map_err(|e| RuntimeError::ExecFailed(e.to_string()))?
+            {
+                StartExecResults::Attached { mut output, .. } => {
+                    while let Some(item) = output.next().await {
+                        match item {
+                            Ok(log) => output_buf.push_str(&log.to_string()),
+                            Err(e) => {
+                                return Err(RuntimeError::ExecFailed(format!(
+                                    "output stream error: {e}"
+                                )));
+                            }
+                        }
+                    }
+                }
+                StartExecResults::Detached => {
+                    // Should not happen since we didn't set detach=true.
+                }
+            }
+
+            // Check the exit code via inspect_exec.
+            let inspect = self
+                .docker
+                .inspect_exec(&exec.id)
+                .await
+                .map_err(|e| RuntimeError::ExecFailed(format!("inspect_exec failed: {e}")))?;
+
+            let exit_code = inspect.exit_code.unwrap_or(0);
+            if exit_code != 0 {
+                return Err(RuntimeError::ExecFailed(format!(
+                    "exit code {exit_code}: {output_buf}"
+                )));
+            }
+
+            Ok(output_buf)
         })
     }
 }
