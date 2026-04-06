@@ -170,7 +170,7 @@ pub struct AppState {
     /// Timestamp when the daemon was started (used for uptime calculation).
     pub started_at: DateTime<Utc>,
     /// Active preview deployment states keyed by `"{app}:{preview_id}"`.
-    pub preview_states: DashMap<String, PreviewState>,
+    pub preview_states: Arc<DashMap<String, PreviewState>>,
     /// Per-preview deploy locks; prevents concurrent deploys for the same preview.
     ///
     /// Keyed by `"{app}:{preview_id}"`. Allows preview deploys to run concurrently
@@ -726,7 +726,7 @@ mod tests {
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
             started_at: Utc::now(),
-            preview_states: DashMap::new(),
+            preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
         })
     }
@@ -979,7 +979,7 @@ mod tests {
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
             started_at: Utc::now(),
-            preview_states: DashMap::new(),
+            preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
         });
 
@@ -1026,7 +1026,7 @@ mod tests {
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
             started_at: Utc::now(),
-            preview_states: DashMap::new(),
+            preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
         });
 
@@ -1225,7 +1225,7 @@ mod tests {
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
             started_at: Utc::now(),
-            preview_states: DashMap::new(),
+            preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
         });
 
@@ -1605,7 +1605,7 @@ mod tests {
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
             started_at: Utc::now(),
-            preview_states: DashMap::new(),
+            preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
         });
 

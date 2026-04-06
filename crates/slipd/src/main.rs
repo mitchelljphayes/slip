@@ -160,8 +160,8 @@ async fn main() -> anyhow::Result<()> {
             "loaded persisted preview states"
         );
     }
-    let preview_states: DashMap<String, slip_core::PreviewState> =
-        persisted_previews.into_iter().collect();
+    let preview_states: Arc<DashMap<String, slip_core::PreviewState>> =
+        Arc::new(persisted_previews.into_iter().collect());
 
     // ── Reconcile preview Caddy routes ───────────────────────────────────────
     if let Err(e) = reconcile_preview_routes(&caddy, &preview_states).await {

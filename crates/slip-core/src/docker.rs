@@ -578,7 +578,7 @@ impl RuntimeBackend for DockerClient {
                 .await
                 .map_err(|e| RuntimeError::ExecFailed(format!("inspect_exec failed: {e}")))?;
 
-            let exit_code = inspect.exit_code.unwrap_or(0);
+            let exit_code = inspect.exit_code.unwrap_or(-1);
             if exit_code != 0 {
                 return Err(RuntimeError::ExecFailed(format!(
                     "exit code {exit_code}: {output_buf}"

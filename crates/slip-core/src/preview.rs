@@ -469,7 +469,7 @@ pub async fn execute_preview_deploy(state: Arc<crate::api::AppState>, ctx: Previ
     let shared = PreviewSharedState {
         config: state.config.clone(),
         app_config,
-        preview_states: Arc::new(state.preview_states.clone()),
+        preview_states: state.preview_states.clone(),
         storage_path: state.config.storage.path.clone(),
         credentials: state.registry_credentials(),
     };
@@ -676,14 +676,17 @@ pub(crate) async fn execute_preview_deploy_inner(
     );
 
     if let Some(max) = max_limit {
-        // Count active previews for this app (excluding the current preview_id).
-        // The current preview may already be in state (as Deploying), so exclude it.
+        // Count active previews for this app (excluding the current preview_id and
+        // any previews that are still Deploying — we don't want to evict an in-progress deploy).
+        // Only Running previews count against the limit.
         let mut existing: Vec<(String, DateTime<Utc>)> = shared
             .preview_states
             .iter()
             .filter(|entry| {
                 let ps = entry.value();
-                ps.app == *app_name && ps.preview_id != *preview_id
+                ps.app == *app_name
+                    && ps.preview_id != *preview_id
+                    && ps.status == AppStatus::Running
             })
             .map(|entry| {
                 let ps = entry.value();
