@@ -5,8 +5,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
@@ -176,6 +177,115 @@ pub(crate) fn resolve_preview_domain(
     ))
 }
 
+// ─── TTL parsing ──────────────────────────────────────────────────────────────
+
+/// Parse a human-readable TTL string into a [`chrono::Duration`].
+///
+/// Supported suffixes:
+/// - `"h"` — hours (e.g. `"72h"`)
+/// - `"d"` — days (e.g. `"3d"`)
+/// - `"m"` — minutes (e.g. `"30m"`)
+/// - `"s"` — seconds (e.g. `"3600s"`)
+///
+/// Returns `DeployError` for unrecognised formats.
+pub fn parse_ttl(s: &str) -> Result<ChronoDuration, DeployError> {
+    let s = s.trim();
+
+    // Try suffixes in order: days first (to avoid `d` being misread as digits).
+    if let Some(rest) = s.strip_suffix('d') {
+        let days: i64 = rest
+            .trim()
+            .parse()
+            .map_err(|_| DeployError(format!("invalid TTL '{s}': expected integer before 'd'")))?;
+        return ChronoDuration::try_days(days)
+            .ok_or_else(|| DeployError(format!("TTL '{s}' overflows chrono::Duration")));
+    }
+    if let Some(rest) = s.strip_suffix('h') {
+        let hours: i64 = rest
+            .trim()
+            .parse()
+            .map_err(|_| DeployError(format!("invalid TTL '{s}': expected integer before 'h'")))?;
+        return ChronoDuration::try_hours(hours)
+            .ok_or_else(|| DeployError(format!("TTL '{s}' overflows chrono::Duration")));
+    }
+    if let Some(rest) = s.strip_suffix('m') {
+        let mins: i64 = rest
+            .trim()
+            .parse()
+            .map_err(|_| DeployError(format!("invalid TTL '{s}': expected integer before 'm'")))?;
+        return ChronoDuration::try_minutes(mins)
+            .ok_or_else(|| DeployError(format!("TTL '{s}' overflows chrono::Duration")));
+    }
+    if let Some(rest) = s.strip_suffix('s') {
+        let secs: i64 = rest
+            .trim()
+            .parse()
+            .map_err(|_| DeployError(format!("invalid TTL '{s}': expected integer before 's'")))?;
+        return ChronoDuration::try_seconds(secs)
+            .ok_or_else(|| DeployError(format!("TTL '{s}' overflows chrono::Duration")));
+    }
+
+    Err(DeployError(format!(
+        "invalid TTL '{s}': expected suffix 'd', 'h', 'm', or 's'"
+    )))
+}
+
+/// Compute `expires_at` for a new preview.
+///
+/// Priority (highest first):
+/// 1. Repo `preview.ttl` — already a `std::time::Duration`
+/// 2. Server `preview.default_ttl` — a string that must be parsed via [`parse_ttl`]
+/// 3. `None` — no expiry
+pub(crate) fn compute_expires_at(
+    deployed_at: DateTime<Utc>,
+    repo_ttl: Option<StdDuration>,
+    server_default_ttl: Option<&str>,
+) -> Result<Option<DateTime<Utc>>, DeployError> {
+    // 1. Repo TTL takes priority.
+    if let Some(std_dur) = repo_ttl {
+        let chrono_dur = ChronoDuration::from_std(std_dur)
+            .map_err(|e| DeployError(format!("repo TTL out of range for chrono: {e}")))?;
+        return Ok(Some(deployed_at + chrono_dur));
+    }
+
+    // 2. Fall back to server default TTL string.
+    if let Some(ttl_str) = server_default_ttl {
+        let chrono_dur = parse_ttl(ttl_str)?;
+        return Ok(Some(deployed_at + chrono_dur));
+    }
+
+    // 3. No TTL → no expiry.
+    Ok(None)
+}
+
+/// Resolve the max concurrent previews limit for an app.
+///
+/// Priority (highest first):
+/// 1. Repo `preview.max` — from the image's slip.toml
+/// 2. App-level `preview.max` — from the server-side app config
+/// 3. Server `preview.max_per_app` — daemon-wide default
+/// 4. `None` — no limit
+pub(crate) fn resolve_max_limit(
+    repo_max: Option<u32>,
+    app_preview: &Option<AppPreviewConfig>,
+    server_preview: &Option<ServerPreviewConfig>,
+) -> Option<u32> {
+    if let Some(m) = repo_max {
+        return Some(m);
+    }
+    if let Some(app_cfg) = app_preview
+        && let Some(m) = app_cfg.max
+    {
+        return Some(m);
+    }
+    if let Some(server_cfg) = server_preview
+        && let Some(m) = server_cfg.max_per_app
+    {
+        return Some(m);
+    }
+    None
+}
+
 // ─── Preview deploy context and shared state ──────────────────────────────────
 
 /// Context for a single preview deploy.
@@ -306,7 +416,11 @@ pub(crate) async fn execute_preview_deploy_inner(
     )
     .map_err(|e| DeployError(format!("domain resolution failed: {e}")))?;
 
+    // Record the deploy timestamp once so it's consistent.
+    let deployed_at = Utc::now();
+
     // Insert initial preview state entry (Deploying).
+    // expires_at starts as None — we'll fill it in after extracting repo config.
     {
         let initial = PreviewState {
             preview_id: preview_id.clone(),
@@ -317,7 +431,7 @@ pub(crate) async fn execute_preview_deploy_inner(
             pod_name: None,
             port: None,
             tag: Some(ctx.tag.clone()),
-            deployed_at: Utc::now(),
+            deployed_at,
             expires_at: None,
             domain: resolved_domain.clone(),
             manifest_path: None,
@@ -413,6 +527,88 @@ pub(crate) async fn execute_preview_deploy_inner(
     };
 
     let effective_config = merged.app.clone();
+
+    // ── COMPUTE EXPIRES_AT (TTL) ──────────────────────────────────────────────
+    // Priority: repo preview.ttl → server preview.default_ttl → None
+    let repo_ttl = merged.preview.as_ref().and_then(|p| p.ttl);
+    let server_default_ttl = shared
+        .config
+        .preview
+        .as_ref()
+        .and_then(|p| p.default_ttl.as_deref());
+
+    let expires_at =
+        compute_expires_at(deployed_at, repo_ttl, server_default_ttl).map_err(|e| {
+            fail_preview(&shared.preview_states, &state_key);
+            DeployError(format!("TTL computation failed: {e}"))
+        })?;
+
+    // Update the state entry with the computed expires_at.
+    if let Some(mut entry) = shared.preview_states.get_mut(&state_key) {
+        entry.expires_at = expires_at;
+    }
+
+    // ── MAX-LIMIT EVICTION ────────────────────────────────────────────────────
+    // Priority: repo preview.max → app-level preview.max → server preview.max_per_app → None
+    let max_limit = resolve_max_limit(
+        merged.preview.as_ref().and_then(|p| p.max),
+        &shared.app_config.preview,
+        &shared.config.preview,
+    );
+
+    if let Some(max) = max_limit {
+        // Count active previews for this app (excluding the current preview_id).
+        // The current preview may already be in state (as Deploying), so exclude it.
+        let mut existing: Vec<(String, DateTime<Utc>)> = shared
+            .preview_states
+            .iter()
+            .filter(|entry| {
+                let ps = entry.value();
+                ps.app == *app_name && ps.preview_id != *preview_id
+            })
+            .map(|entry| {
+                let ps = entry.value();
+                (ps.preview_id.clone(), ps.deployed_at)
+            })
+            .collect();
+
+        if existing.len() >= max as usize {
+            // Sort oldest first and evict until we're under the limit.
+            existing.sort_by_key(|(_, dt)| *dt);
+            let to_evict = existing.len() - max as usize + 1; // +1 to make room for this one
+            let victims: Vec<String> = existing
+                .into_iter()
+                .take(to_evict)
+                .map(|(id, _)| id)
+                .collect();
+
+            for victim_id in victims {
+                tracing::info!(
+                    app = %app_name,
+                    evicted_preview_id = %victim_id,
+                    reason = "max_limit_eviction",
+                    "evicting oldest preview to make room for new deploy"
+                );
+                if let Err(e) = teardown_preview(
+                    runtime,
+                    caddy,
+                    &shared.preview_states,
+                    &shared.storage_path,
+                    app_name,
+                    &victim_id,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        app = %app_name,
+                        evicted_preview_id = %victim_id,
+                        error = %e,
+                        "eviction teardown failed (non-fatal)"
+                    );
+                }
+            }
+        }
+    }
 
     // ── REDEPLOY: tear down existing preview if already running ──────────────
     // Use the values captured before the initial state insert (at the top of this function).
@@ -771,6 +967,70 @@ pub async fn teardown_preview(
     Ok(())
 }
 
+// ─── Background reaper ────────────────────────────────────────────────────────
+
+/// Scan `preview_states` and return identifiers of all expired previews.
+///
+/// This is factored out for testability — tests can call this directly without
+/// needing a full background task.  The caller is responsible for calling
+/// [`teardown_preview`] on the returned pairs.
+pub(crate) fn collect_expired_previews(
+    preview_states: &DashMap<String, PreviewState>,
+) -> Vec<(String, String)> {
+    let now = Utc::now();
+    preview_states
+        .iter()
+        .filter(|entry| entry.value().expires_at.is_some_and(|exp| now >= exp))
+        .map(|entry| {
+            let ps = entry.value();
+            (ps.app.clone(), ps.preview_id.clone())
+        })
+        .collect()
+}
+
+/// Reap all expired previews from `state`.
+///
+/// Errors from individual teardowns are logged but do not abort the iteration.
+pub async fn reap_expired_previews(state: &crate::api::AppState) {
+    let expired = collect_expired_previews(&state.preview_states);
+
+    for (app, preview_id) in expired {
+        tracing::info!(
+            app = %app,
+            preview_id = %preview_id,
+            "reaper: tearing down expired preview"
+        );
+        if let Err(e) = teardown_preview(
+            state.runtime.as_ref(),
+            &state.caddy,
+            &state.preview_states,
+            &state.config.storage.path,
+            &app,
+            &preview_id,
+        )
+        .await
+        {
+            tracing::warn!(
+                app = %app,
+                preview_id = %preview_id,
+                error = %e,
+                "reaper: teardown failed (non-fatal)"
+            );
+        }
+    }
+}
+
+/// Background task that periodically reaps expired previews.
+///
+/// Sleeps 60 seconds between scans. Designed to be spawned with
+/// `tokio::spawn(preview_reaper(state.clone()))` before the HTTP server starts.
+pub async fn preview_reaper(state: Arc<crate::api::AppState>) {
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        reap_expired_previews(&state).await;
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -780,7 +1040,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
-    use chrono::Utc;
+    use chrono::{Duration as ChronoDuration, Utc};
     use dashmap::DashMap;
     use tempfile::TempDir;
 
@@ -1884,5 +2144,421 @@ enabled = {enabled}
 
         // State should be cleared.
         assert!(preview_states.get("testapp:pr-42").is_none());
+    }
+
+    // ── Phase 4: parse_ttl tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_ttl_hours() {
+        let dur = parse_ttl("72h").unwrap();
+        assert_eq!(dur, ChronoDuration::hours(72));
+    }
+
+    #[test]
+    fn test_parse_ttl_days() {
+        let dur = parse_ttl("3d").unwrap();
+        assert_eq!(dur, ChronoDuration::days(3));
+    }
+
+    #[test]
+    fn test_parse_ttl_minutes() {
+        let dur = parse_ttl("30m").unwrap();
+        assert_eq!(dur, ChronoDuration::minutes(30));
+    }
+
+    #[test]
+    fn test_parse_ttl_seconds() {
+        let dur = parse_ttl("3600s").unwrap();
+        assert_eq!(dur, ChronoDuration::seconds(3600));
+    }
+
+    #[test]
+    fn test_parse_ttl_invalid() {
+        let err = parse_ttl("invalid").unwrap_err();
+        assert!(
+            err.0.contains("invalid TTL"),
+            "error should mention TTL: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn test_parse_ttl_no_suffix() {
+        assert!(parse_ttl("42").is_err());
+    }
+
+    // ── Phase 4: compute_expires_at tests ────────────────────────────────────
+
+    #[test]
+    fn test_compute_expires_at_repo_ttl_takes_priority() {
+        let now = Utc::now();
+        let repo_ttl = Some(StdDuration::from_secs(3600)); // 1 hour
+        let server_ttl = Some("24h");
+
+        let expires = compute_expires_at(now, repo_ttl, server_ttl).unwrap();
+
+        // Should use repo TTL (1h), not server TTL (24h).
+        let expected = now + ChronoDuration::hours(1);
+        let expires = expires.expect("should have expires_at");
+        // Allow ±1 second for test timing.
+        let diff = (expires - expected).num_seconds().abs();
+        assert!(
+            diff <= 1,
+            "expires_at should be ~1h from now, diff: {diff}s"
+        );
+    }
+
+    #[test]
+    fn test_compute_expires_at_falls_back_to_server_default() {
+        let now = Utc::now();
+        let repo_ttl: Option<StdDuration> = None; // no repo TTL
+        let server_ttl = Some("24h");
+
+        let expires = compute_expires_at(now, repo_ttl, server_ttl)
+            .unwrap()
+            .expect("should have expires_at from server default");
+
+        let expected = now + ChronoDuration::hours(24);
+        let diff = (expires - expected).num_seconds().abs();
+        assert!(
+            diff <= 1,
+            "expires_at should be ~24h from now, diff: {diff}s"
+        );
+    }
+
+    #[test]
+    fn test_compute_expires_at_none_when_no_ttl_configured() {
+        let now = Utc::now();
+        let result = compute_expires_at(now, None, None).unwrap();
+        assert!(result.is_none(), "expires_at should be None when no TTL");
+    }
+
+    // ── Phase 4: collect_expired_previews tests ───────────────────────────────
+
+    /// Expired preview (expires_at in the past) is returned by collect_expired_previews.
+    #[test]
+    fn test_collect_expired_previews_returns_expired() {
+        let preview_states: DashMap<String, PreviewState> = DashMap::new();
+        let past = Utc::now() - ChronoDuration::hours(1);
+
+        preview_states.insert(
+            "app1:pr-expired".to_string(),
+            PreviewState {
+                preview_id: "pr-expired".to_string(),
+                app: "app1".to_string(),
+                sha: "sha1".to_string(),
+                status: AppStatus::Running,
+                container_id: Some("ctr-expired".to_string()),
+                pod_name: None,
+                port: Some(9001),
+                tag: Some("v1".to_string()),
+                deployed_at: past - ChronoDuration::hours(1),
+                expires_at: Some(past), // already expired
+                domain: "pr-expired.preview.example.com".to_string(),
+                manifest_path: None,
+                deploy_id: None,
+            },
+        );
+
+        let expired = collect_expired_previews(&preview_states);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, "app1");
+        assert_eq!(expired[0].1, "pr-expired");
+    }
+
+    /// Non-expired preview (expires_at in the future) is NOT returned.
+    #[test]
+    fn test_collect_expired_previews_keeps_non_expired() {
+        let preview_states: DashMap<String, PreviewState> = DashMap::new();
+        let future = Utc::now() + ChronoDuration::hours(24);
+
+        preview_states.insert(
+            "app1:pr-fresh".to_string(),
+            PreviewState {
+                preview_id: "pr-fresh".to_string(),
+                app: "app1".to_string(),
+                sha: "sha2".to_string(),
+                status: AppStatus::Running,
+                container_id: Some("ctr-fresh".to_string()),
+                pod_name: None,
+                port: Some(9002),
+                tag: Some("v2".to_string()),
+                deployed_at: Utc::now(),
+                expires_at: Some(future), // not yet expired
+                domain: "pr-fresh.preview.example.com".to_string(),
+                manifest_path: None,
+                deploy_id: None,
+            },
+        );
+
+        let expired = collect_expired_previews(&preview_states);
+        assert!(
+            expired.is_empty(),
+            "fresh preview should not be collected for reaping"
+        );
+    }
+
+    /// Preview with no expires_at (no TTL) is never expired.
+    #[test]
+    fn test_collect_expired_previews_ignores_no_expiry() {
+        let preview_states: DashMap<String, PreviewState> = DashMap::new();
+
+        preview_states.insert(
+            "app1:pr-no-ttl".to_string(),
+            PreviewState {
+                preview_id: "pr-no-ttl".to_string(),
+                app: "app1".to_string(),
+                sha: "sha3".to_string(),
+                status: AppStatus::Running,
+                container_id: Some("ctr-no-ttl".to_string()),
+                pod_name: None,
+                port: Some(9003),
+                tag: Some("v3".to_string()),
+                deployed_at: Utc::now() - ChronoDuration::days(100),
+                expires_at: None, // no TTL configured
+                domain: "pr-no-ttl.preview.example.com".to_string(),
+                manifest_path: None,
+                deploy_id: None,
+            },
+        );
+
+        let expired = collect_expired_previews(&preview_states);
+        assert!(
+            expired.is_empty(),
+            "preview with no TTL should never be reaped"
+        );
+    }
+
+    // ── Phase 4: max-limit eviction in execute_preview_deploy_inner ───────────
+
+    fn make_preview_repo_config_with_max_toml(max: u32) -> Vec<u8> {
+        format!(
+            r#"
+[app]
+name = "testapp"
+
+[preview]
+enabled = true
+max = {max}
+"#
+        )
+        .into_bytes()
+    }
+
+    /// Deploying when max=2 and 2 existing previews → oldest is evicted.
+    #[tokio::test]
+    async fn test_max_limit_eviction_evicts_oldest_when_at_max() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_config_bytes = make_preview_repo_config_with_max_toml(2);
+        let docker = MockDocker::with_repo_config(repo_config_bytes);
+        let stop_count = docker.stop_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let preview_states = Arc::new(DashMap::<String, PreviewState>::new());
+
+        let old_time = Utc::now() - ChronoDuration::hours(2);
+        let newer_time = Utc::now() - ChronoDuration::hours(1);
+
+        // Insert 2 existing previews: one older, one newer.
+        preview_states.insert(
+            "testapp:pr-old".to_string(),
+            PreviewState {
+                preview_id: "pr-old".to_string(),
+                app: "testapp".to_string(),
+                sha: "sha-old".to_string(),
+                status: AppStatus::Running,
+                container_id: Some("ctr-old".to_string()),
+                pod_name: None,
+                port: Some(51001),
+                tag: Some("old-tag".to_string()),
+                deployed_at: old_time, // oldest
+                expires_at: None,
+                domain: "pr-old.preview.example.com".to_string(),
+                manifest_path: None,
+                deploy_id: None,
+            },
+        );
+        preview_states.insert(
+            "testapp:pr-newer".to_string(),
+            PreviewState {
+                preview_id: "pr-newer".to_string(),
+                app: "testapp".to_string(),
+                sha: "sha-newer".to_string(),
+                status: AppStatus::Running,
+                container_id: Some("ctr-newer".to_string()),
+                pod_name: None,
+                port: Some(51002),
+                tag: Some("newer-tag".to_string()),
+                deployed_at: newer_time, // not oldest
+                expires_at: None,
+                domain: "pr-newer.preview.example.com".to_string(),
+                manifest_path: None,
+                deploy_id: None,
+            },
+        );
+
+        // Deploy a new preview (pr-42) — this is the 3rd, but max=2.
+        let shared = make_shared(&tmp, test_app_config(), preview_states.clone());
+        let ctx = test_preview_ctx(); // preview_id = "pr-42"
+
+        let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
+
+        assert!(
+            result.is_ok(),
+            "deploy should succeed despite eviction: {result:?}"
+        );
+
+        // The oldest preview (pr-old) should have been evicted.
+        assert!(
+            preview_states.get("testapp:pr-old").is_none(),
+            "oldest preview should be evicted"
+        );
+
+        // The newer preview should survive.
+        assert!(
+            preview_states.get("testapp:pr-newer").is_some(),
+            "newer preview should survive"
+        );
+
+        // The new preview should be running.
+        let new_state = preview_states
+            .get("testapp:pr-42")
+            .expect("new preview should be in state");
+        assert_eq!(new_state.status, AppStatus::Running);
+
+        // stop_and_remove should have been called at least once (for the evicted preview).
+        assert!(
+            stop_count.load(Ordering::SeqCst) >= 1,
+            "at least one container should be stopped for eviction"
+        );
+    }
+
+    /// Deploying when max=3 and only 1 existing preview → no eviction needed.
+    #[tokio::test]
+    async fn test_max_limit_no_eviction_when_under_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_config_bytes = make_preview_repo_config_with_max_toml(3);
+        let docker = MockDocker::with_repo_config(repo_config_bytes);
+        let stop_count = docker.stop_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let preview_states = Arc::new(DashMap::<String, PreviewState>::new());
+
+        // Insert 1 existing preview — well under max=3.
+        preview_states.insert(
+            "testapp:pr-existing".to_string(),
+            PreviewState {
+                preview_id: "pr-existing".to_string(),
+                app: "testapp".to_string(),
+                sha: "sha-existing".to_string(),
+                status: AppStatus::Running,
+                container_id: Some("ctr-existing".to_string()),
+                pod_name: None,
+                port: Some(51003),
+                tag: Some("existing-tag".to_string()),
+                deployed_at: Utc::now() - ChronoDuration::hours(1),
+                expires_at: None,
+                domain: "pr-existing.preview.example.com".to_string(),
+                manifest_path: None,
+                deploy_id: None,
+            },
+        );
+
+        let shared = make_shared(&tmp, test_app_config(), preview_states.clone());
+        let ctx = test_preview_ctx(); // preview_id = "pr-42"
+
+        let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
+
+        assert!(result.is_ok(), "deploy should succeed: {result:?}");
+
+        // Existing preview should still be there (no eviction).
+        assert!(
+            preview_states.get("testapp:pr-existing").is_some(),
+            "existing preview should survive when under limit"
+        );
+
+        // New preview should be deployed.
+        let new_state = preview_states
+            .get("testapp:pr-42")
+            .expect("new preview in state");
+        assert_eq!(new_state.status, AppStatus::Running);
+
+        // No container should be stopped for eviction (only the new one's health check would stop it on failure).
+        // stop_and_remove should be 0 since health passes.
+        assert_eq!(
+            stop_count.load(Ordering::SeqCst),
+            0,
+            "no eviction should occur when under limit"
+        );
+    }
+
+    // ── Phase 4: TTL set on deployed preview ──────────────────────────────────
+
+    /// When server default_ttl is configured, preview gets expires_at set.
+    #[tokio::test]
+    async fn test_deploy_sets_expires_at_from_server_default_ttl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_config_bytes = make_preview_repo_config_toml(true); // no repo TTL
+        let docker = MockDocker::with_repo_config(repo_config_bytes);
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let preview_states = Arc::new(DashMap::new());
+
+        let mut config = test_slip_config(tmp.path().to_path_buf());
+        config.preview = Some(ServerPreviewConfig {
+            domain: "preview.example.com".to_string(),
+            max_per_app: None,
+            default_ttl: Some("24h".to_string()),
+            max_memory: None,
+            max_cpus: None,
+        });
+
+        let shared = PreviewSharedState {
+            config,
+            app_config: test_app_config(),
+            preview_states: preview_states.clone(),
+            storage_path: tmp.path().to_path_buf(),
+            credentials: None,
+        };
+        let ctx = test_preview_ctx();
+
+        let before = Utc::now();
+        let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
+        assert!(result.is_ok(), "deploy should succeed: {result:?}");
+
+        let state = preview_states.get("testapp:pr-42").unwrap();
+        let expires_at = state.expires_at.expect("expires_at should be set");
+        let expected = before + ChronoDuration::hours(24);
+
+        // expires_at should be roughly 24h from now (allow 5s tolerance).
+        let diff = (expires_at - expected).num_seconds().abs();
+        assert!(
+            diff <= 5,
+            "expires_at should be ~24h from deploy, diff: {diff}s"
+        );
+    }
+
+    /// When no TTL is configured (repo or server), preview gets no expires_at.
+    #[tokio::test]
+    async fn test_deploy_no_expires_at_when_no_ttl_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_config_bytes = make_preview_repo_config_toml(true); // no repo TTL
+        let docker = MockDocker::with_repo_config(repo_config_bytes);
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let preview_states = Arc::new(DashMap::new());
+
+        // Server config has no default_ttl.
+        let shared = make_shared(&tmp, test_app_config(), preview_states.clone());
+        let ctx = test_preview_ctx();
+
+        let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
+        assert!(result.is_ok(), "deploy should succeed: {result:?}");
+
+        let state = preview_states.get("testapp:pr-42").unwrap();
+        assert!(
+            state.expires_at.is_none(),
+            "no expires_at when no TTL configured"
+        );
     }
 }

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use clap::Parser;
 use dashmap::DashMap;
+use slip_core::preview::preview_reaper;
 use slip_core::runtime::RuntimeBackend;
 use slip_core::{
     AppState, CaddyClient, DockerClient, HealthChecker, PodmanBackend, build_router,
@@ -184,6 +185,9 @@ async fn main() -> anyhow::Result<()> {
         preview_states,
         preview_locks: DashMap::new(),
     });
+
+    // ── Spawn background tasks ────────────────────────────────────────────────
+    tokio::spawn(preview_reaper(state.clone()));
 
     // ── Build router ─────────────────────────────────────────────────────────
     let router = build_router(state);
