@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Pre-commit hook: Run fmt, clippy, and relevant tests
+# Install with: git config core.hooksPath .githooks
+
+set -e
+
+echo "Running pre-commit checks..."
+
+# Check formatting
+echo ">>> cargo fmt --check"
+if ! cargo fmt --all -- --check; then
+    echo ""
+    echo "❌ Formatting check failed. Run 'cargo fmt --all' to fix."
+    exit 1
+fi
+
+# Check clippy
+echo ">>> cargo clippy"
+if ! cargo clippy --workspace --all-targets -- -D warnings; then
+    echo ""
+    echo "❌ Clippy check failed. Fix the warnings above."
+    exit 1
+fi
+
+# Run tests for changed crates
+echo ">>> Running tests for changed crates..."
+
+# Get list of changed files (staged)
+CHANGED_FILES=$(git diff --cached --name-only --diff-filter=ACMR)
+
+if [ -z "$CHANGED_FILES" ]; then
+    echo "No staged changes, skipping tests."
+    echo ""
+    echo "✅ Pre-commit checks passed"
+    exit 0
+fi
+
+# Determine which crates have changes
+CRATES_TO_TEST=""
+
+if echo "$CHANGED_FILES" | grep -q "^crates/slip-core/"; then
+    CRATES_TO_TEST="$CRATES_TO_TEST -p slip-core"
+fi
+
+if echo "$CHANGED_FILES" | grep -q "^crates/slipd/"; then
+    CRATES_TO_TEST="$CRATES_TO_TEST -p slipd"
+fi
+
+if echo "$CHANGED_FILES" | grep -q "^crates/slip/"; then
+    CRATES_TO_TEST="$CRATES_TO_TEST -p slip"
+fi
+
+# If no crate-specific changes, run all tests
+if [ -z "$CRATES_TO_TEST" ]; then
+    echo "Changes outside crates/, running all tests..."
+    TEST_CMD="cargo test --workspace"
+else
+    echo "Testing affected crates:$CRATES_TO_TEST"
+    TEST_CMD="cargo test $CRATES_TO_TEST"
+fi
+
+if ! eval "$TEST_CMD"; then
+    echo ""
+    echo "❌ Tests failed. Fix the failures above before committing."
+    exit 1
+fi
+
+echo ""
+echo "✅ Pre-commit checks passed"

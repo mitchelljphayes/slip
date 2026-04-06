@@ -127,6 +127,25 @@ pub trait RuntimeBackend: Send + Sync {
         })
     }
 
+    /// Execute a command inside a running container and return its combined output.
+    ///
+    /// Returns [`RuntimeError::ExecFailed`] if the command exits with a non-zero
+    /// status. Returns [`RuntimeError::Unsupported`] by default — must be
+    /// overridden by runtimes that support exec (Docker, Podman).
+    fn exec_in_container<'a>(
+        &'a self,
+        _container_id: &'a str,
+        _command: &'a [&'a str],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, RuntimeError>> + Send + 'a>,
+    > {
+        Box::pin(async {
+            Err(RuntimeError::Unsupported(
+                "exec_in_container not implemented for this runtime".to_string(),
+            ))
+        })
+    }
+
     /// Return the runtime name ("docker" or "podman").
     fn name(&self) -> &str;
 }

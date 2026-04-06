@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use slip_core::runtime::RuntimeBackend;
 use slip_core::{
     AppState, CaddyClient, DockerClient, HealthChecker, PodmanBackend, build_router,
-    load_app_states, load_config, reconcile_routes, verify_containers,
+    load_app_states, load_config, load_preview_states, reconcile_routes, verify_containers,
 };
 use tokio::sync::RwLock;
 
@@ -150,6 +150,17 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(error = %e, "caddy route reconciliation failed on startup (non-fatal)");
     }
 
+    // ── Load persisted preview states ────────────────────────────────────────
+    let persisted_previews = load_preview_states(&state_dir);
+    if !persisted_previews.is_empty() {
+        tracing::info!(
+            count = persisted_previews.len(),
+            "loaded persisted preview states"
+        );
+    }
+    let preview_states: DashMap<String, slip_core::PreviewState> =
+        persisted_previews.into_iter().collect();
+
     // ── Build application state ──────────────────────────────────────────────
     let state = Arc::new(AppState {
         config: slip_config,
@@ -161,6 +172,8 @@ async fn main() -> anyhow::Result<()> {
         app_states: RwLock::new(verified_states),
         deploys: DashMap::new(),
         started_at: Utc::now(),
+        preview_states,
+        preview_locks: DashMap::new(),
     });
 
     // ── Build router ─────────────────────────────────────────────────────────

@@ -18,9 +18,22 @@ use crate::caddy::CaddyClient;
 use crate::config::{AppConfig, SlipConfig};
 use crate::deploy::{AppRuntimeState, DeployContext, TriggerSource, execute_deploy};
 use crate::health::HealthChecker;
+use crate::preview::PreviewState;
 use crate::runtime::{RegistryCredentials, RuntimeBackend};
 
 // ─── Request / Response types ─────────────────────────────────────────────────
+
+/// Preview-specific fields sent alongside a deploy request.
+///
+/// When present, the deploy creates an ephemeral preview environment instead
+/// of updating the production deployment.
+#[derive(Debug, Deserialize)]
+pub struct PreviewRequestInfo {
+    /// Unique preview identifier (e.g. "pr-42", "feature-foo").
+    pub id: String,
+    /// Git commit SHA for metadata / display purposes.
+    pub sha: String,
+}
 
 /// Payload sent to `POST /v1/deploy`.
 #[derive(Debug, Deserialize)]
@@ -28,6 +41,9 @@ pub struct DeployRequest {
     pub app: String,
     pub image: String,
     pub tag: String,
+    /// If present, this is a preview deploy rather than a production deploy.
+    #[serde(default)]
+    pub preview: Option<PreviewRequestInfo>,
 }
 
 /// Successful deploy response (202 Accepted).
@@ -130,6 +146,13 @@ pub struct AppState {
     pub deploys: DashMap<String, DeployContext>,
     /// Timestamp when the daemon was started (used for uptime calculation).
     pub started_at: DateTime<Utc>,
+    /// Active preview deployment states keyed by `"{app}:{preview_id}"`.
+    pub preview_states: DashMap<String, PreviewState>,
+    /// Per-preview deploy locks; prevents concurrent deploys for the same preview.
+    ///
+    /// Keyed by `"{app}:{preview_id}"`. Allows preview deploys to run concurrently
+    /// with production deploys and other previews.
+    pub preview_locks: DashMap<String, Arc<Mutex<()>>>,
 }
 
 impl AppState {
@@ -434,6 +457,7 @@ mod tests {
             registry: RegistryConfig { ghcr_token: None },
             storage: StorageConfig::default(),
             runtime: RuntimeConfig::default(),
+            preview: None,
         }
     }
 
@@ -455,6 +479,7 @@ mod tests {
             env_file: None,
             resources: ResourceConfig::default(),
             network: NetworkConfig::default(),
+            preview: None,
         }
     }
 
@@ -475,6 +500,8 @@ mod tests {
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
             started_at: Utc::now(),
+            preview_states: DashMap::new(),
+            preview_locks: DashMap::new(),
         })
     }
 
@@ -492,6 +519,35 @@ mod tests {
     /// Build a signature header for the given body + secret.
     fn sig_header(body: &[u8], secret: &str) -> String {
         format!("sha256={}", compute_signature(body, secret))
+    }
+
+    // ── DeployRequest backward compatibility ──────────────────────────────────
+
+    #[test]
+    fn test_deploy_request_no_preview_field_deserializes() {
+        // Old clients that don't send `preview` should still parse fine.
+        let json = r#"{"app":"myapp","image":"ghcr.io/org/myapp","tag":"v1.0.0"}"#;
+        let req: crate::api::DeployRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.app, "myapp");
+        assert_eq!(req.tag, "v1.0.0");
+        assert!(
+            req.preview.is_none(),
+            "preview must be None when field is absent"
+        );
+    }
+
+    #[test]
+    fn test_deploy_request_with_preview_field_deserializes() {
+        let json = r#"{
+            "app": "myapp",
+            "image": "ghcr.io/org/myapp",
+            "tag": "sha-abc123",
+            "preview": {"id": "pr-42", "sha": "abc123def456"}
+        }"#;
+        let req: crate::api::DeployRequest = serde_json::from_str(json).unwrap();
+        let preview = req.preview.expect("preview should be Some");
+        assert_eq!(preview.id, "pr-42");
+        assert_eq!(preview.sha, "abc123def456");
     }
 
     // ── 202 Accepted ──────────────────────────────────────────────────────────
@@ -697,6 +753,8 @@ mod tests {
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
             started_at: Utc::now(),
+            preview_states: DashMap::new(),
+            preview_locks: DashMap::new(),
         });
 
         let app = build_router(state_inner);
@@ -742,6 +800,8 @@ mod tests {
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
             started_at: Utc::now(),
+            preview_states: DashMap::new(),
+            preview_locks: DashMap::new(),
         });
 
         let app = build_router(state);

@@ -77,6 +77,8 @@ pub enum RuntimeError {
     NetworkError(String),
     #[error("operation not supported by this runtime: {0}")]
     Unsupported(String),
+    #[error("exec in container failed: {0}")]
+    ExecFailed(String),
 }
 
 impl From<DockerError> for RuntimeError {

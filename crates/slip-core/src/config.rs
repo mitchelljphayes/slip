@@ -115,6 +115,34 @@ fn default_env() -> HashMap<String, String> {
 
 // ─── Daemon / server config ───────────────────────────────────────────────────
 
+/// Server-level preview deployment configuration.
+///
+/// Provides defaults and caps for all preview deployments on this daemon.
+/// Apps may override the domain via [`AppPreviewConfig`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerPreviewConfig {
+    /// Wildcard base domain for preview subdomains.
+    ///
+    /// Each preview is served at `{preview_id}.{domain}`.
+    /// Example: `"preview.example.com"` → preview URL `"pr-42.preview.example.com"`.
+    pub domain: String,
+    /// Maximum concurrent previews per app (server-level default).
+    pub max_per_app: Option<u32>,
+    /// Default TTL for previews as a duration string (e.g. "1h", "24h", "7d").
+    ///
+    /// Stored as `String` because TOML doesn't natively support `std::time::Duration`.
+    /// Parse with the duration helpers in `repo_config.rs` when needed.
+    pub default_ttl: Option<String>,
+    /// Maximum memory for preview containers (server-level cap).
+    ///
+    /// Expressed as a Docker-style size string (e.g. "512m", "1g").
+    pub max_memory: Option<String>,
+    /// Maximum CPU allocation for preview containers (server-level cap).
+    ///
+    /// Expressed as a fractional string (e.g. "0.5", "1.0").
+    pub max_cpus: Option<String>,
+}
+
 /// Top-level daemon configuration (`slip.toml`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SlipConfig {
@@ -125,6 +153,9 @@ pub struct SlipConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    /// Optional server-level preview configuration.
+    #[serde(default)]
+    pub preview: Option<ServerPreviewConfig>,
 }
 
 /// Container runtime backend settings.
@@ -206,6 +237,18 @@ impl Default for StorageConfig {
 
 // ─── Per-app config ───────────────────────────────────────────────────────────
 
+/// Per-app override for preview deployment settings.
+///
+/// When present in an app's `apps/<name>.toml`, these values take precedence
+/// over the corresponding server-level [`ServerPreviewConfig`] defaults.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AppPreviewConfig {
+    /// App-specific preview base domain (overrides server-level `preview.domain`).
+    pub domain: Option<String>,
+    /// Maximum concurrent previews for this app (overrides `preview.max_per_app`).
+    pub max: Option<u32>,
+}
+
 /// Per-application configuration loaded from `apps/<name>.toml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -220,6 +263,9 @@ pub struct AppConfig {
     pub resources: ResourceConfig,
     #[serde(default)]
     pub network: NetworkConfig,
+    /// Optional per-app preview configuration.
+    #[serde(default)]
+    pub preview: Option<AppPreviewConfig>,
 }
 
 /// Basic application identity.

@@ -797,6 +797,7 @@ mod tests {
                 RuntimeError::ContainerNotRunning(msg.clone())
             }
             RuntimeError::NoPortAssigned => RuntimeError::NoPortAssigned,
+            RuntimeError::ExecFailed(msg) => RuntimeError::ExecFailed(msg.clone()),
         }
     }
 
@@ -1008,6 +1009,14 @@ mod tests {
             };
             Box::pin(async move { result })
         }
+
+        fn remove_route<'a>(
+            &'a self,
+            _app_name: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     // ── Mock: HealthCheck ─────────────────────────────────────────────────────
@@ -1057,6 +1066,7 @@ mod tests {
             registry: RegistryConfig { ghcr_token: None },
             storage: StorageConfig { path: storage_path },
             runtime: crate::config::RuntimeConfig::default(),
+            preview: None,
         }
     }
 
@@ -1088,6 +1098,7 @@ mod tests {
             env_file: None,
             resources: ResourceConfig::default(),
             network: crate::config::NetworkConfig::default(),
+            preview: None,
         }
     }
 

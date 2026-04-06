@@ -15,6 +15,14 @@ pub trait ReverseProxy: Send + Sync {
         domain: &'a str,
         upstream_port: u16,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>;
+
+    /// Remove the reverse-proxy route for an app.
+    ///
+    /// A 404 response (route already gone) is treated as success.
+    fn remove_route<'a>(
+        &'a self,
+        app_name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>;
 }
 
 impl ReverseProxy for CaddyClient {
@@ -31,6 +39,14 @@ impl ReverseProxy for CaddyClient {
             domain,
             upstream_port,
         ))
+    }
+
+    fn remove_route<'a>(
+        &'a self,
+        app_name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>
+    {
+        Box::pin(CaddyClient::remove_route(self, app_name))
     }
 }
 
