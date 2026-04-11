@@ -45,6 +45,8 @@ pub enum CaddyError {
     RouteUpdateFailed(String),
     #[error("caddy not reachable at {url}: {source}")]
     Unreachable { url: String, source: reqwest::Error },
+    #[error("caddy TLS configuration failed: {0}")]
+    TlsConfigFailed(String),
 }
 
 /// Errors that can occur when interacting with the Docker daemon.

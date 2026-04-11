@@ -141,6 +141,31 @@ async fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("Caddy bootstrap error: {e}")
     })?;
 
+    // ── Configure TLS for preview wildcard certificates ────────────────────────
+    if let (Some(preview_config), Some(tls_config)) = (&slip_config.preview, &slip_config.caddy.tls)
+    {
+        match caddy
+            .configure_tls(&preview_config.domain, tls_config)
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    domain = %preview_config.domain,
+                    "configured TLS for wildcard preview certificates"
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to configure TLS for preview domain");
+                return Err(anyhow::anyhow!("TLS configuration error: {e}"));
+            }
+        }
+    } else if slip_config.preview.is_some() && slip_config.caddy.tls.is_none() {
+        tracing::warn!(
+            "preview deployments configured but no TLS config found; \
+             preview domains will use Caddy's default HTTP-01 challenge"
+        );
+    }
+
     tracing::info!("infrastructure bootstrap complete");
 
     // ── Load and reconcile persisted state ───────────────────────────────────

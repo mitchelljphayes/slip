@@ -18,9 +18,9 @@ pub mod state;
 pub use api::{AppState, DeployRequest, DeployResponse, PreviewRequestInfo, build_router};
 pub use caddy::{CaddyClient, ReverseProxy, RouteInfo};
 pub use config::{
-    AppConfig, AppInfo, AppPreviewConfig, CaddyConfig, DeployConfig, EnvFileConfig, HealthConfig,
-    NetworkConfig, RegistryConfig, ResourceConfig, RoutingConfig, RuntimeConfig, ServerConfig,
-    ServerPreviewConfig, SlipConfig, StorageConfig, load_config, resolve_env_vars,
+    AppConfig, AppInfo, AppPreviewConfig, CaddyConfig, CaddyTlsConfig, DeployConfig, EnvFileConfig,
+    HealthConfig, NetworkConfig, RegistryConfig, ResourceConfig, RoutingConfig, RuntimeConfig,
+    ServerConfig, ServerPreviewConfig, SlipConfig, StorageConfig, load_config, resolve_env_vars,
 };
 pub use deploy::{
     AppRuntimeState, AppStatus, DeployContext, DeployStatus, TriggerSource, execute_deploy,

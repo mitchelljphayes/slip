@@ -1,5 +1,6 @@
 //! Caddy admin API client for dynamic route management.
 
+use crate::config::CaddyTlsConfig;
 use crate::error::CaddyError;
 use serde_json::json;
 
@@ -190,6 +191,119 @@ impl CaddyClient {
         }
         Ok(())
     }
+
+    /// Configure TLS for wildcard certificates on a preview domain.
+    ///
+    /// Sets up a TLS connection policy with DNS-01 challenge for obtaining
+    /// wildcard certificates (e.g., `*.preview.example.com`).
+    ///
+    /// This method is idempotent: if a policy with matching subjects already
+    /// exists, it returns success without making changes.
+    ///
+    /// # Arguments
+    ///
+    /// * `preview_domain` - The base domain for previews (e.g., `preview.example.com`)
+    /// * `tls_config` - TLS configuration including DNS provider settings
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let tls_config = CaddyTlsConfig {
+    ///     email: "admin@example.com".to_string(),
+    ///     dns_provider: "cloudflare".to_string(),
+    ///     dns_provider_config: Some(toml::value::Table::new()),
+    ///     propagation_delay: "2m".to_string(),
+    ///     staging: false,
+    /// };
+    /// client.configure_tls("preview.example.com", &tls_config).await?;
+    /// ```
+    pub async fn configure_tls(
+        &self,
+        preview_domain: &str,
+        tls_config: &CaddyTlsConfig,
+    ) -> Result<(), CaddyError> {
+        let wildcard_subject = format!("*.{preview_domain}");
+
+        // Check if a policy with matching subjects already exists (idempotency)
+        let policies_url = format!("{}/config/apps/tls/automation/policies", self.base_url);
+        let resp = self.client.get(&policies_url).send().await?;
+
+        if resp.status().is_success() {
+            let policies: Vec<serde_json::Value> = resp.json().await.unwrap_or_default();
+            // Check if any policy already has our wildcard subject
+            for policy in policies {
+                if let Some(subjects) = policy.get("subjects").and_then(|s| s.as_array())
+                    && subjects
+                        .iter()
+                        .any(|s| s.as_str() == Some(&wildcard_subject))
+                {
+                    // Policy already exists, nothing to do
+                    return Ok(());
+                }
+            }
+        }
+
+        // Build the DNS provider config for Caddy
+        // Caddy expects provider config values to use {env.VAR_NAME} syntax
+        // Provider config fields are siblings of "name", not nested under "config"
+        let mut provider = json!({"name": tls_config.dns_provider});
+        if let Some(config_table) = &tls_config.dns_provider_config {
+            for (key, value) in config_table {
+                // Convert TOML value to JSON value and merge as sibling of "name"
+                provider[key] = serde_json::to_value(value).unwrap_or(json!(null));
+            }
+        }
+
+        // Determine CA URL based on staging flag
+        let ca_url = if tls_config.staging {
+            "https://acme-staging-v02.api.letsencrypt.org/directory"
+        } else {
+            "https://acme-v02.api.letsencrypt.org/directory"
+        };
+
+        // Build the TLS policy with ACME issuer using DNS challenge
+        // Note: Caddy uses "issuers" (array) and "dns" (not "dns-01")
+        let policy = json!({
+            "subjects": [&wildcard_subject],
+            "issuers": [{
+                "module": "acme",
+                "email": tls_config.email,
+                "challenges": {
+                    "dns": {
+                        "provider": provider,
+                        "propagation_delay": tls_config.propagation_delay
+                    }
+                },
+                "ca": ca_url
+            }]
+        });
+
+        // Ensure the parent TLS automation path exists before appending policy
+        // POST to the automation path creates the structure if it doesn't exist
+        let automation_url = format!("{}/config/apps/tls/automation", self.base_url);
+        let automation_body = json!({"policies": []});
+        // Ignore errors here - if it already exists, Caddy returns an error but that's fine
+        let _ = self
+            .client
+            .post(&automation_url)
+            .json(&automation_body)
+            .send()
+            .await;
+
+        // Append the policy to the automation policies
+        let post_url = format!("{}/config/apps/tls/automation/policies", self.base_url);
+        let post_resp = self.client.post(&post_url).json(&policy).send().await?;
+
+        if post_resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = post_resp.status();
+            let text = post_resp.text().await.unwrap_or_default();
+            Err(CaddyError::TlsConfigFailed(format!(
+                "POST {post_url} returned {status}: {text}"
+            )))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +387,53 @@ mod tests {
         }
     }
 
+    async fn mock_get_tls_policies(
+        State(state): State<MockState>,
+    ) -> (StatusCode, axum::Json<serde_json::Value>) {
+        let map = state.lock().await;
+        if let Some(policies) = map.get("__tls_policies__") {
+            (StatusCode::OK, axum::Json(policies.clone()))
+        } else {
+            (StatusCode::OK, axum::Json(json!([])))
+        }
+    }
+
+    async fn mock_add_tls_policy(
+        State(state): State<MockState>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> StatusCode {
+        let mut map = state.lock().await;
+        // Get existing policies or create empty array
+        let policies = map
+            .entry("__tls_policies__".to_string())
+            .or_insert(json!([]));
+        if let Some(arr) = policies.as_array_mut() {
+            arr.push(body);
+        }
+        StatusCode::OK
+    }
+
+    async fn mock_add_tls_policy_fail(
+        State(state): State<MockState>,
+        axum::Json(_body): axum::Json<serde_json::Value>,
+    ) -> StatusCode {
+        // Check if we should fail
+        let map = state.lock().await;
+        if map.contains_key("__tls_fail__") {
+            StatusCode::INTERNAL_SERVER_ERROR
+        } else {
+            drop(map);
+            let mut map = state.lock().await;
+            let policies = map
+                .entry("__tls_policies__".to_string())
+                .or_insert(json!([]));
+            if let Some(arr) = policies.as_array_mut() {
+                arr.push(_body);
+            }
+            StatusCode::OK
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Test helpers
     // -----------------------------------------------------------------------
@@ -291,6 +452,38 @@ mod tests {
             .route(
                 "/id/{id}",
                 patch(mock_patch_route).delete(mock_delete_route),
+            )
+            .route(
+                "/config/apps/tls/automation/policies",
+                get(mock_get_tls_policies).post(mock_add_tls_policy),
+            )
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, state)
+    }
+
+    /// Mock Caddy that can be configured to fail TLS policy POST requests
+    async fn start_mock_caddy_with_tls_failure() -> (u16, MockState) {
+        let state: MockState = Arc::new(Mutex::new(HashMap::new()));
+        let app = Router::new()
+            .route(
+                "/config/apps/http/servers/slip",
+                get(mock_get_server).post(mock_create_server),
+            )
+            .route(
+                "/config/apps/http/servers/slip/routes",
+                post(mock_add_route),
+            )
+            .route(
+                "/id/{id}",
+                patch(mock_patch_route).delete(mock_delete_route),
+            )
+            .route(
+                "/config/apps/tls/automation/policies",
+                get(mock_get_tls_policies).post(mock_add_tls_policy_fail),
             )
             .with_state(state.clone());
 
@@ -463,6 +656,178 @@ mod tests {
         assert!(
             map.contains_key("slip-app-three"),
             "app-three should be registered"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // configure_tls tests
+    // -----------------------------------------------------------------------
+
+    fn test_tls_config() -> CaddyTlsConfig {
+        CaddyTlsConfig {
+            email: "admin@example.com".to_string(),
+            dns_provider: "cloudflare".to_string(),
+            dns_provider_config: None,
+            propagation_delay: "2m".to_string(),
+            staging: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_configure_tls_creates_policy() {
+        let (port, state) = start_mock_caddy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        let tls_config = test_tls_config();
+
+        client
+            .configure_tls("preview.example.com", &tls_config)
+            .await
+            .expect("configure_tls should succeed");
+
+        let map = state.lock().await;
+        let policies = map.get("__tls_policies__").expect("policies should exist");
+        let arr = policies.as_array().expect("policies should be an array");
+        assert_eq!(arr.len(), 1, "should have one policy");
+        let policy = &arr[0];
+        assert_eq!(
+            policy["subjects"][0].as_str(),
+            Some("*.preview.example.com"),
+            "subject should be wildcard domain"
+        );
+        assert_eq!(
+            policy["issuers"][0]["module"].as_str(),
+            Some("acme"),
+            "issuer should be ACME"
+        );
+        assert_eq!(
+            policy["issuers"][0]["email"].as_str(),
+            Some("admin@example.com"),
+            "email should match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_tls_is_idempotent() {
+        let (port, state) = start_mock_caddy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        let tls_config = test_tls_config();
+
+        // Pre-populate with existing policy for the same domain
+        state.lock().await.insert(
+            "__tls_policies__".to_string(),
+            json!([{
+                "subjects": ["*.preview.example.com"],
+                "issuers": [{"module": "acme"}]
+            }]),
+        );
+
+        // Should succeed without adding a new policy
+        client
+            .configure_tls("preview.example.com", &tls_config)
+            .await
+            .expect("configure_tls should succeed for existing policy");
+
+        let map = state.lock().await;
+        let policies = map.get("__tls_policies__").expect("policies should exist");
+        let arr = policies.as_array().expect("policies should be an array");
+        // Should still be 1 policy (not 2)
+        assert_eq!(arr.len(), 1, "should not add duplicate policy");
+    }
+
+    #[tokio::test]
+    async fn test_configure_tls_uses_staging_ca() {
+        let (port, state) = start_mock_caddy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        let mut tls_config = test_tls_config();
+        tls_config.staging = true;
+
+        client
+            .configure_tls("preview.example.com", &tls_config)
+            .await
+            .expect("configure_tls should succeed");
+
+        let map = state.lock().await;
+        let policies = map.get("__tls_policies__").expect("policies should exist");
+        let arr = policies.as_array().expect("policies should be an array");
+        let policy = &arr[0];
+        assert_eq!(
+            policy["issuers"][0]["ca"].as_str(),
+            Some("https://acme-staging-v02.api.letsencrypt.org/directory"),
+            "should use staging CA"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_tls_includes_provider_config() {
+        let (port, state) = start_mock_caddy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+
+        let mut provider_config = toml::value::Table::new();
+        provider_config.insert(
+            "api_token".to_string(),
+            toml::Value::String("{env.CLOUDFLARE_API_TOKEN}".to_string()),
+        );
+
+        let tls_config = CaddyTlsConfig {
+            email: "admin@example.com".to_string(),
+            dns_provider: "cloudflare".to_string(),
+            dns_provider_config: Some(provider_config),
+            propagation_delay: "5m".to_string(),
+            staging: false,
+        };
+
+        client
+            .configure_tls("preview.example.com", &tls_config)
+            .await
+            .expect("configure_tls should succeed");
+
+        let map = state.lock().await;
+        let policies = map.get("__tls_policies__").expect("policies should exist");
+        let arr = policies.as_array().expect("policies should be an array");
+        let policy = &arr[0];
+        // Check provider config is flattened (sibling of "name", not nested under "config")
+        let provider = &policy["issuers"][0]["challenges"]["dns"]["provider"];
+        assert_eq!(
+            provider["name"].as_str(),
+            Some("cloudflare"),
+            "provider name should match"
+        );
+        assert_eq!(
+            provider["api_token"].as_str(),
+            Some("{env.CLOUDFLARE_API_TOKEN}"),
+            "provider config should be flattened as sibling of name"
+        );
+        // Check propagation_delay is in challenges.dns, not at issuer level
+        assert_eq!(
+            policy["issuers"][0]["challenges"]["dns"]["propagation_delay"].as_str(),
+            Some("5m"),
+            "propagation_delay should be in challenges.dns"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_tls_returns_error_on_post_failure() {
+        let (port, state) = start_mock_caddy_with_tls_failure().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        let tls_config = test_tls_config();
+
+        // Configure mock to fail on POST
+        state
+            .lock()
+            .await
+            .insert("__tls_fail__".to_string(), json!(true));
+
+        let result = client
+            .configure_tls("preview.example.com", &tls_config)
+            .await;
+        assert!(
+            result.is_err(),
+            "configure_tls should return error when POST fails"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, CaddyError::TlsConfigFailed(_)),
+            "error should be TlsConfigFailed"
         );
     }
 }

@@ -413,7 +413,38 @@ Existing Caddy config (like our sietch Caddyfile) is untouched — Caddy support
 
 ### TLS
 
-Caddy handles TLS automatically. When slip adds a route with `"host": ["api.walden.sh"]`, Caddy will automatically obtain a Let's Encrypt certificate for that domain. For domains that need DNS challenge (like `.dev` domains behind Tailscale), we'd use Caddy's global TLS config or the DNS challenge module we already have.
+Caddy handles TLS automatically. When slip adds a route with `"host": ["api.walden.sh"]`, Caddy will automatically obtain a Let's Encrypt certificate for that domain using HTTP-01 challenge.
+
+#### Wildcard certificates for preview deployments
+
+Preview deployments use wildcard subdomains (e.g., `*.preview.example.com`), which require DNS-01 challenge validation. slipd can configure Caddy to obtain wildcard certificates automatically when both `preview` and `caddy.tls` are configured:
+
+```toml
+# /etc/slip/slip.toml
+
+[preview]
+domain = "preview.example.com"
+max_per_app = 5
+default_ttl = "24h"
+
+[caddy]
+admin_api = "http://localhost:2019"
+
+[caddy.tls]
+email = "admin@example.com"
+dns_provider = "cloudflare"
+propagation_delay = "2m"
+staging = false
+
+[caddy.tls.dns_provider_config]
+api_token = "{env.CLOUDFLARE_API_TOKEN}"
+```
+
+On startup, slipd configures a TLS automation policy in Caddy for `*.preview.example.com` using the specified DNS provider. The `dns_provider_config` values use Caddy's `{env.VAR_NAME}` syntax to reference environment variables, keeping credentials out of the config file.
+
+Supported DNS providers match Caddy's DNS challenge modules: `cloudflare`, `route53`, `digitalocean`, `gandi`, `godaddy`, `googleclouddns`, `linode`, `namecheap`, `namedotcom`, `ovh`, `powerdns`, `rfc2136`, `vultr`, and more.
+
+If `preview` is configured but `caddy.tls` is not, slipd logs a warning and preview domains will use Caddy's default HTTP-01 challenge (which won't work for wildcards).
 
 ---
 

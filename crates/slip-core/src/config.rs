@@ -198,12 +198,52 @@ impl Default for ServerConfig {
 pub struct CaddyConfig {
     #[serde(default = "default_caddy_admin_api")]
     pub admin_api: String,
+    /// Optional TLS configuration for wildcard certificates (e.g., for preview deployments).
+    #[serde(default)]
+    pub tls: Option<CaddyTlsConfig>,
+}
+
+/// TLS configuration for Caddy to obtain wildcard certificates via DNS challenge.
+///
+/// This is used for preview deployments that need wildcard certificates
+/// (e.g., `*.preview.example.com`) which require DNS-01 challenge validation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CaddyTlsConfig {
+    /// Email address for Let's Encrypt account registration.
+    pub email: String,
+    /// DNS provider module name (e.g., "cloudflare", "route53", "digitalocean").
+    pub dns_provider: String,
+    /// Provider-specific configuration as a TOML table.
+    ///
+    /// Values should use Caddy's `{env.VAR_NAME}` syntax to reference environment
+    /// variables. For example, Cloudflare requires:
+    /// ```toml
+    /// [caddy.tls.dns_provider_config]
+    /// api_token = "{env.CLOUDFLARE_API_TOKEN}"
+    /// ```
+    pub dns_provider_config: Option<toml::value::Table>,
+    /// DNS propagation delay before attempting certificate issuance.
+    ///
+    /// Expressed as a duration string (e.g., "2m", "30s"). Defaults to "2m".
+    #[serde(default = "default_propagation_delay")]
+    pub propagation_delay: String,
+    /// Use Let's Encrypt staging environment for testing.
+    ///
+    /// Staging certificates are not trusted by browsers but have no rate limits.
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub staging: bool,
+}
+
+fn default_propagation_delay() -> String {
+    "2m".to_owned()
 }
 
 impl Default for CaddyConfig {
     fn default() -> Self {
         Self {
             admin_api: default_caddy_admin_api(),
+            tls: None,
         }
     }
 }
@@ -543,6 +583,104 @@ secret = "s"
         assert_eq!(cfg.storage.path, PathBuf::from("/var/lib/slip"));
         assert!(cfg.registry.ghcr_token.is_none());
         assert_eq!(cfg.runtime.backend, "auto");
+        // TLS config should be None by default
+        assert!(cfg.caddy.tls.is_none());
+    }
+
+    // ── CaddyTlsConfig parsing ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_caddy_tls_config_full() {
+        let toml = r#"
+[server]
+
+[caddy]
+admin_api = "http://localhost:2019"
+
+[caddy.tls]
+email = "admin@example.com"
+dns_provider = "cloudflare"
+propagation_delay = "5m"
+staging = true
+
+[caddy.tls.dns_provider_config]
+api_token = "{env.CLOUDFLARE_API_TOKEN}"
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        let tls = cfg
+            .caddy
+            .tls
+            .as_ref()
+            .expect("tls config should be present");
+        assert_eq!(tls.email, "admin@example.com");
+        assert_eq!(tls.dns_provider, "cloudflare");
+        assert_eq!(tls.propagation_delay, "5m");
+        assert!(tls.staging);
+        let provider_config = tls.dns_provider_config.as_ref().expect("provider config");
+        assert_eq!(
+            provider_config.get("api_token").and_then(|v| v.as_str()),
+            Some("{env.CLOUDFLARE_API_TOKEN}")
+        );
+    }
+
+    #[test]
+    fn parse_caddy_tls_config_defaults() {
+        let toml = r#"
+[server]
+
+[caddy]
+
+[caddy.tls]
+email = "admin@example.com"
+dns_provider = "cloudflare"
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        let tls = cfg
+            .caddy
+            .tls
+            .as_ref()
+            .expect("tls config should be present");
+        assert_eq!(tls.email, "admin@example.com");
+        assert_eq!(tls.dns_provider, "cloudflare");
+        // propagation_delay should default to "2m"
+        assert_eq!(tls.propagation_delay, "2m");
+        // staging should default to false
+        assert!(!tls.staging);
+        // dns_provider_config should be None
+        assert!(tls.dns_provider_config.is_none());
+    }
+
+    #[test]
+    fn parse_caddy_tls_config_optional() {
+        // TLS config is optional - should parse without it
+        let toml = r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.caddy.tls.is_none());
     }
 
     // ── AppConfig parsing ────────────────────────────────────────────────────
