@@ -456,7 +456,7 @@ fn update_preview_deploy_status(
 /// the preview deploy state machine through: Pull → Configure → Start →
 /// HealthCheck → SetRoute → Complete (or Fail at any step).
 pub async fn execute_preview_deploy(state: Arc<crate::api::AppState>, ctx: PreviewDeployContext) {
-    let app_config = match state.apps.get(&ctx.app_name) {
+    let app_config = match state.apps.read().await.get(&ctx.app_name) {
         Some(cfg) => cfg.clone(),
         None => {
             tracing::error!(app = %ctx.app_name, "preview deploy: app not found in config");

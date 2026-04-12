@@ -1,6 +1,7 @@
 //! HTTP API types, router, and handlers for slipd.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -116,6 +117,88 @@ pub struct PreviewStatusResponse {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+// ─── Management API request/response types ─────────────────────────────────────
+
+/// Request body for `POST /v1/apps`.
+#[derive(Debug, Deserialize)]
+pub struct CreateAppRequest {
+    pub name: String,
+    pub image: String,
+    pub domain: String,
+    #[serde(default = "default_app_port")]
+    pub port: u16,
+    pub secret: Option<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    pub resources: Option<crate::config::ResourceConfig>,
+    pub network: Option<crate::config::NetworkConfig>,
+    pub health: Option<crate::config::HealthConfig>,
+    pub deploy: Option<crate::config::DeployConfig>,
+    pub preview: Option<crate::config::AppPreviewConfig>,
+}
+
+fn default_app_port() -> u16 {
+    8080
+}
+
+/// Request body for `PATCH /v1/apps/{name}`.
+#[derive(Debug, Deserialize)]
+pub struct UpdateAppRequest {
+    pub image: Option<String>,
+    pub domain: Option<String>,
+    pub port: Option<u16>,
+    pub secret: Option<String>,
+    pub env: Option<HashMap<String, String>>,
+    pub resources: Option<crate::config::ResourceConfig>,
+    pub network: Option<crate::config::NetworkConfig>,
+    pub health: Option<crate::config::HealthConfig>,
+    pub deploy: Option<crate::config::DeployConfig>,
+    pub preview: Option<crate::config::AppPreviewConfig>,
+}
+
+/// Response for `GET /v1/apps` and `GET /v1/apps/{name}`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AppResponse {
+    pub name: String,
+    pub image: String,
+    pub domain: String,
+    pub port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    pub env: HashMap<String, String>,
+    pub resources: crate::config::ResourceConfig,
+    pub network: crate::config::NetworkConfig,
+    pub health: crate::config::HealthConfig,
+    pub deploy: crate::config::DeployConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<crate::config::AppPreviewConfig>,
+}
+
+impl From<&AppConfig> for AppResponse {
+    fn from(cfg: &AppConfig) -> Self {
+        Self {
+            name: cfg.app.name.clone(),
+            image: cfg.app.image.clone(),
+            domain: cfg.routing.domain.clone(),
+            port: cfg.routing.port,
+            // Don't expose the secret in responses
+            secret: None,
+            env: cfg.env.clone(),
+            resources: cfg.resources.clone(),
+            network: cfg.network.clone(),
+            health: cfg.health.clone(),
+            deploy: cfg.deploy.clone(),
+            preview: cfg.preview.clone(),
+        }
+    }
+}
+
+/// Response for `GET /v1/apps` (list).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AppListResponse {
+    pub apps: Vec<AppResponse>,
+}
+
 // ─── App error ────────────────────────────────────────────────────────────────
 
 /// Typed errors returned from handlers; each variant maps to an HTTP status.
@@ -148,7 +231,9 @@ pub struct AppState {
     /// Daemon-level configuration (auth secret, Caddy URL, etc.).
     pub config: SlipConfig,
     /// Per-application configurations keyed by app name.
-    pub apps: HashMap<String, AppConfig>,
+    pub apps: RwLock<HashMap<String, AppConfig>>,
+    /// Path to the configuration directory (for writing app configs).
+    pub config_dir: PathBuf,
     /// Per-app deploy locks; prevents concurrent deploys for the same app.
     ///
     /// Entries are created on first deploy and never removed. This is bounded by
@@ -201,6 +286,24 @@ impl AppState {
 
 /// Build the axum router with all API routes and shared state.
 pub fn build_router(state: Arc<AppState>) -> axum::Router {
+    // Management routes (require Bearer token auth)
+    let management_routes = axum::Router::new()
+        .route(
+            "/v1/apps",
+            axum::routing::post(handle_create_app).get(handle_list_apps),
+        )
+        .route(
+            "/v1/apps/{name}",
+            axum::routing::get(handle_get_app)
+                .patch(handle_update_app)
+                .delete(handle_delete_app),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            management_auth,
+        ));
+
+    // Public routes (HMAC auth per-endpoint)
     axum::Router::new()
         .route("/v1/deploy", axum::routing::post(handle_deploy))
         .route("/v1/status", axum::routing::get(handle_status))
@@ -216,8 +319,277 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
             "/v1/previews/{app}/{preview_id}",
             axum::routing::get(handle_preview_status).delete(handle_preview_teardown),
         )
+        .merge(management_routes)
         .layer(DefaultBodyLimit::max(64 * 1024)) // 64 KiB limit
         .with_state(state)
+}
+
+// ─── Management auth middleware ────────────────────────────────────────────────
+
+use axum::middleware::Next;
+
+/// Middleware that validates Bearer token against the auth secret.
+async fn management_auth(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let auth_header = request
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| AppError::Unauthorized("missing Authorization header".to_string()))?;
+
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| AppError::Unauthorized("invalid Authorization header format".to_string()))?;
+
+    // Constant-time comparison to prevent timing attacks
+    let expected = &state.config.auth.secret;
+    if !constant_time_eq(token, expected) {
+        return Err(AppError::Unauthorized("invalid token".to_string()));
+    }
+
+    Ok(next.run(request).await)
+}
+
+/// Constant-time string comparison.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    if a.len() != b.len() {
+        return false;
+    }
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+// ─── Management API handlers ───────────────────────────────────────────────────
+
+/// Validate app name format.
+///
+/// Rules:
+/// - Lowercase alphanumeric and hyphens only
+/// - No leading or trailing hyphen
+/// - 1-63 characters (DNS label limit)
+fn validate_app_name(name: &str) -> Result<(), AppError> {
+    if name.is_empty() {
+        return Err(AppError::BadRequest("app name cannot be empty".to_string()));
+    }
+    if name.len() > 63 {
+        return Err(AppError::BadRequest(
+            "app name must be 63 characters or less".to_string(),
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(AppError::BadRequest(
+            "app name must contain only lowercase letters, digits, and hyphens".to_string(),
+        ));
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return Err(AppError::BadRequest(
+            "app name cannot start or end with a hyphen".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// `POST /v1/apps` — Create a new app.
+async fn handle_create_app(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateAppRequest>,
+) -> Result<(StatusCode, Json<AppResponse>), AppError> {
+    // Validate name format
+    validate_app_name(&req.name)?;
+
+    // Build AppConfig from request
+    let app_config = AppConfig {
+        app: crate::config::AppInfo {
+            name: req.name.clone(),
+            image: req.image.clone(),
+            secret: req.secret,
+        },
+        routing: crate::config::RoutingConfig {
+            domain: req.domain,
+            port: req.port,
+        },
+        health: req.health.unwrap_or_default(),
+        deploy: req.deploy.unwrap_or_default(),
+        env: req.env,
+        env_file: None,
+        resources: req.resources.unwrap_or_default(),
+        network: req.network.unwrap_or_default(),
+        preview: req.preview,
+    };
+
+    // Check for conflicts and insert atomically (TOCTOU fix)
+    {
+        let mut apps = state.apps.write().await;
+        if apps.contains_key(&req.name) {
+            return Err(AppError::Conflict(format!(
+                "app '{}' already exists",
+                req.name
+            )));
+        }
+        apps.insert(req.name.clone(), app_config.clone());
+    }
+
+    // Write config to disk (non-blocking)
+    let config_dir = state.config_dir.clone();
+    let app_config_clone = app_config.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = crate::config::write_app_config(&config_dir, &app_config_clone) {
+            warn!(error = %e, "failed to write app config");
+        }
+    });
+
+    info!(app = %req.name, "app created");
+
+    Ok((StatusCode::CREATED, Json(AppResponse::from(&app_config))))
+}
+
+/// `GET /v1/apps` — List all apps.
+async fn handle_list_apps(
+    State(state): State<Arc<AppState>>,
+) -> Result<(StatusCode, Json<AppListResponse>), AppError> {
+    let apps = state.apps.read().await;
+    let app_list: Vec<AppResponse> = apps.values().map(AppResponse::from).collect();
+    Ok((StatusCode::OK, Json(AppListResponse { apps: app_list })))
+}
+
+/// `GET /v1/apps/{name}` — Get a specific app.
+async fn handle_get_app(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<(StatusCode, Json<AppResponse>), AppError> {
+    let apps = state.apps.read().await;
+    let app_config = apps
+        .get(&name)
+        .ok_or_else(|| AppError::NotFound(format!("app '{}' not found", name)))?;
+    Ok((StatusCode::OK, Json(AppResponse::from(app_config))))
+}
+
+/// `PATCH /v1/apps/{name}` — Update an app.
+async fn handle_update_app(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateAppRequest>,
+) -> Result<(StatusCode, Json<AppResponse>), AppError> {
+    // Get existing config and merge updates
+    let updated_config = {
+        let mut apps = state.apps.write().await;
+        let existing = apps
+            .get(&name)
+            .ok_or_else(|| AppError::NotFound(format!("app '{}' not found", name)))?
+            .clone();
+
+        let mut updated = existing.clone();
+
+        // Merge updates (only update fields that are Some)
+        if let Some(image) = req.image {
+            updated.app.image = image;
+        }
+        if let Some(domain) = req.domain {
+            updated.routing.domain = domain;
+        }
+        if let Some(port) = req.port {
+            updated.routing.port = port;
+        }
+        if let Some(secret) = req.secret {
+            updated.app.secret = Some(secret);
+        }
+        if let Some(env) = req.env {
+            updated.env = env;
+        }
+        if let Some(resources) = req.resources {
+            updated.resources = resources;
+        }
+        if let Some(network) = req.network {
+            updated.network = network;
+        }
+        if let Some(health) = req.health {
+            updated.health = health;
+        }
+        if let Some(deploy) = req.deploy {
+            updated.deploy = deploy;
+        }
+        if let Some(preview) = req.preview {
+            updated.preview = Some(preview);
+        }
+
+        apps.insert(name.clone(), updated.clone());
+        updated
+    };
+
+    // Write config to disk
+    let config_dir = state.config_dir.clone();
+    let app_config_clone = updated_config.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = crate::config::write_app_config(&config_dir, &app_config_clone) {
+            warn!(error = %e, "failed to write app config");
+        }
+    });
+
+    info!(app = %name, "app updated");
+
+    Ok((StatusCode::OK, Json(AppResponse::from(&updated_config))))
+}
+
+/// `DELETE /v1/apps/{name}` — Delete an app.
+async fn handle_delete_app(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    // Remove from apps map
+    {
+        let mut apps = state.apps.write().await;
+        if apps.remove(&name).is_none() {
+            return Err(AppError::NotFound(format!("app '{}' not found", name)));
+        }
+    }
+
+    // Full teardown: stop container, remove Caddy route, clean up state
+    // Get runtime state if exists
+    if let Some(app_state) = state.app_states.read().await.get(&name).cloned() {
+        // Stop container if running
+        if let Some(ref container_id) = app_state.current_container_id
+            && let Err(e) = state.runtime.stop_and_remove(container_id).await
+        {
+            warn!(app = %name, container_id = %container_id, error = %e, "failed to stop container during app deletion");
+        }
+        // Stop pod if running
+        if let (Some(ref _pod_name), Some(manifest)) =
+            (app_state.current_pod_name, &app_state.current_manifest_path)
+            && let Err(e) = state.runtime.teardown_pod(manifest).await
+        {
+            warn!(app = %name, error = %e, "failed to teardown pod during app deletion");
+        }
+    }
+
+    // Remove Caddy route
+    if let Err(e) = state.caddy.remove_route(&name).await {
+        warn!(app = %name, error = %e, "failed to remove Caddy route during app deletion");
+    }
+
+    // Remove deploy lock
+    state.deploy_locks.remove(&name);
+
+    // Remove app state
+    state.app_states.write().await.remove(&name);
+
+    // Delete config file
+    let config_dir = state.config_dir.clone();
+    let name_clone = name.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = crate::config::delete_app_config(&config_dir, &name_clone) {
+            warn!(app = %name_clone, error = %e, "failed to delete app config file");
+        }
+    });
+
+    info!(app = %name, "app deleted");
+
+    Ok((StatusCode::OK, Json(serde_json::json!({"status": "ok"}))))
 }
 
 // ─── Deploy handler ───────────────────────────────────────────────────────────
@@ -254,7 +626,10 @@ async fn handle_deploy(
     // 4. Look up app config.
     let app_cfg = state
         .apps
+        .read()
+        .await
         .get(&request.app)
+        .cloned()
         .ok_or_else(|| AppError::NotFound(format!("unknown app: {}", request.app)))?;
 
     // 5. Resolve HMAC secret.
@@ -455,11 +830,11 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
 
     let app_states = state.app_states.read().await;
 
-    let apps = state
-        .apps
-        .keys()
+    let apps_keys: Vec<String> = state.apps.read().await.keys().cloned().collect();
+    let apps = apps_keys
+        .into_iter()
         .map(|app_name| {
-            let app_status = match app_states.get(app_name) {
+            let app_status = match app_states.get(&app_name) {
                 None => AppStatusResponse {
                     status: "not_deployed".to_string(),
                     tag: None,
@@ -581,7 +956,10 @@ async fn handle_preview_teardown(
 
     let app_cfg = state
         .apps
+        .read()
+        .await
         .get(&app)
+        .cloned()
         .ok_or_else(|| AppError::NotFound(format!("unknown app: {app}")))?;
 
     let secret = resolve_secret(app_cfg.app.secret.as_deref(), &state.config.auth.secret);
@@ -645,6 +1023,7 @@ async fn handle_preview_status(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use axum::body::Body;
@@ -655,7 +1034,9 @@ mod tests {
 
     use chrono::Utc;
 
-    use crate::api::{AppState, DeployResponse, ErrorResponse, build_router};
+    use crate::api::{
+        AppListResponse, AppResponse, AppState, DeployResponse, ErrorResponse, build_router,
+    };
     use crate::auth::compute_signature;
     use crate::caddy::CaddyClient;
     use crate::config::{
@@ -716,7 +1097,8 @@ mod tests {
 
         Arc::new(AppState {
             config: test_slip_config(),
-            apps,
+            apps: RwLock::new(apps),
+            config_dir: PathBuf::from("/tmp/slip-test"),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(
                 DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
@@ -969,7 +1351,8 @@ mod tests {
 
         let state_inner = Arc::new(AppState {
             config: test_slip_config(),
-            apps,
+            apps: RwLock::new(apps),
+            config_dir: PathBuf::from("/tmp/slip-test"),
             deploy_locks,
             runtime: Arc::new(
                 DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
@@ -1016,7 +1399,8 @@ mod tests {
 
         let state = Arc::new(AppState {
             config: test_slip_config(),
-            apps,
+            apps: RwLock::new(apps),
+            config_dir: PathBuf::from("/tmp/slip-test"),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(
                 DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
@@ -1215,7 +1599,8 @@ mod tests {
 
         let state = Arc::new(AppState {
             config,
-            apps,
+            apps: RwLock::new(apps),
+            config_dir: PathBuf::from("/tmp/slip-test"),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(
                 DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
@@ -1595,7 +1980,8 @@ mod tests {
 
         let state = Arc::new(AppState {
             config,
-            apps,
+            apps: RwLock::new(apps),
+            config_dir: PathBuf::from("/tmp/slip-test"),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(
                 DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
@@ -1712,5 +2098,280 @@ mod tests {
             .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(payload["status"], "ok");
+    }
+
+    // ── Management API tests ─────────────────────────────────────────────────────
+
+    fn auth_header(token: &str) -> String {
+        format!("Bearer {token}")
+    }
+
+    #[tokio::test]
+    async fn test_management_auth_missing_header() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/apps")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_management_auth_invalid_token() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/apps")
+            .header("Authorization", "Bearer wrong-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_list_apps_empty() {
+        let config = test_slip_config();
+        let state = Arc::new(AppState {
+            config,
+            apps: RwLock::new(HashMap::new()),
+            config_dir: PathBuf::from("/tmp/slip-test"),
+            deploy_locks: DashMap::new(),
+            runtime: Arc::new(
+                DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            ),
+            caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
+            health: HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
+            started_at: Utc::now(),
+            preview_states: Arc::new(DashMap::new()),
+            preview_locks: DashMap::new(),
+        });
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/apps")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: AppListResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(payload.apps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_apps_with_apps() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/apps")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: AppListResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload.apps.len(), 1);
+        assert_eq!(payload.apps[0].name, APP_NAME);
+    }
+
+    #[tokio::test]
+    async fn test_get_app_found() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: AppResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload.name, APP_NAME);
+        assert_eq!(payload.image, APP_IMAGE);
+    }
+
+    #[tokio::test]
+    async fn test_get_app_not_found() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/apps/nonexistent")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_create_app_success() {
+        let config = test_slip_config();
+        let state = Arc::new(AppState {
+            config,
+            apps: RwLock::new(HashMap::new()),
+            config_dir: PathBuf::from("/tmp/slip-test"),
+            deploy_locks: DashMap::new(),
+            runtime: Arc::new(
+                DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            ),
+            caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
+            health: HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
+            started_at: Utc::now(),
+            preview_states: Arc::new(DashMap::new()),
+            preview_locks: DashMap::new(),
+        });
+        let app = build_router(state.clone());
+
+        let body = serde_json::json!({
+            "name": "newapp",
+            "image": "ghcr.io/org/newapp:latest",
+            "domain": "newapp.example.com",
+            "port": 3000
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/apps")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // Verify app was added
+        let apps = state.apps.read().await;
+        assert!(apps.contains_key("newapp"));
+    }
+
+    #[tokio::test]
+    async fn test_create_app_conflict() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "name": APP_NAME,
+            "image": "ghcr.io/org/testapp:latest",
+            "domain": "testapp.example.com",
+            "port": 3000
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/apps")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_create_app_invalid_name() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "name": "Invalid-Name",
+            "image": "ghcr.io/org/testapp:latest",
+            "domain": "testapp.example.com",
+            "port": 3000
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/apps")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_app_partial() {
+        let state = create_test_state();
+        let app = build_router(state.clone());
+
+        let body = serde_json::json!({
+            "port": 9000
+        });
+
+        let request = Request::builder()
+            .method("PATCH")
+            .uri(format!("/v1/apps/{APP_NAME}"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify port was updated
+        let apps = state.apps.read().await;
+        let app_config = apps.get(APP_NAME).unwrap();
+        assert_eq!(app_config.routing.port, 9000);
+    }
+
+    #[tokio::test]
+    async fn test_delete_app() {
+        let state = create_test_state();
+        let app = build_router(state.clone());
+
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/apps/{APP_NAME}"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify app was removed
+        let apps = state.apps.read().await;
+        assert!(!apps.contains_key(APP_NAME));
     }
 }
