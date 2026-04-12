@@ -153,7 +153,8 @@ async fn main() -> anyhow::Result<()> {
     // ── Build application state ──────────────────────────────────────────────
     let state = Arc::new(AppState {
         config: slip_config,
-        apps,
+        apps: RwLock::new(apps),
+        config_dir: config_path.to_path_buf(),
         deploy_locks: DashMap::new(),
         runtime,
         caddy,

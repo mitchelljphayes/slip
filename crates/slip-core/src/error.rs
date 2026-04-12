@@ -25,6 +25,21 @@ pub enum ConfigError {
         filename: String,
         config_name: String,
     },
+
+    #[error("failed to serialize config: {0}")]
+    Serialize(String),
+
+    #[error("failed to write {path}: {source}")]
+    WriteFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("failed to delete {path}: {source}")]
+    DeleteFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 /// Errors that can occur during container health checking.

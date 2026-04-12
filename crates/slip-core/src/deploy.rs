@@ -137,7 +137,7 @@ pub enum AppStatus {
 /// the inner function can be tested with mock dependencies.
 pub(crate) struct DeploySharedState<'a> {
     pub config: &'a SlipConfig,
-    pub apps: &'a HashMap<String, AppConfig>,
+    pub apps: &'a RwLock<HashMap<String, AppConfig>>,
     pub app_states: &'a RwLock<HashMap<String, AppRuntimeState>>,
     pub deploys: &'a DashMap<String, DeployContext>,
     pub credentials: Option<RegistryCredentials>,
@@ -178,8 +178,8 @@ pub(crate) async fn execute_deploy_inner(
     mut ctx: DeployContext,
 ) {
     let app_name = ctx.app.clone();
-    let app_config = match shared.apps.get(&app_name) {
-        Some(cfg) => cfg.clone(),
+    let app_config = match shared.apps.read().await.get(&app_name).cloned() {
+        Some(cfg) => cfg,
         None => {
             ctx.fail(&format!("app '{}' not found in config", app_name));
             record_deploy(shared.deploys, &ctx);
@@ -1104,7 +1104,7 @@ mod tests {
     /// Build a `DeploySharedState` backed by real in-memory structures.
     fn make_shared<'a>(
         config: &'a SlipConfig,
-        apps: &'a HashMap<String, AppConfig>,
+        apps: &'a RwLock<HashMap<String, AppConfig>>,
         app_states: &'a RwLock<HashMap<String, AppRuntimeState>>,
         deploys: &'a DashMap<String, DeployContext>,
     ) -> DeploySharedState<'a> {
@@ -1126,6 +1126,7 @@ mod tests {
         let config = test_slip_config(tmp.path().to_path_buf());
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
         let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
         let deploys: DashMap<String, DeployContext> = DashMap::new();
 
@@ -1170,6 +1171,7 @@ mod tests {
         let config = test_slip_config(tmp.path().to_path_buf());
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
         let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
         let deploys: DashMap<String, DeployContext> = DashMap::new();
 
@@ -1203,6 +1205,7 @@ mod tests {
         let config = test_slip_config(tmp.path().to_path_buf());
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
 
         // Pre-populate app state with an existing container.
         let mut initial_states = HashMap::new();
@@ -1257,6 +1260,7 @@ mod tests {
         let config = test_slip_config(tmp.path().to_path_buf());
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
         let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
         let deploys: DashMap<String, DeployContext> = DashMap::new();
 
@@ -1307,6 +1311,7 @@ mod tests {
         let config = test_slip_config(tmp.path().to_path_buf());
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
         let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
         let deploys: DashMap<String, DeployContext> = DashMap::new();
 
@@ -1355,6 +1360,7 @@ mod tests {
         let config = test_slip_config(tmp.path().to_path_buf());
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
 
         // Pre-populate with an old container to verify it is NOT stopped.
         let mut initial_states = HashMap::new();
@@ -1440,6 +1446,7 @@ memory = "256m"
         let mut apps = HashMap::new();
         // Server config has no health path
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
         let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
         let deploys: DashMap<String, DeployContext> = DashMap::new();
 
@@ -1471,6 +1478,7 @@ memory = "256m"
         let config = test_slip_config(tmp.path().to_path_buf());
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
         let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
         let deploys: DashMap<String, DeployContext> = DashMap::new();
 
@@ -1503,6 +1511,7 @@ memory = "256m"
         let config = test_slip_config(tmp.path().to_path_buf());
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
         let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
         let deploys: DashMap<String, DeployContext> = DashMap::new();
 
@@ -1539,6 +1548,7 @@ memory = "256m"
         let config = test_slip_config(tmp.path().to_path_buf());
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
         let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
         let deploys: DashMap<String, DeployContext> = DashMap::new();
 
@@ -1571,6 +1581,7 @@ memory = "256m"
         let config = test_slip_config(tmp.path().to_path_buf());
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
         let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
         let deploys: DashMap<String, DeployContext> = DashMap::new();
 
@@ -1608,6 +1619,7 @@ memory = "256m"
         let config = test_slip_config(tmp.path().to_path_buf());
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
         let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
         let deploys: DashMap<String, DeployContext> = DashMap::new();
 
@@ -1694,6 +1706,7 @@ path = "/health"
         let config = test_slip_config(tmp.path().to_path_buf());
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
         let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
         let deploys: DashMap<String, DeployContext> = DashMap::new();
 
@@ -1753,6 +1766,7 @@ path = "/health"
         let config = test_slip_config(tmp.path().to_path_buf());
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
         let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
         let deploys: DashMap<String, DeployContext> = DashMap::new();
 
@@ -1807,6 +1821,7 @@ path = "/health"
         let config = test_slip_config(tmp.path().to_path_buf());
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
         let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
         let deploys: DashMap<String, DeployContext> = DashMap::new();
 
@@ -1854,6 +1869,7 @@ container = "web"
         let config = test_slip_config(tmp.path().to_path_buf());
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
         // No pre-existing pod state.
         let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
         let deploys: DashMap<String, DeployContext> = DashMap::new();
@@ -1893,6 +1909,7 @@ container = "web"
         let config = test_slip_config(tmp.path().to_path_buf());
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
 
         // Pre-populate app state with an existing pod.
         let old_manifest_path = tmp.path().join("manifests").join("testapp-old.yaml");

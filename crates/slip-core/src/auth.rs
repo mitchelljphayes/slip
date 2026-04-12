@@ -48,6 +48,13 @@ pub fn resolve_secret<'a>(app_secret: Option<&'a str>, global_secret: &'a str) -
     app_secret.unwrap_or(global_secret)
 }
 
+/// Constant-time comparison of two byte slices.
+///
+/// Uses the `subtle` crate to prevent timing attacks.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.ct_eq(b).into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
