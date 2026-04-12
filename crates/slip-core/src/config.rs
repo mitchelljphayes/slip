@@ -115,6 +115,34 @@ fn default_env() -> HashMap<String, String> {
 
 // ─── Daemon / server config ───────────────────────────────────────────────────
 
+/// Server-level preview deployment configuration.
+///
+/// Provides defaults and caps for all preview deployments on this daemon.
+/// Apps may override the domain via [`AppPreviewConfig`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerPreviewConfig {
+    /// Wildcard base domain for preview subdomains.
+    ///
+    /// Each preview is served at `{preview_id}.{domain}`.
+    /// Example: `"preview.example.com"` → preview URL `"pr-42.preview.example.com"`.
+    pub domain: String,
+    /// Maximum concurrent previews per app (server-level default).
+    pub max_per_app: Option<u32>,
+    /// Default TTL for previews as a duration string (e.g. "1h", "24h", "7d").
+    ///
+    /// Stored as `String` because TOML doesn't natively support `std::time::Duration`.
+    /// Parse with the duration helpers in `repo_config.rs` when needed.
+    pub default_ttl: Option<String>,
+    /// Maximum memory for preview containers (server-level cap).
+    ///
+    /// Expressed as a Docker-style size string (e.g. "512m", "1g").
+    pub max_memory: Option<String>,
+    /// Maximum CPU allocation for preview containers (server-level cap).
+    ///
+    /// Expressed as a fractional string (e.g. "0.5", "1.0").
+    pub max_cpus: Option<String>,
+}
+
 /// Top-level daemon configuration (`slip.toml`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SlipConfig {
@@ -125,6 +153,9 @@ pub struct SlipConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    /// Optional server-level preview configuration.
+    #[serde(default)]
+    pub preview: Option<ServerPreviewConfig>,
 }
 
 /// Container runtime backend settings.
@@ -167,12 +198,52 @@ impl Default for ServerConfig {
 pub struct CaddyConfig {
     #[serde(default = "default_caddy_admin_api")]
     pub admin_api: String,
+    /// Optional TLS configuration for wildcard certificates (e.g., for preview deployments).
+    #[serde(default)]
+    pub tls: Option<CaddyTlsConfig>,
+}
+
+/// TLS configuration for Caddy to obtain wildcard certificates via DNS challenge.
+///
+/// This is used for preview deployments that need wildcard certificates
+/// (e.g., `*.preview.example.com`) which require DNS-01 challenge validation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CaddyTlsConfig {
+    /// Email address for Let's Encrypt account registration.
+    pub email: String,
+    /// DNS provider module name (e.g., "cloudflare", "route53", "digitalocean").
+    pub dns_provider: String,
+    /// Provider-specific configuration as a TOML table.
+    ///
+    /// Values should use Caddy's `{env.VAR_NAME}` syntax to reference environment
+    /// variables. For example, Cloudflare requires:
+    /// ```toml
+    /// [caddy.tls.dns_provider_config]
+    /// api_token = "{env.CLOUDFLARE_API_TOKEN}"
+    /// ```
+    pub dns_provider_config: Option<toml::value::Table>,
+    /// DNS propagation delay before attempting certificate issuance.
+    ///
+    /// Expressed as a duration string (e.g., "2m", "30s"). Defaults to "2m".
+    #[serde(default = "default_propagation_delay")]
+    pub propagation_delay: String,
+    /// Use Let's Encrypt staging environment for testing.
+    ///
+    /// Staging certificates are not trusted by browsers but have no rate limits.
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub staging: bool,
+}
+
+fn default_propagation_delay() -> String {
+    "2m".to_owned()
 }
 
 impl Default for CaddyConfig {
     fn default() -> Self {
         Self {
             admin_api: default_caddy_admin_api(),
+            tls: None,
         }
     }
 }
@@ -206,6 +277,18 @@ impl Default for StorageConfig {
 
 // ─── Per-app config ───────────────────────────────────────────────────────────
 
+/// Per-app override for preview deployment settings.
+///
+/// When present in an app's `apps/<name>.toml`, these values take precedence
+/// over the corresponding server-level [`ServerPreviewConfig`] defaults.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AppPreviewConfig {
+    /// App-specific preview base domain (overrides server-level `preview.domain`).
+    pub domain: Option<String>,
+    /// Maximum concurrent previews for this app (overrides `preview.max_per_app`).
+    pub max: Option<u32>,
+}
+
 /// Per-application configuration loaded from `apps/<name>.toml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -220,6 +303,9 @@ pub struct AppConfig {
     pub resources: ResourceConfig,
     #[serde(default)]
     pub network: NetworkConfig,
+    /// Optional per-app preview configuration.
+    #[serde(default)]
+    pub preview: Option<AppPreviewConfig>,
 }
 
 /// Basic application identity.
@@ -497,6 +583,104 @@ secret = "s"
         assert_eq!(cfg.storage.path, PathBuf::from("/var/lib/slip"));
         assert!(cfg.registry.ghcr_token.is_none());
         assert_eq!(cfg.runtime.backend, "auto");
+        // TLS config should be None by default
+        assert!(cfg.caddy.tls.is_none());
+    }
+
+    // ── CaddyTlsConfig parsing ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_caddy_tls_config_full() {
+        let toml = r#"
+[server]
+
+[caddy]
+admin_api = "http://localhost:2019"
+
+[caddy.tls]
+email = "admin@example.com"
+dns_provider = "cloudflare"
+propagation_delay = "5m"
+staging = true
+
+[caddy.tls.dns_provider_config]
+api_token = "{env.CLOUDFLARE_API_TOKEN}"
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        let tls = cfg
+            .caddy
+            .tls
+            .as_ref()
+            .expect("tls config should be present");
+        assert_eq!(tls.email, "admin@example.com");
+        assert_eq!(tls.dns_provider, "cloudflare");
+        assert_eq!(tls.propagation_delay, "5m");
+        assert!(tls.staging);
+        let provider_config = tls.dns_provider_config.as_ref().expect("provider config");
+        assert_eq!(
+            provider_config.get("api_token").and_then(|v| v.as_str()),
+            Some("{env.CLOUDFLARE_API_TOKEN}")
+        );
+    }
+
+    #[test]
+    fn parse_caddy_tls_config_defaults() {
+        let toml = r#"
+[server]
+
+[caddy]
+
+[caddy.tls]
+email = "admin@example.com"
+dns_provider = "cloudflare"
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        let tls = cfg
+            .caddy
+            .tls
+            .as_ref()
+            .expect("tls config should be present");
+        assert_eq!(tls.email, "admin@example.com");
+        assert_eq!(tls.dns_provider, "cloudflare");
+        // propagation_delay should default to "2m"
+        assert_eq!(tls.propagation_delay, "2m");
+        // staging should default to false
+        assert!(!tls.staging);
+        // dns_provider_config should be None
+        assert!(tls.dns_provider_config.is_none());
+    }
+
+    #[test]
+    fn parse_caddy_tls_config_optional() {
+        // TLS config is optional - should parse without it
+        let toml = r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.caddy.tls.is_none());
     }
 
     // ── AppConfig parsing ────────────────────────────────────────────────────

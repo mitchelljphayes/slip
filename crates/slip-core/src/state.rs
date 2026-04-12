@@ -4,12 +4,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::caddy::{CaddyClient, RouteInfo};
 use crate::config::AppConfig;
 use crate::deploy::{AppRuntimeState, AppStatus};
 use crate::error::CaddyError;
+use crate::preview::{PersistedPreviewState, PreviewState};
 use crate::runtime::RuntimeBackend;
 
 // ─── Persisted state shape ────────────────────────────────────────────────────
@@ -243,6 +245,196 @@ pub async fn reconcile_routes(
 
     tracing::info!(route_count = routes.len(), "reconciling caddy routes");
     caddy.reconcile(&routes).await
+}
+
+// ─── Reconcile preview Caddy routes ──────────────────────────────────────────
+
+/// Reconcile Caddy routes for all running preview deployments on startup.
+///
+/// For each preview state with status `Running` and a non-empty domain, calls
+/// `set_route` to ensure the Caddy route exists. This recovers routes that were
+/// lost due to a Caddy restart while slipd was down.
+pub async fn reconcile_preview_routes(
+    caddy: &CaddyClient,
+    preview_states: &DashMap<String, PreviewState>,
+) -> Result<(), CaddyError> {
+    let routes: Vec<RouteInfo> = preview_states
+        .iter()
+        .filter_map(|entry| {
+            let state = entry.value();
+            if state.status != AppStatus::Running {
+                return None;
+            }
+            let port = state.port?;
+            if state.domain.is_empty() {
+                return None;
+            }
+            // The Caddy route app_name for previews is "{app}-preview-{preview_id}".
+            let preview_app_name = format!("{}-preview-{}", state.app, state.preview_id);
+            Some(RouteInfo {
+                app_name: preview_app_name,
+                domain: state.domain.clone(),
+                port,
+            })
+        })
+        .collect();
+
+    if routes.is_empty() {
+        tracing::debug!("no running preview deploys to reconcile");
+        return Ok(());
+    }
+
+    tracing::info!(
+        route_count = routes.len(),
+        "reconciling caddy routes for preview deployments"
+    );
+    caddy.reconcile(&routes).await
+}
+
+// ─── Preview state persistence ────────────────────────────────────────────────
+
+/// Save a preview's state to `{state_dir}/previews/{app_name}/{preview_id}.json`.
+///
+/// Creates all intermediate directories if they do not exist.
+pub fn save_preview_state(
+    state_dir: &Path,
+    app_name: &str,
+    preview_id: &str,
+    state: &PreviewState,
+) -> Result<(), std::io::Error> {
+    let preview_dir = state_dir.join("previews").join(app_name);
+    std::fs::create_dir_all(&preview_dir)?;
+
+    let persisted = PersistedPreviewState::from(state);
+    let json = serde_json::to_string_pretty(&persisted)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    let path = preview_dir.join(format!("{preview_id}.json"));
+    std::fs::write(path, json)
+}
+
+/// Load all persisted preview states from `{state_dir}/previews/**/*.json`.
+///
+/// Returns a map keyed by `"{app}:{preview_id}"`.
+/// If the `previews/` directory does not exist, returns an empty map.
+/// Files that cannot be parsed are silently skipped with a warning.
+pub fn load_preview_states(state_dir: &Path) -> HashMap<String, PreviewState> {
+    let previews_dir = state_dir.join("previews");
+    if !previews_dir.exists() {
+        return HashMap::new();
+    }
+
+    let mut states = HashMap::new();
+
+    // Iterate top-level app directories.
+    let app_entries = match std::fs::read_dir(&previews_dir) {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(
+                path = %previews_dir.display(),
+                error = %err,
+                "failed to read previews directory"
+            );
+            return states;
+        }
+    };
+
+    for app_entry in app_entries {
+        let app_entry = match app_entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        let app_path = app_entry.path();
+        if !app_path.is_dir() {
+            continue;
+        }
+
+        let app_name = match app_path.file_name().and_then(|s| s.to_str()) {
+            Some(name) => name.to_owned(),
+            None => continue,
+        };
+
+        // Iterate preview JSON files within the app directory.
+        let preview_entries = match std::fs::read_dir(&app_path) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(
+                    path = %app_path.display(),
+                    error = %err,
+                    "failed to read app preview directory"
+                );
+                continue;
+            }
+        };
+
+        for preview_entry in preview_entries {
+            let preview_entry = match preview_entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let file_path = preview_entry.path();
+            if file_path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+
+            let preview_id = match file_path.file_stem().and_then(|s| s.to_str()) {
+                Some(id) => id.to_owned(),
+                None => continue,
+            };
+
+            let content = match std::fs::read_to_string(&file_path) {
+                Ok(c) => c,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %file_path.display(),
+                        error = %err,
+                        "failed to read preview state file, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            let persisted: PersistedPreviewState = match serde_json::from_str(&content) {
+                Ok(p) => p,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %file_path.display(),
+                        error = %err,
+                        "failed to parse preview state file, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            let key = format!("{app_name}:{preview_id}");
+            states.insert(key, PreviewState::from(persisted));
+        }
+    }
+
+    states
+}
+
+/// Delete the persisted state for a preview.
+///
+/// Removes `{state_dir}/previews/{app_name}/{preview_id}.json`.
+/// Returns `Ok(())` if the file did not exist (idempotent).
+pub fn delete_preview_state(
+    state_dir: &Path,
+    app_name: &str,
+    preview_id: &str,
+) -> Result<(), std::io::Error> {
+    let path = state_dir
+        .join("previews")
+        .join(app_name)
+        .join(format!("{preview_id}.json"));
+
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -484,6 +676,7 @@ mod tests {
                 resources: crate::config::ResourceConfig::default(),
                 env: HashMap::new(),
                 env_file: None,
+                preview: None,
             },
         );
 
@@ -563,6 +756,7 @@ mod tests {
                 resources: crate::config::ResourceConfig::default(),
                 env: HashMap::new(),
                 env_file: None,
+                preview: None,
             },
         );
 
@@ -599,5 +793,243 @@ mod tests {
             !map.contains_key("slip-app2"),
             "app2 (no config) should not have route"
         );
+    }
+
+    // ── Preview state persistence ─────────────────────────────────────────────
+
+    use crate::preview::PreviewState;
+
+    fn sample_preview_state() -> PreviewState {
+        PreviewState {
+            preview_id: "pr-99".to_string(),
+            app: "myapp".to_string(),
+            sha: "deadbeef1234".to_string(),
+            status: AppStatus::Running,
+            container_id: Some("ctr-preview-001".to_string()),
+            pod_name: None,
+            port: Some(49000),
+            tag: Some("sha-deadbeef".to_string()),
+            deployed_at: Utc::now(),
+            expires_at: None,
+            domain: "pr-99.preview.example.com".to_string(),
+            manifest_path: None,
+            deploy_id: Some("dep_transient_xyz".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_preview_state_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let state_dir = dir.path();
+        let original = sample_preview_state();
+
+        save_preview_state(state_dir, "myapp", "pr-99", &original)
+            .expect("save_preview_state should succeed");
+
+        // Verify the file was created at the expected path.
+        assert!(
+            state_dir
+                .join("previews")
+                .join("myapp")
+                .join("pr-99.json")
+                .exists(),
+            "preview state file should exist"
+        );
+
+        let loaded = load_preview_states(state_dir);
+        assert!(
+            loaded.contains_key("myapp:pr-99"),
+            "loaded map should contain 'myapp:pr-99'"
+        );
+
+        let restored = &loaded["myapp:pr-99"];
+
+        assert_eq!(restored.preview_id, original.preview_id);
+        assert_eq!(restored.app, original.app);
+        assert_eq!(restored.sha, original.sha);
+        assert_eq!(restored.container_id, original.container_id);
+        assert_eq!(restored.port, original.port);
+        assert_eq!(restored.tag, original.tag);
+        assert_eq!(restored.domain, original.domain);
+
+        // deploy_id is transient — must not survive the round-trip.
+        assert!(
+            restored.deploy_id.is_none(),
+            "deploy_id should not be persisted"
+        );
+
+        // Status is inferred from container_id presence.
+        assert_eq!(restored.status, AppStatus::Running);
+    }
+
+    #[test]
+    fn test_load_preview_states_missing_dir() {
+        let dir = TempDir::new().unwrap();
+        let state_dir = dir.path().join("does-not-exist");
+
+        let loaded = load_preview_states(&state_dir);
+        assert!(
+            loaded.is_empty(),
+            "should return empty map when previews dir is missing"
+        );
+    }
+
+    #[test]
+    fn test_delete_preview_state() {
+        let dir = TempDir::new().unwrap();
+        let state_dir = dir.path();
+        let state = sample_preview_state();
+
+        save_preview_state(state_dir, "myapp", "pr-99", &state).expect("save should succeed");
+
+        let file = state_dir.join("previews").join("myapp").join("pr-99.json");
+        assert!(file.exists(), "file should exist before delete");
+
+        delete_preview_state(state_dir, "myapp", "pr-99").expect("delete should succeed");
+        assert!(!file.exists(), "file should be gone after delete");
+
+        // Deleting again should be idempotent (no error).
+        delete_preview_state(state_dir, "myapp", "pr-99").expect("double delete should succeed");
+    }
+
+    #[test]
+    fn test_save_preview_state_creates_dirs() {
+        let dir = TempDir::new().unwrap();
+        // Deeply nested state dir that doesn't exist yet.
+        let state_dir = dir.path().join("deep").join("nested");
+        let state = sample_preview_state();
+
+        save_preview_state(&state_dir, "myapp", "pr-1", &state)
+            .expect("should create all intermediate dirs");
+
+        assert!(
+            state_dir
+                .join("previews")
+                .join("myapp")
+                .join("pr-1.json")
+                .exists(),
+            "file should be created even when parent dirs are missing"
+        );
+    }
+
+    // ── reconcile_preview_routes tests ───────────────────────────────────────
+
+    use crate::preview::PreviewState as PS;
+
+    fn running_preview(app: &str, preview_id: &str, port: u16, domain: &str) -> PS {
+        PS {
+            preview_id: preview_id.to_string(),
+            app: app.to_string(),
+            sha: "sha".to_string(),
+            status: AppStatus::Running,
+            container_id: Some(format!("ctr-{preview_id}")),
+            pod_name: None,
+            port: Some(port),
+            tag: Some("v1".to_string()),
+            deployed_at: Utc::now(),
+            expires_at: None,
+            domain: domain.to_string(),
+            manifest_path: None,
+            deploy_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_preview_routes_reconciles_running_previews() {
+        let (port, caddy_state) = start_mock_caddy_for_reconcile().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let caddy = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        caddy.bootstrap().await.unwrap();
+
+        let preview_states: DashMap<String, PS> = DashMap::new();
+        preview_states.insert(
+            "myapp:pr-1".to_string(),
+            running_preview("myapp", "pr-1", 54001, "pr-1.preview.example.com"),
+        );
+        preview_states.insert(
+            "myapp:pr-2".to_string(),
+            running_preview("myapp", "pr-2", 54002, "pr-2.preview.example.com"),
+        );
+
+        reconcile_preview_routes(&caddy, &preview_states)
+            .await
+            .unwrap();
+
+        let map = caddy_state.lock().await;
+        assert!(
+            map.contains_key("slip-myapp-preview-pr-1"),
+            "route for pr-1 should be reconciled"
+        );
+        assert!(
+            map.contains_key("slip-myapp-preview-pr-2"),
+            "route for pr-2 should be reconciled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_preview_routes_skips_non_running() {
+        let (port, caddy_state) = start_mock_caddy_for_reconcile().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let caddy = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        caddy.bootstrap().await.unwrap();
+
+        let preview_states: DashMap<String, PS> = DashMap::new();
+
+        // Running preview — should be reconciled.
+        preview_states.insert(
+            "myapp:pr-1".to_string(),
+            running_preview("myapp", "pr-1", 54001, "pr-1.preview.example.com"),
+        );
+
+        // Failed preview — should NOT be reconciled.
+        preview_states.insert(
+            "myapp:pr-2".to_string(),
+            PS {
+                preview_id: "pr-2".to_string(),
+                app: "myapp".to_string(),
+                sha: "sha".to_string(),
+                status: AppStatus::Failed,
+                container_id: None,
+                pod_name: None,
+                port: Some(54002),
+                tag: None,
+                deployed_at: Utc::now(),
+                expires_at: None,
+                domain: "pr-2.preview.example.com".to_string(),
+                manifest_path: None,
+                deploy_id: None,
+            },
+        );
+
+        reconcile_preview_routes(&caddy, &preview_states)
+            .await
+            .unwrap();
+
+        let map = caddy_state.lock().await;
+        assert!(
+            map.contains_key("slip-myapp-preview-pr-1"),
+            "running preview route should be reconciled"
+        );
+        assert!(
+            !map.contains_key("slip-myapp-preview-pr-2"),
+            "failed preview route should NOT be reconciled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_preview_routes_empty_map_is_ok() {
+        let (port, _caddy_state) = start_mock_caddy_for_reconcile().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let caddy = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        caddy.bootstrap().await.unwrap();
+
+        let preview_states: DashMap<String, PS> = DashMap::new();
+
+        // Should succeed with no routes to reconcile.
+        let result = reconcile_preview_routes(&caddy, &preview_states).await;
+        assert!(result.is_ok(), "empty reconcile should succeed");
     }
 }

@@ -115,6 +115,7 @@ mod tests {
             env_file: None,
             resources: ResourceConfig::default(),
             network: NetworkConfig::default(),
+            preview: None,
         }
     }
 

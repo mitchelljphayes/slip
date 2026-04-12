@@ -18,9 +18,25 @@ use crate::caddy::CaddyClient;
 use crate::config::{AppConfig, SlipConfig};
 use crate::deploy::{AppRuntimeState, DeployContext, TriggerSource, execute_deploy};
 use crate::health::HealthChecker;
+use crate::preview::{
+    PreviewDeployContext, PreviewState, execute_preview_deploy, resolve_preview_domain,
+    teardown_preview,
+};
 use crate::runtime::{RegistryCredentials, RuntimeBackend};
 
 // ─── Request / Response types ─────────────────────────────────────────────────
+
+/// Preview-specific fields sent alongside a deploy request.
+///
+/// When present, the deploy creates an ephemeral preview environment instead
+/// of updating the production deployment.
+#[derive(Debug, Deserialize)]
+pub struct PreviewRequestInfo {
+    /// Unique preview identifier (e.g. "pr-42", "feature-foo").
+    pub id: String,
+    /// Git commit SHA for metadata / display purposes.
+    pub sha: String,
+}
 
 /// Payload sent to `POST /v1/deploy`.
 #[derive(Debug, Deserialize)]
@@ -28,6 +44,9 @@ pub struct DeployRequest {
     pub app: String,
     pub image: String,
     pub tag: String,
+    /// If present, this is a preview deploy rather than a production deploy.
+    #[serde(default)]
+    pub preview: Option<PreviewRequestInfo>,
 }
 
 /// Successful deploy response (202 Accepted).
@@ -37,6 +56,12 @@ pub struct DeployResponse {
     pub app: String,
     pub tag: String,
     pub status: String,
+    /// Expected preview URL for preview deploys. `None` for production deploys.
+    ///
+    /// This is computed from config at request time as a hint. The actual URL
+    /// becomes live after the background deploy task completes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_url: Option<String>,
 }
 
 /// Error response body.
@@ -75,6 +100,20 @@ pub struct DeployStatusResponse {
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+}
+
+/// Response for preview status endpoints.
+#[derive(Debug, Serialize)]
+pub struct PreviewStatusResponse {
+    pub preview_id: String,
+    pub app: String,
+    pub sha: String,
+    pub status: String,
+    pub tag: Option<String>,
+    pub domain: String,
+    pub port: Option<u16>,
+    pub deployed_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 // ─── App error ────────────────────────────────────────────────────────────────
@@ -130,6 +169,13 @@ pub struct AppState {
     pub deploys: DashMap<String, DeployContext>,
     /// Timestamp when the daemon was started (used for uptime calculation).
     pub started_at: DateTime<Utc>,
+    /// Active preview deployment states keyed by `"{app}:{preview_id}"`.
+    pub preview_states: Arc<DashMap<String, PreviewState>>,
+    /// Per-preview deploy locks; prevents concurrent deploys for the same preview.
+    ///
+    /// Keyed by `"{app}:{preview_id}"`. Allows preview deploys to run concurrently
+    /// with production deploys and other previews.
+    pub preview_locks: DashMap<String, Arc<Mutex<()>>>,
 }
 
 impl AppState {
@@ -161,6 +207,14 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         .route(
             "/v1/deploys/{deploy_id}",
             axum::routing::get(handle_deploy_status),
+        )
+        .route(
+            "/v1/previews/{app}",
+            axum::routing::get(handle_list_previews),
+        )
+        .route(
+            "/v1/previews/{app}/{preview_id}",
+            axum::routing::get(handle_preview_status).delete(handle_preview_teardown),
         )
         .layer(DefaultBodyLimit::max(64 * 1024)) // 64 KiB limit
         .with_state(state)
@@ -236,6 +290,97 @@ async fn handle_deploy(
         ));
     }
 
+    // ── Preview deploy path ──────────────────────────────────────────────────
+    if let Some(ref preview_info) = request.preview {
+        // Validate preview ID format (same charset as tags).
+        if preview_info.id.is_empty() {
+            return Err(AppError::BadRequest(
+                "preview.id must not be empty".to_string(),
+            ));
+        }
+        if !preview_info
+            .id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err(AppError::BadRequest(
+                "preview.id contains invalid characters (allowed: alphanumeric, -, _, .)"
+                    .to_string(),
+            ));
+        }
+
+        // Pre-flight: verify preview domain is configured (server or app level).
+        // This gives a fast 400 before spawning any background task.
+        let preview_url = match resolve_preview_domain(
+            &preview_info.id,
+            &request.app,
+            &state.config.preview,
+            &app_cfg.preview,
+        ) {
+            Ok(domain) => Some(format!("https://{domain}")),
+            Err(_) => {
+                return Err(AppError::BadRequest(
+                        "preview deployments not configured for this server: set [preview].domain in slip.toml".to_string(),
+                    ));
+            }
+        };
+
+        // Acquire per-preview deploy lock (allows concurrent preview deploys).
+        let preview_lock_key = format!("{}:{}", request.app, preview_info.id);
+        let lock = {
+            let lock_entry = state
+                .preview_locks
+                .entry(preview_lock_key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())));
+            lock_entry.clone()
+        };
+
+        let guard = lock.try_lock_owned().map_err(|_| {
+            AppError::Conflict(format!(
+                "preview deploy already in progress for '{}/{}'",
+                request.app, preview_info.id
+            ))
+        })?;
+
+        // Generate deploy_id.
+        let deploy_id = format!("dep_{}", ulid::Ulid::new().to_string().to_lowercase());
+
+        info!(
+            deploy_id = %deploy_id,
+            app = %request.app,
+            tag = %request.tag,
+            preview_id = %preview_info.id,
+            "preview deploy accepted"
+        );
+
+        let response = DeployResponse {
+            deploy_id: deploy_id.clone(),
+            app: request.app.clone(),
+            tag: request.tag.clone(),
+            status: "accepted".to_string(),
+            preview_url,
+        };
+
+        let preview_ctx = PreviewDeployContext {
+            deploy_id,
+            app_name: request.app.clone(),
+            image: request.image.clone(),
+            tag: request.tag.clone(),
+            preview_id: preview_info.id.clone(),
+            sha: preview_info.sha.clone(),
+        };
+
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            execute_preview_deploy(state_clone, preview_ctx).await;
+        });
+
+        return Ok((StatusCode::ACCEPTED, Json(response)));
+    }
+
+    // ── Production deploy path (unchanged) ────────────────────────────────────
+
     // 9. Try to acquire per-app deploy lock (non-blocking).
     let lock = {
         let lock_entry = state
@@ -265,6 +410,7 @@ async fn handle_deploy(
         app: request.app.clone(),
         tag: request.tag.clone(),
         status: "accepted".to_string(),
+        preview_url: None,
     };
 
     // 11. Spawn deploy orchestrator.
@@ -391,6 +537,109 @@ async fn handle_deploy_status(
     Ok((StatusCode::OK, Json(response)))
 }
 
+// ─── Preview handlers ─────────────────────────────────────────────────────────
+
+/// Helper: convert `AppStatus` to a string for JSON responses.
+fn preview_status_str(status: &crate::deploy::AppStatus) -> &'static str {
+    match status {
+        crate::deploy::AppStatus::Running => "running",
+        crate::deploy::AppStatus::Deploying => "deploying",
+        crate::deploy::AppStatus::Failed => "failed",
+        crate::deploy::AppStatus::NotDeployed => "not_deployed",
+    }
+}
+
+/// Helper: build a `PreviewStatusResponse` from a `PreviewState`.
+fn to_preview_response(state: &PreviewState) -> PreviewStatusResponse {
+    PreviewStatusResponse {
+        preview_id: state.preview_id.clone(),
+        app: state.app.clone(),
+        sha: state.sha.clone(),
+        status: preview_status_str(&state.status).to_string(),
+        tag: state.tag.clone(),
+        domain: state.domain.clone(),
+        port: state.port,
+        deployed_at: state.deployed_at,
+        expires_at: state.expires_at,
+    }
+}
+
+/// `DELETE /v1/previews/:app/:preview_id`
+///
+/// Tears down a preview deployment: stops container/pod, removes Caddy route,
+/// clears state. Requires HMAC authentication (same as deploy endpoint).
+async fn handle_preview_teardown(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path((app, preview_id)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    // Validate HMAC signature.
+    let sig_header = headers
+        .get("X-Slip-Signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| AppError::Unauthorized("missing X-Slip-Signature header".to_string()))?;
+
+    let app_cfg = state
+        .apps
+        .get(&app)
+        .ok_or_else(|| AppError::NotFound(format!("unknown app: {app}")))?;
+
+    let secret = resolve_secret(app_cfg.app.secret.as_deref(), &state.config.auth.secret);
+
+    // Sign over the path params (app + preview_id concatenated as the "body").
+    let body = format!("{app}:{preview_id}");
+    if !verify_signature(sig_header, body.as_bytes(), secret) {
+        warn!(app = %app, preview_id = %preview_id, "preview teardown rejected: invalid signature");
+        return Err(AppError::Unauthorized("invalid signature".to_string()));
+    }
+
+    teardown_preview(
+        state.runtime.as_ref(),
+        &state.caddy,
+        &state.preview_states,
+        &state.config.storage.path,
+        &app,
+        &preview_id,
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("teardown failed: {e}")))?;
+
+    Ok((StatusCode::OK, Json(serde_json::json!({"status": "ok"}))))
+}
+
+/// `GET /v1/previews/:app`
+///
+/// Returns a list of all active previews for an app. No auth required (read-only).
+async fn handle_list_previews(
+    State(state): State<Arc<AppState>>,
+    Path(app): Path<String>,
+) -> (StatusCode, Json<Vec<PreviewStatusResponse>>) {
+    let prefix = format!("{app}:");
+    let previews: Vec<PreviewStatusResponse> = state
+        .preview_states
+        .iter()
+        .filter(|entry| entry.key().starts_with(&prefix))
+        .map(|entry| to_preview_response(entry.value()))
+        .collect();
+
+    (StatusCode::OK, Json(previews))
+}
+
+/// `GET /v1/previews/:app/:preview_id`
+///
+/// Returns the status of a single preview. No auth required (read-only).
+async fn handle_preview_status(
+    State(state): State<Arc<AppState>>,
+    Path((app, preview_id)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<PreviewStatusResponse>), AppError> {
+    let key = format!("{app}:{preview_id}");
+    let entry = state.preview_states.get(&key).ok_or_else(|| {
+        AppError::NotFound(format!("preview '{preview_id}' not found for app '{app}'"))
+    })?;
+
+    Ok((StatusCode::OK, Json(to_preview_response(&entry))))
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -434,6 +683,7 @@ mod tests {
             registry: RegistryConfig { ghcr_token: None },
             storage: StorageConfig::default(),
             runtime: RuntimeConfig::default(),
+            preview: None,
         }
     }
 
@@ -455,6 +705,7 @@ mod tests {
             env_file: None,
             resources: ResourceConfig::default(),
             network: NetworkConfig::default(),
+            preview: None,
         }
     }
 
@@ -475,6 +726,8 @@ mod tests {
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
             started_at: Utc::now(),
+            preview_states: Arc::new(DashMap::new()),
+            preview_locks: DashMap::new(),
         })
     }
 
@@ -492,6 +745,35 @@ mod tests {
     /// Build a signature header for the given body + secret.
     fn sig_header(body: &[u8], secret: &str) -> String {
         format!("sha256={}", compute_signature(body, secret))
+    }
+
+    // ── DeployRequest backward compatibility ──────────────────────────────────
+
+    #[test]
+    fn test_deploy_request_no_preview_field_deserializes() {
+        // Old clients that don't send `preview` should still parse fine.
+        let json = r#"{"app":"myapp","image":"ghcr.io/org/myapp","tag":"v1.0.0"}"#;
+        let req: crate::api::DeployRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.app, "myapp");
+        assert_eq!(req.tag, "v1.0.0");
+        assert!(
+            req.preview.is_none(),
+            "preview must be None when field is absent"
+        );
+    }
+
+    #[test]
+    fn test_deploy_request_with_preview_field_deserializes() {
+        let json = r#"{
+            "app": "myapp",
+            "image": "ghcr.io/org/myapp",
+            "tag": "sha-abc123",
+            "preview": {"id": "pr-42", "sha": "abc123def456"}
+        }"#;
+        let req: crate::api::DeployRequest = serde_json::from_str(json).unwrap();
+        let preview = req.preview.expect("preview should be Some");
+        assert_eq!(preview.id, "pr-42");
+        assert_eq!(preview.sha, "abc123def456");
     }
 
     // ── 202 Accepted ──────────────────────────────────────────────────────────
@@ -697,6 +979,8 @@ mod tests {
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
             started_at: Utc::now(),
+            preview_states: Arc::new(DashMap::new()),
+            preview_locks: DashMap::new(),
         });
 
         let app = build_router(state_inner);
@@ -742,6 +1026,8 @@ mod tests {
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
             started_at: Utc::now(),
+            preview_states: Arc::new(DashMap::new()),
+            preview_locks: DashMap::new(),
         });
 
         let app = build_router(state);
@@ -907,5 +1193,524 @@ mod tests {
             .unwrap();
         let payload: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
         assert!(payload.error.contains("deploy not found"));
+    }
+
+    // ── POST /v1/deploy with preview field → 202 ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_deploy_with_preview_field_returns_202() {
+        use crate::config::ServerPreviewConfig;
+
+        let mut apps = HashMap::new();
+        apps.insert(APP_NAME.to_string(), test_app_config(Some(APP_SECRET)));
+
+        let mut config = test_slip_config();
+        config.preview = Some(ServerPreviewConfig {
+            domain: "preview.example.com".to_string(),
+            max_per_app: None,
+            default_ttl: None,
+            max_memory: None,
+            max_cpus: None,
+        });
+
+        let state = Arc::new(AppState {
+            config,
+            apps,
+            deploy_locks: DashMap::new(),
+            runtime: Arc::new(
+                DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            ),
+            caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
+            health: HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
+            started_at: Utc::now(),
+            preview_states: Arc::new(DashMap::new()),
+            preview_locks: DashMap::new(),
+        });
+
+        let app = build_router(state);
+
+        let body_json = serde_json::json!({
+            "app": APP_NAME,
+            "image": APP_IMAGE,
+            "tag": "sha-abc123",
+            "preview": {
+                "id": "pr-42",
+                "sha": "abc123def456"
+            }
+        })
+        .to_string();
+        let body_bytes = body_json.as_bytes().to_vec();
+        let sig = sig_header(&body_bytes, APP_SECRET);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/deploy")
+            .header("Content-Type", "application/json")
+            .header("X-Slip-Signature", sig)
+            .body(Body::from(body_bytes))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: DeployResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload.app, APP_NAME);
+        assert_eq!(payload.tag, "sha-abc123");
+        assert_eq!(payload.status, "accepted");
+        assert!(payload.deploy_id.starts_with("dep_"));
+    }
+
+    // ── POST /v1/deploy preview: invalid preview_id → 400 ────────────────────
+
+    #[tokio::test]
+    async fn test_deploy_preview_invalid_id() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let body_json = serde_json::json!({
+            "app": APP_NAME,
+            "image": APP_IMAGE,
+            "tag": "sha-abc123",
+            "preview": {
+                "id": "pr/42", // invalid: contains slash
+                "sha": "abc123"
+            }
+        })
+        .to_string();
+        let body_bytes = body_json.as_bytes().to_vec();
+        let sig = sig_header(&body_bytes, APP_SECRET);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/deploy")
+            .header("Content-Type", "application/json")
+            .header("X-Slip-Signature", sig)
+            .body(Body::from(body_bytes))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(payload.error.contains("invalid characters"));
+    }
+
+    // ── GET /v1/previews/:app — empty list ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_previews_empty() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/previews/{APP_NAME}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert!(payload.is_empty(), "should return empty list");
+    }
+
+    // ── GET /v1/previews/:app — with previews ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_previews_with_entries() {
+        use crate::deploy::AppStatus;
+        use crate::preview::PreviewState;
+        use chrono::Utc;
+
+        let state = create_test_state();
+
+        // Insert two previews for testapp and one for another app.
+        state.preview_states.insert(
+            format!("{APP_NAME}:pr-1"),
+            PreviewState {
+                preview_id: "pr-1".to_string(),
+                app: APP_NAME.to_string(),
+                sha: "abc".to_string(),
+                status: AppStatus::Running,
+                container_id: Some("ctr-1".to_string()),
+                pod_name: None,
+                port: Some(54001),
+                tag: Some("v1".to_string()),
+                deployed_at: Utc::now(),
+                expires_at: None,
+                domain: "pr-1.preview.example.com".to_string(),
+                manifest_path: None,
+                deploy_id: None,
+            },
+        );
+        state.preview_states.insert(
+            format!("{APP_NAME}:pr-2"),
+            PreviewState {
+                preview_id: "pr-2".to_string(),
+                app: APP_NAME.to_string(),
+                sha: "def".to_string(),
+                status: AppStatus::Running,
+                container_id: Some("ctr-2".to_string()),
+                pod_name: None,
+                port: Some(54002),
+                tag: Some("v2".to_string()),
+                deployed_at: Utc::now(),
+                expires_at: None,
+                domain: "pr-2.preview.example.com".to_string(),
+                manifest_path: None,
+                deploy_id: None,
+            },
+        );
+        // Different app — should not appear in the list for APP_NAME.
+        state.preview_states.insert(
+            "otherapp:pr-1".to_string(),
+            PreviewState {
+                preview_id: "pr-1".to_string(),
+                app: "otherapp".to_string(),
+                sha: "ghi".to_string(),
+                status: AppStatus::Running,
+                container_id: Some("ctr-other".to_string()),
+                pod_name: None,
+                port: Some(54003),
+                tag: Some("v1".to_string()),
+                deployed_at: Utc::now(),
+                expires_at: None,
+                domain: "pr-1.other.example.com".to_string(),
+                manifest_path: None,
+                deploy_id: None,
+            },
+        );
+
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/previews/{APP_NAME}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(payload.len(), 2, "should return 2 previews for testapp");
+        let ids: Vec<&str> = payload
+            .iter()
+            .map(|p| p["preview_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"pr-1"), "should contain pr-1");
+        assert!(ids.contains(&"pr-2"), "should contain pr-2");
+    }
+
+    // ── GET /v1/previews/:app/:preview_id — found ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_preview_status_found() {
+        use crate::deploy::AppStatus;
+        use crate::preview::PreviewState;
+        use chrono::Utc;
+
+        let state = create_test_state();
+
+        state.preview_states.insert(
+            format!("{APP_NAME}:pr-99"),
+            PreviewState {
+                preview_id: "pr-99".to_string(),
+                app: APP_NAME.to_string(),
+                sha: "sha999".to_string(),
+                status: AppStatus::Running,
+                container_id: Some("ctr-99".to_string()),
+                pod_name: None,
+                port: Some(55999),
+                tag: Some("sha-abc999".to_string()),
+                deployed_at: Utc::now(),
+                expires_at: None,
+                domain: "pr-99.preview.example.com".to_string(),
+                manifest_path: None,
+                deploy_id: None,
+            },
+        );
+
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/previews/{APP_NAME}/pr-99"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(payload["preview_id"], "pr-99");
+        assert_eq!(payload["app"], APP_NAME);
+        assert_eq!(payload["status"], "running");
+        assert_eq!(payload["tag"], "sha-abc999");
+        assert_eq!(payload["port"], 55999);
+    }
+
+    // ── GET /v1/previews/:app/:preview_id — not found ─────────────────────────
+
+    #[tokio::test]
+    async fn test_preview_status_not_found() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/previews/{APP_NAME}/nonexistent"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(payload.error.contains("not found"));
+    }
+
+    // ── DELETE /v1/previews/:app/:preview_id — missing signature → 401 ────────
+
+    #[tokio::test]
+    async fn test_preview_teardown_missing_signature() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/previews/{APP_NAME}/pr-1"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── DELETE /v1/previews/:app/:preview_id — invalid signature → 401 ────────
+
+    #[tokio::test]
+    async fn test_preview_teardown_invalid_signature() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/previews/{APP_NAME}/pr-1"))
+            .header("X-Slip-Signature", "sha256=deadbeef")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── POST /v1/deploy with preview but no server preview config → 400 ────────
+
+    #[tokio::test]
+    async fn test_deploy_preview_no_domain_config_returns_400() {
+        // State has no server preview config (preview: None in SlipConfig).
+        let state = create_test_state(); // uses test_slip_config() which has preview: None
+        let app = build_router(state);
+
+        let body_json = serde_json::json!({
+            "app": APP_NAME,
+            "image": APP_IMAGE,
+            "tag": "sha-abc123",
+            "preview": {
+                "id": "pr-42",
+                "sha": "abc123def456"
+            }
+        })
+        .to_string();
+        let body_bytes = body_json.as_bytes().to_vec();
+        let sig = sig_header(&body_bytes, APP_SECRET);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/deploy")
+            .header("Content-Type", "application/json")
+            .header("X-Slip-Signature", sig)
+            .body(Body::from(body_bytes))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "should reject preview deploy when no domain is configured"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            payload.error.contains("not configured") || payload.error.contains("domain"),
+            "error should mention preview not configured: {}",
+            payload.error
+        );
+    }
+
+    // ── POST /v1/deploy with preview + server config → 202 with preview_url ──
+
+    #[tokio::test]
+    async fn test_deploy_preview_with_server_config_returns_preview_url() {
+        use crate::config::ServerPreviewConfig;
+
+        let mut apps = HashMap::new();
+        apps.insert(APP_NAME.to_string(), test_app_config(Some(APP_SECRET)));
+
+        let mut config = test_slip_config();
+        config.preview = Some(ServerPreviewConfig {
+            domain: "preview.example.com".to_string(),
+            max_per_app: None,
+            default_ttl: None,
+            max_memory: None,
+            max_cpus: None,
+        });
+
+        let state = Arc::new(AppState {
+            config,
+            apps,
+            deploy_locks: DashMap::new(),
+            runtime: Arc::new(
+                DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            ),
+            caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
+            health: HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
+            started_at: Utc::now(),
+            preview_states: Arc::new(DashMap::new()),
+            preview_locks: DashMap::new(),
+        });
+
+        let app = build_router(state);
+
+        let body_json = serde_json::json!({
+            "app": APP_NAME,
+            "image": APP_IMAGE,
+            "tag": "sha-abc123",
+            "preview": {
+                "id": "pr-42",
+                "sha": "abc123def456"
+            }
+        })
+        .to_string();
+        let body_bytes = body_json.as_bytes().to_vec();
+        let sig = sig_header(&body_bytes, APP_SECRET);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/deploy")
+            .header("Content-Type", "application/json")
+            .header("X-Slip-Signature", sig)
+            .body(Body::from(body_bytes))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(payload["app"], APP_NAME);
+        assert_eq!(payload["status"], "accepted");
+        // preview_url should be included and point to the expected subdomain.
+        let preview_url = payload["preview_url"]
+            .as_str()
+            .expect("preview_url should be present");
+        assert!(
+            preview_url.contains("pr-42.preview.example.com"),
+            "preview_url should contain subdomain: {preview_url}"
+        );
+    }
+
+    // ── POST /v1/deploy (production) → no preview_url in response ─────────────
+
+    #[tokio::test]
+    async fn test_deploy_production_response_has_no_preview_url() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let body = deploy_body(APP_NAME, APP_IMAGE, "v1.2.3");
+        let sig = sig_header(&body, APP_SECRET);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/deploy")
+            .header("Content-Type", "application/json")
+            .header("X-Slip-Signature", sig)
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // preview_url should be absent from the JSON (skip_serializing_if = None).
+        assert!(
+            payload["preview_url"].is_null(),
+            "preview_url should not be present in production deploy response"
+        );
+    }
+
+    // ── DELETE /v1/previews/:app/:preview_id — valid, no preview → 200 ────────
+
+    #[tokio::test]
+    async fn test_preview_teardown_valid_nonexistent_returns_ok() {
+        // teardown_preview is idempotent — deleting a non-existent preview → 200.
+        let state = create_test_state();
+        let app = build_router(state);
+
+        // Sign over "testapp:pr-99" (the body format used by teardown).
+        let body = format!("{APP_NAME}:pr-99");
+        let sig = sig_header(body.as_bytes(), APP_SECRET);
+
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/previews/{APP_NAME}/pr-99"))
+            .header("X-Slip-Signature", sig)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["status"], "ok");
     }
 }

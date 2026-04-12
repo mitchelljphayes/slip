@@ -445,6 +445,36 @@ impl RuntimeBackend for PodmanBackend {
         })
     }
 
+    fn exec_in_container<'a>(
+        &'a self,
+        container_id: &'a str,
+        command: &'a [&'a str],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, RuntimeError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let output = tokio::process::Command::new(&self.podman_path)
+                .args(["exec", container_id])
+                .args(command)
+                .output()
+                .await
+                .map_err(|e| RuntimeError::ExecFailed(format!("failed to run podman exec: {e}")))?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let combined = format!("{stdout}{stderr}");
+
+            if output.status.success() {
+                Ok(combined)
+            } else {
+                Err(RuntimeError::ExecFailed(format!(
+                    "exit code {}: {combined}",
+                    output.status.code().unwrap_or(-1)
+                )))
+            }
+        })
+    }
+
     fn extract_file<'a>(
         &'a self,
         image: &'a str,

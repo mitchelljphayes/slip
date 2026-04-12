@@ -4,10 +4,12 @@ use std::sync::Arc;
 use chrono::Utc;
 use clap::Parser;
 use dashmap::DashMap;
+use slip_core::preview::preview_reaper;
 use slip_core::runtime::RuntimeBackend;
 use slip_core::{
     AppState, CaddyClient, DockerClient, HealthChecker, PodmanBackend, build_router,
-    load_app_states, load_config, reconcile_routes, verify_containers,
+    load_app_states, load_config, load_preview_states, reconcile_preview_routes, reconcile_routes,
+    verify_containers,
 };
 use tokio::sync::RwLock;
 
@@ -139,6 +141,31 @@ async fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("Caddy bootstrap error: {e}")
     })?;
 
+    // ── Configure TLS for preview wildcard certificates ────────────────────────
+    if let (Some(preview_config), Some(tls_config)) = (&slip_config.preview, &slip_config.caddy.tls)
+    {
+        match caddy
+            .configure_tls(&preview_config.domain, tls_config)
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    domain = %preview_config.domain,
+                    "configured TLS for wildcard preview certificates"
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to configure TLS for preview domain");
+                return Err(anyhow::anyhow!("TLS configuration error: {e}"));
+            }
+        }
+    } else if slip_config.preview.is_some() && slip_config.caddy.tls.is_none() {
+        tracing::warn!(
+            "preview deployments configured but no TLS config found; \
+             preview domains will use Caddy's default HTTP-01 challenge"
+        );
+    }
+
     tracing::info!("infrastructure bootstrap complete");
 
     // ── Load and reconcile persisted state ───────────────────────────────────
@@ -148,6 +175,25 @@ async fn main() -> anyhow::Result<()> {
 
     if let Err(e) = reconcile_routes(&caddy, &verified_states, &apps).await {
         tracing::warn!(error = %e, "caddy route reconciliation failed on startup (non-fatal)");
+    }
+
+    // ── Load persisted preview states ────────────────────────────────────────
+    let persisted_previews = load_preview_states(&state_dir);
+    if !persisted_previews.is_empty() {
+        tracing::info!(
+            count = persisted_previews.len(),
+            "loaded persisted preview states"
+        );
+    }
+    let preview_states: Arc<DashMap<String, slip_core::PreviewState>> =
+        Arc::new(persisted_previews.into_iter().collect());
+
+    // ── Reconcile preview Caddy routes ───────────────────────────────────────
+    if let Err(e) = reconcile_preview_routes(&caddy, &preview_states).await {
+        tracing::warn!(
+            error = %e,
+            "preview caddy route reconciliation failed on startup (non-fatal)"
+        );
     }
 
     // ── Build application state ──────────────────────────────────────────────
@@ -161,7 +207,12 @@ async fn main() -> anyhow::Result<()> {
         app_states: RwLock::new(verified_states),
         deploys: DashMap::new(),
         started_at: Utc::now(),
+        preview_states,
+        preview_locks: DashMap::new(),
     });
+
+    // ── Spawn background tasks ────────────────────────────────────────────────
+    tokio::spawn(preview_reaper(state.clone()));
 
     // ── Build router ─────────────────────────────────────────────────────────
     let router = build_router(state);
