@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
 
@@ -21,7 +21,7 @@ use crate::error::ConfigError;
 mod duration_serde {
     use std::time::Duration;
 
-    use serde::{Deserialize, Deserializer};
+    use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
     where
@@ -29,6 +29,14 @@ mod duration_serde {
     {
         let s = String::deserialize(deserializer)?;
         parse_duration(&s).map_err(serde::de::Error::custom)
+    }
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let secs = duration.as_secs();
+        serializer.serialize_str(&format!("{secs}s"))
     }
 
     fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -119,7 +127,7 @@ fn default_env() -> HashMap<String, String> {
 ///
 /// Provides defaults and caps for all preview deployments on this daemon.
 /// Apps may override the domain via [`AppPreviewConfig`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerPreviewConfig {
     /// Wildcard base domain for preview subdomains.
     ///
@@ -144,7 +152,7 @@ pub struct ServerPreviewConfig {
 }
 
 /// Top-level daemon configuration (`slip.toml`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SlipConfig {
     pub server: ServerConfig,
     pub caddy: CaddyConfig,
@@ -159,7 +167,7 @@ pub struct SlipConfig {
 }
 
 /// Container runtime backend settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuntimeConfig {
     /// Which runtime backend to use: "docker", "podman", or "auto" (default).
     #[serde(default = "default_runtime_backend")]
@@ -179,7 +187,7 @@ impl Default for RuntimeConfig {
 }
 
 /// HTTP server settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
@@ -194,7 +202,7 @@ impl Default for ServerConfig {
 }
 
 /// Caddy reverse-proxy settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CaddyConfig {
     #[serde(default = "default_caddy_admin_api")]
     pub admin_api: String,
@@ -207,7 +215,7 @@ pub struct CaddyConfig {
 ///
 /// This is used for preview deployments that need wildcard certificates
 /// (e.g., `*.preview.example.com`) which require DNS-01 challenge validation.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CaddyTlsConfig {
     /// Email address for Let's Encrypt account registration.
     pub email: String,
@@ -249,19 +257,19 @@ impl Default for CaddyConfig {
 }
 
 /// Authentication settings (shared HMAC secret).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AuthConfig {
     pub secret: String,
 }
 
 /// Container registry settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RegistryConfig {
     pub ghcr_token: Option<String>,
 }
 
 /// Persistent storage path.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StorageConfig {
     #[serde(default = "default_storage_path")]
     pub path: PathBuf,
@@ -281,7 +289,7 @@ impl Default for StorageConfig {
 ///
 /// When present in an app's `apps/<name>.toml`, these values take precedence
 /// over the corresponding server-level [`ServerPreviewConfig`] defaults.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppPreviewConfig {
     /// App-specific preview base domain (overrides server-level `preview.domain`).
     pub domain: Option<String>,
@@ -290,7 +298,7 @@ pub struct AppPreviewConfig {
 }
 
 /// Per-application configuration loaded from `apps/<name>.toml`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
     pub app: AppInfo,
     pub routing: RoutingConfig,
@@ -309,7 +317,7 @@ pub struct AppConfig {
 }
 
 /// Basic application identity.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppInfo {
     pub name: String,
     pub image: String,
@@ -317,14 +325,14 @@ pub struct AppInfo {
 }
 
 /// HTTP routing configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RoutingConfig {
     pub domain: String,
     pub port: u16,
 }
 
 /// Container health-check configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HealthConfig {
     pub path: Option<String>,
     #[serde(default = "default_health_interval", with = "duration_serde")]
@@ -350,7 +358,7 @@ impl Default for HealthConfig {
 }
 
 /// Deployment strategy settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeployConfig {
     #[serde(default = "default_deploy_strategy")]
     pub strategy: String,
@@ -368,20 +376,20 @@ impl Default for DeployConfig {
 }
 
 /// Optional `.env`-style file to load.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EnvFileConfig {
     pub path: PathBuf,
 }
 
 /// Container resource limits.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ResourceConfig {
     pub memory: Option<String>,
     pub cpus: Option<String>,
 }
 
 /// Container network settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NetworkConfig {
     #[serde(default = "default_network_name")]
     pub name: String,
@@ -522,6 +530,55 @@ pub fn load_config(path: &Path) -> Result<(SlipConfig, HashMap<String, AppConfig
     }
 
     Ok((slip_cfg, apps))
+}
+
+// ─── Config write-back functions ──────────────────────────────────────────────
+
+/// Write an app configuration to disk atomically.
+///
+/// The config is written to `{config_dir}/apps/{name}.toml` using an atomic
+/// write (temp file → rename) to ensure consistency.
+pub fn write_app_config(config_dir: &Path, app: &AppConfig) -> Result<(), ConfigError> {
+    let apps_dir = config_dir.join("apps");
+    if !apps_dir.exists() {
+        std::fs::create_dir_all(&apps_dir).map_err(|e| ConfigError::WriteFile {
+            path: apps_dir.clone(),
+            source: e,
+        })?;
+    }
+
+    let app_name = &app.app.name;
+    let target_path = apps_dir.join(format!("{app_name}.toml"));
+    let temp_path = apps_dir.join(format!(".{app_name}.toml.tmp"));
+
+    let content = toml::to_string_pretty(app).map_err(|e| ConfigError::Serialize(e.to_string()))?;
+
+    std::fs::write(&temp_path, content).map_err(|e| ConfigError::WriteFile {
+        path: temp_path.clone(),
+        source: e,
+    })?;
+
+    std::fs::rename(&temp_path, &target_path).map_err(|e| ConfigError::WriteFile {
+        path: target_path.clone(),
+        source: e,
+    })?;
+
+    Ok(())
+}
+
+/// Delete an app configuration file from disk.
+///
+/// Removes `{config_dir}/apps/{name}.toml`. Ignores "not found" errors
+/// (idempotent).
+pub fn delete_app_config(config_dir: &Path, name: &str) -> Result<(), ConfigError> {
+    let apps_dir = config_dir.join("apps");
+    let path = apps_dir.join(format!("{name}.toml"));
+
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ConfigError::DeleteFile { path, source: e }),
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
