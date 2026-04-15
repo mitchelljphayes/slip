@@ -57,6 +57,9 @@ enum Commands {
         /// Path to slip.toml (default: ./slip.toml).
         #[arg(default_value = "slip.toml")]
         path: String,
+        /// Also validate image references in pod manifests.
+        #[arg(long)]
+        strict: bool,
     },
 }
 
@@ -425,31 +428,58 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init => {
             println!("slip init — not yet implemented (Phase 2)");
         }
-        Commands::Validate { path } => {
-            let content = std::fs::read(&path).with_context(|| format!("failed to read {path}"))?;
-            let config = slip_core::repo_config::parse_repo_config(&content)
-                .with_context(|| format!("failed to parse {path}"))?;
-
-            println!("✓ Valid repo config");
-            println!("  app:  {}", config.app.name);
-            println!("  kind: {}", config.app.kind);
-
-            if let Some(ref manifest) = config.app.manifest {
-                println!("  manifest: {manifest}");
-                if !std::path::Path::new(manifest).exists() {
-                    eprintln!("  ⚠ manifest file '{manifest}' not found");
+        Commands::Validate { path, strict } => {
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("✗ Failed to read '{}': {}", path, e);
+                    std::process::exit(1);
                 }
+            };
+
+            let base_dir = std::path::Path::new(&path)
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf();
+
+            let (config, result) =
+                slip_core::validate::parse_and_validate(&content, &base_dir, strict);
+
+            // Print warnings
+            for warning in &result.warnings {
+                println!("⚠ {}", warning);
             }
 
-            if let Some(ref preview) = config.preview {
-                println!(
-                    "  preview: {}",
-                    if preview.enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                );
+            // Print errors
+            for error in &result.errors {
+                eprintln!("✗ {}", error);
+            }
+
+            // Exit if errors
+            if !result.is_valid() {
+                std::process::exit(1);
+            }
+
+            // Print success summary
+            if let Some(cfg) = config {
+                println!("✓ Valid repo config");
+                println!("  app:  {}", cfg.app.name);
+                println!("  kind: {}", cfg.app.kind);
+
+                if let Some(ref manifest) = cfg.app.manifest {
+                    println!("  manifest: {}", manifest);
+                }
+
+                if let Some(ref preview) = cfg.preview {
+                    println!(
+                        "  preview: {}",
+                        if preview.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                }
             }
         }
     }

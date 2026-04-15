@@ -13,6 +13,7 @@ pub mod preview;
 pub mod repo_config;
 pub mod runtime;
 pub mod state;
+pub mod validate;
 
 // Re-exports for convenience
 pub use api::{AppState, DeployRequest, DeployResponse, PreviewRequestInfo, build_router};
@@ -39,4 +40,8 @@ pub use state::{
     PersistedAppState, delete_preview_state, load_app_states, load_preview_states,
     reconcile_preview_routes, reconcile_routes, save_app_state, save_preview_state,
     verify_containers,
+};
+pub use validate::{
+    ValidationError, ValidationResult, parse_and_validate, validate_image_refs,
+    validate_pod_manifest, validate_repo_config,
 };
