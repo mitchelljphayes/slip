@@ -141,6 +141,7 @@ pub(crate) struct DeploySharedState<'a> {
     pub app_states: &'a RwLock<HashMap<String, AppRuntimeState>>,
     pub deploys: &'a DashMap<String, DeployContext>,
     pub credentials: Option<RegistryCredentials>,
+    pub secrets_store: Option<&'a crate::secrets::SecretsStore>,
 }
 
 // ─── Core orchestrator ────────────────────────────────────────────────────────
@@ -157,6 +158,7 @@ pub async fn execute_deploy(state: Arc<AppState>, ctx: DeployContext) {
         app_states: &state.app_states,
         deploys: &state.deploys,
         credentials: state.registry_credentials(),
+        secrets_store: Some(&state.secrets_store),
     };
     execute_deploy_inner(
         shared,
@@ -276,7 +278,7 @@ pub(crate) async fn execute_deploy_inner(
     ctx.status = DeployStatus::Starting;
     record_deploy(shared.deploys, &ctx);
 
-    let env_vars = resolve_env_vars_for_app(&effective_config);
+    let env_vars = resolve_env_vars_for_app(&effective_config, shared.secrets_store, &app_name);
 
     // Determine if this is a pod or container deploy.
     let is_pod = merged.as_ref().map(|m| m.kind == "pod").unwrap_or(false);
@@ -642,8 +644,16 @@ fn set_app_failed(app_states: &RwLock<HashMap<String, AppRuntimeState>>, app_nam
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Merge env vars from app config `[env]` section + optional env_file on disk.
-fn resolve_env_vars_for_app(app_config: &AppConfig) -> Vec<String> {
+/// Merge env vars from app config `[env]` section + optional env_file on disk
+/// + secrets from the SecretsStore (if provided).
+///
+/// Secrets take precedence over env vars: if both define `DB_URL`, the secret
+/// value wins. A warning is logged when a secret shadows an env key.
+pub(crate) fn resolve_env_vars_for_app(
+    app_config: &AppConfig,
+    secrets_store: Option<&crate::secrets::SecretsStore>,
+    app_name: &str,
+) -> Vec<String> {
     let mut vars: Vec<String> = app_config
         .env
         .iter()
@@ -659,6 +669,32 @@ fn resolve_env_vars_for_app(app_config: &AppConfig) -> Vec<String> {
             if !line.is_empty() && !line.starts_with('#') {
                 vars.push(line.to_string());
             }
+        }
+    }
+
+    // Inject secrets — they override env vars with matching keys
+    if let Some(store) = secrets_store
+        && let Ok(secrets) = store.get_all(app_name)
+    {
+        let env_keys: std::collections::HashSet<String> = app_config.env.keys().cloned().collect();
+        for (key, value) in &secrets {
+            if env_keys.contains(key) {
+                tracing::warn!(
+                    app = app_name,
+                    key = %key,
+                    "secret overrides env var"
+                );
+            }
+            // Remove any existing entry for this key from vars
+            vars.retain(|v| !v.starts_with(&format!("{key}=")));
+            vars.push(format!("{key}={value}"));
+        }
+        if !secrets.is_empty() {
+            tracing::info!(
+                app = app_name,
+                secret_count = secrets.len(),
+                "injected secrets into env vars"
+            );
         }
     }
 
@@ -1125,6 +1161,7 @@ mod tests {
             app_states,
             deploys,
             credentials: None,
+            secrets_store: None,
         }
     }
 
@@ -2081,5 +2118,130 @@ container = "web"
         let app = states.get("testapp").expect("app state should exist");
         assert_eq!(app.current_tag.as_deref(), Some("v1.0"));
         assert_eq!(app.previous_tag.as_deref(), Some("v2.0"));
+    }
+
+    // ── Secrets injection tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_env_vars_without_secrets() {
+        let app_config = AppConfig {
+            app: AppInfo {
+                name: "testapp".to_string(),
+                image: "ghcr.io/org/testapp".to_string(),
+                secret: None,
+            },
+            routing: RoutingConfig {
+                domain: "testapp.example.com".to_string(),
+                port: 3000,
+            },
+            health: HealthConfig::default(),
+            deploy: DeployConfig::default(),
+            env: HashMap::from([
+                ("KEY_A".to_string(), "val_a".to_string()),
+                ("KEY_B".to_string(), "val_b".to_string()),
+            ]),
+            env_file: None,
+            resources: ResourceConfig::default(),
+            network: crate::config::NetworkConfig::default(),
+            preview: None,
+        };
+
+        let vars = resolve_env_vars_for_app(&app_config, None, "testapp");
+        assert_eq!(vars.len(), 2);
+        assert!(vars.contains(&"KEY_A=val_a".to_string()));
+        assert!(vars.contains(&"KEY_B=val_b".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_env_vars_with_secrets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::secrets::SecretsStore::new(tmp.path().join("secrets")).unwrap();
+        store
+            .set("testapp", "DB_URL", "postgres://secret/db")
+            .unwrap();
+        store.set("testapp", "API_KEY", "sk-secret").unwrap();
+
+        let app_config = AppConfig {
+            app: AppInfo {
+                name: "testapp".to_string(),
+                image: "ghcr.io/org/testapp".to_string(),
+                secret: None,
+            },
+            routing: RoutingConfig {
+                domain: "testapp.example.com".to_string(),
+                port: 3000,
+            },
+            health: HealthConfig::default(),
+            deploy: DeployConfig::default(),
+            env: HashMap::from([("KEY_A".to_string(), "val_a".to_string())]),
+            env_file: None,
+            resources: ResourceConfig::default(),
+            network: crate::config::NetworkConfig::default(),
+            preview: None,
+        };
+
+        let vars = resolve_env_vars_for_app(&app_config, Some(&store), "testapp");
+        assert_eq!(vars.len(), 3);
+        assert!(vars.contains(&"KEY_A=val_a".to_string()));
+        assert!(vars.contains(&"DB_URL=postgres://secret/db".to_string()));
+        assert!(vars.contains(&"API_KEY=sk-secret".to_string()));
+    }
+
+    #[test]
+    fn test_secrets_override_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::secrets::SecretsStore::new(tmp.path().join("secrets")).unwrap();
+        // Secret with the same key as an env var
+        store.set("testapp", "DB_URL", "secret-value").unwrap();
+
+        let app_config = AppConfig {
+            app: AppInfo {
+                name: "testapp".to_string(),
+                image: "ghcr.io/org/testapp".to_string(),
+                secret: None,
+            },
+            routing: RoutingConfig {
+                domain: "testapp.example.com".to_string(),
+                port: 3000,
+            },
+            health: HealthConfig::default(),
+            deploy: DeployConfig::default(),
+            env: HashMap::from([("DB_URL".to_string(), "env-value".to_string())]),
+            env_file: None,
+            resources: ResourceConfig::default(),
+            network: crate::config::NetworkConfig::default(),
+            preview: None,
+        };
+
+        let vars = resolve_env_vars_for_app(&app_config, Some(&store), "testapp");
+        // Only one entry for DB_URL, and it should be the secret value
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0], "DB_URL=secret-value");
+    }
+
+    #[test]
+    fn test_deploy_without_secrets_still_works() {
+        // No secrets store → same behavior as before
+        let app_config = AppConfig {
+            app: AppInfo {
+                name: "testapp".to_string(),
+                image: "ghcr.io/org/testapp".to_string(),
+                secret: None,
+            },
+            routing: RoutingConfig {
+                domain: "testapp.example.com".to_string(),
+                port: 3000,
+            },
+            health: HealthConfig::default(),
+            deploy: DeployConfig::default(),
+            env: HashMap::from([("KEY_A".to_string(), "val_a".to_string())]),
+            env_file: None,
+            resources: ResourceConfig::default(),
+            network: crate::config::NetworkConfig::default(),
+            preview: None,
+        };
+
+        let vars = resolve_env_vars_for_app(&app_config, None, "testapp");
+        assert_eq!(vars, vec!["KEY_A=val_a"]);
     }
 }

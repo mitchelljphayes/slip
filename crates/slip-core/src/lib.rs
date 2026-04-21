@@ -12,6 +12,7 @@ pub mod podman;
 pub mod preview;
 pub mod repo_config;
 pub mod runtime;
+pub mod secrets;
 pub mod state;
 pub mod validate;
 
@@ -36,6 +37,7 @@ pub use podman::PodmanBackend;
 pub use preview::{PersistedPreviewState, PreviewState};
 pub use repo_config::{PreviewConfig, RepoConfig, parse_repo_config};
 pub use runtime::{PodInfo, RegistryCredentials, RuntimeBackend};
+pub use secrets::SecretsStore;
 pub use state::{
     PersistedAppState, delete_preview_state, load_app_states, load_preview_states,
     reconcile_preview_routes, reconcile_routes, save_app_state, save_preview_state,

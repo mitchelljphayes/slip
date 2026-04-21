@@ -24,6 +24,7 @@ use crate::preview::{
     teardown_preview,
 };
 use crate::runtime::{RegistryCredentials, RuntimeBackend};
+use crate::secrets::{SecretsStore, validate_secret_key};
 
 // ─── Request / Response types ─────────────────────────────────────────────────
 
@@ -164,6 +165,24 @@ pub struct RollbackRequest {
     pub to: Option<String>,
 }
 
+/// Request body for `PUT /v1/apps/{name}/secrets`.
+#[derive(Debug, Deserialize)]
+pub struct SetSecretsRequest {
+    pub secrets: HashMap<String, String>,
+}
+
+/// Response for `PUT /v1/apps/{name}/secrets` — lists keys that were set.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetSecretsResponse {
+    pub set: Vec<String>,
+}
+
+/// Response for `GET /v1/apps/{name}/secrets` — key names only, never values.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SecretsListResponse {
+    pub secrets: Vec<String>,
+}
+
 /// Validate tag format (non-empty, valid charset for Docker container names).
 fn validate_tag(tag: &str) -> Result<(), AppError> {
     if tag.is_empty() {
@@ -287,6 +306,8 @@ pub struct AppState {
     /// Keyed by `"{app}:{preview_id}"`. Allows preview deploys to run concurrently
     /// with production deploys and other previews.
     pub preview_locks: DashMap<String, Arc<Mutex<()>>>,
+    /// File-system backed secret storage (one file per secret with 0o600 perms).
+    pub secrets_store: SecretsStore,
 }
 
 impl AppState {
@@ -327,6 +348,14 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         .route(
             "/v1/apps/{name}/rollback",
             axum::routing::post(handle_rollback),
+        )
+        .route(
+            "/v1/apps/{name}/secrets",
+            axum::routing::get(handle_list_secrets).put(handle_set_secrets),
+        )
+        .route(
+            "/v1/apps/{name}/secrets/{key}",
+            axum::routing::delete(handle_remove_secret),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -608,6 +637,11 @@ async fn handle_delete_app(
     // Remove app state
     state.app_states.write().await.remove(&name);
 
+    // Remove secrets
+    if let Err(e) = state.secrets_store.remove_all(&name) {
+        warn!(app = %name, error = %e, "failed to remove secrets during app deletion");
+    }
+
     // Delete config file
     let config_dir = state.config_dir.clone();
     let name_clone = name.clone();
@@ -707,6 +741,109 @@ async fn handle_rollback(
     });
 
     Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+// ─── Secrets handlers ─────────────────────────────────────────────────────────
+
+/// `GET /v1/apps/{name}/secrets` — List secret key names for an app.
+///
+/// Values are never returned.
+async fn handle_list_secrets(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<(StatusCode, Json<SecretsListResponse>), AppError> {
+    // Verify app exists
+    {
+        let apps = state.apps.read().await;
+        if !apps.contains_key(&name) {
+            return Err(AppError::NotFound(format!("app '{}' not found", name)));
+        }
+    }
+
+    let keys = state
+        .secrets_store
+        .list(&name)
+        .map_err(|e| AppError::Internal(format!("failed to list secrets: {e}")))?;
+
+    Ok((StatusCode::OK, Json(SecretsListResponse { secrets: keys })))
+}
+
+/// `PUT /v1/apps/{name}/secrets` — Set (bulk) secrets for an app.
+///
+/// Each key name is validated. Values are stored but never returned in the
+/// response — only the list of keys that were set.
+async fn handle_set_secrets(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<SetSecretsRequest>,
+) -> Result<(StatusCode, Json<SetSecretsResponse>), AppError> {
+    // Verify app exists
+    {
+        let apps = state.apps.read().await;
+        if !apps.contains_key(&name) {
+            return Err(AppError::NotFound(format!("app '{}' not found", name)));
+        }
+    }
+
+    // Validate all key names before writing any
+    for key in req.secrets.keys() {
+        if let Err(msg) = validate_secret_key(key) {
+            return Err(AppError::BadRequest(format!(
+                "invalid secret key '{}': {msg}",
+                key
+            )));
+        }
+    }
+
+    // Write each secret
+    let mut set_keys: Vec<String> = Vec::with_capacity(req.secrets.len());
+    for (key, value) in &req.secrets {
+        state
+            .secrets_store
+            .set(&name, key, value)
+            .map_err(|e| AppError::Internal(format!("failed to set secret: {e}")))?;
+        set_keys.push(key.clone());
+    }
+
+    set_keys.sort();
+
+    info!(
+        app = %name,
+        key_count = set_keys.len(),
+        "secrets updated"
+    );
+
+    Ok((StatusCode::OK, Json(SetSecretsResponse { set: set_keys })))
+}
+
+/// `DELETE /v1/apps/{name}/secrets/{key}` — Remove a single secret.
+async fn handle_remove_secret(
+    State(state): State<Arc<AppState>>,
+    Path((name, key)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    // Verify app exists
+    {
+        let apps = state.apps.read().await;
+        if !apps.contains_key(&name) {
+            return Err(AppError::NotFound(format!("app '{}' not found", name)));
+        }
+    }
+
+    let existed = state
+        .secrets_store
+        .remove(&name, &key)
+        .map_err(|e| AppError::Internal(format!("failed to remove secret: {e}")))?;
+
+    if !existed {
+        return Err(AppError::NotFound(format!(
+            "secret '{}' not found for app '{}'",
+            key, name
+        )));
+    }
+
+    info!(app = %name, key = %key, "secret removed");
+
+    Ok((StatusCode::OK, Json(serde_json::json!({"status": "ok"}))))
 }
 
 // ─── Deploy handler ───────────────────────────────────────────────────────────
@@ -1151,6 +1288,7 @@ mod tests {
     use crate::deploy::{AppRuntimeState, AppStatus, DeployContext, DeployStatus, TriggerSource};
     use crate::docker::DockerClient;
     use crate::health::HealthChecker;
+    use crate::secrets::SecretsStore;
 
     const GLOBAL_SECRET: &str = "global-secret";
     const APP_SECRET: &str = "app-secret";
@@ -1195,9 +1333,18 @@ mod tests {
     }
 
     /// Build an `Arc<AppState>` for tests. Uses per-app secret when `use_app_secret` is true.
+    ///
+    /// Each call creates a fresh tempdir for the secrets store, avoiding
+    /// interference between parallel tests.
     fn create_test_state() -> Arc<AppState> {
         let mut apps = HashMap::new();
         apps.insert(APP_NAME.to_string(), test_app_config(Some(APP_SECRET)));
+
+        let secrets_tmp = tempfile::tempdir().expect("tempdir for secrets");
+        let secrets_path = secrets_tmp.path().to_path_buf();
+        // Leak the TempDir so it survives for the test duration.
+        // This is acceptable in test code — the OS cleans up /tmp on reboot.
+        Box::leak(Box::new(secrets_tmp));
 
         Arc::new(AppState {
             config: test_slip_config(),
@@ -1214,6 +1361,7 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            secrets_store: SecretsStore::new(secrets_path).unwrap(),
         })
     }
 
@@ -1468,6 +1616,13 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            secrets_store: SecretsStore::new({
+                let t = tempfile::tempdir().expect("tempdir for secrets");
+                let p = t.path().to_path_buf();
+                Box::leak(Box::new(t));
+                p
+            })
+            .unwrap(),
         });
 
         let app = build_router(state_inner);
@@ -1516,6 +1671,13 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            secrets_store: SecretsStore::new({
+                let t = tempfile::tempdir().expect("tempdir for secrets");
+                let p = t.path().to_path_buf();
+                Box::leak(Box::new(t));
+                p
+            })
+            .unwrap(),
         });
 
         let app = build_router(state);
@@ -1716,6 +1878,13 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            secrets_store: SecretsStore::new({
+                let t = tempfile::tempdir().expect("tempdir for secrets");
+                let p = t.path().to_path_buf();
+                Box::leak(Box::new(t));
+                p
+            })
+            .unwrap(),
         });
 
         let app = build_router(state);
@@ -2097,6 +2266,13 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            secrets_store: SecretsStore::new({
+                let t = tempfile::tempdir().expect("tempdir for secrets");
+                let p = t.path().to_path_buf();
+                Box::leak(Box::new(t));
+                p
+            })
+            .unwrap(),
         });
 
         let app = build_router(state);
@@ -2259,6 +2435,13 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            secrets_store: SecretsStore::new({
+                let t = tempfile::tempdir().expect("tempdir for secrets");
+                let p = t.path().to_path_buf();
+                Box::leak(Box::new(t));
+                p
+            })
+            .unwrap(),
         });
         let app = build_router(state);
 
@@ -2359,6 +2542,13 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            secrets_store: SecretsStore::new({
+                let t = tempfile::tempdir().expect("tempdir for secrets");
+                let p = t.path().to_path_buf();
+                Box::leak(Box::new(t));
+                p
+            })
+            .unwrap(),
         });
         let app = build_router(state.clone());
 
@@ -2658,6 +2848,13 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            secrets_store: SecretsStore::new({
+                let t = tempfile::tempdir().expect("tempdir for secrets");
+                let p = t.path().to_path_buf();
+                Box::leak(Box::new(t));
+                p
+            })
+            .unwrap(),
         });
 
         let app = build_router(state);
@@ -2721,6 +2918,264 @@ mod tests {
         assert_eq!(
             payload.tag, "v1.0",
             "rollback should target previous_tag v1.0"
+        );
+    }
+
+    // ── Secrets API tests ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_secrets_empty() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/secrets"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: crate::api::SecretsListResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(payload.secrets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_set_and_list_secrets() {
+        let state = create_test_state();
+
+        // Set two secrets
+        let body = serde_json::json!({
+            "secrets": {
+                "DB_URL": "postgres://localhost/db",
+                "API_KEY": "sk-12345"
+            }
+        });
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/apps/{APP_NAME}/secrets"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let app = build_router(state.clone());
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: crate::api::SetSecretsResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload.set, vec!["API_KEY", "DB_URL"]); // sorted
+
+        // List secrets — should return key names only (use same state)
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/secrets"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let app2 = build_router(state);
+        let response = app2.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: crate::api::SecretsListResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload.secrets, vec!["API_KEY", "DB_URL"]);
+    }
+
+    #[tokio::test]
+    async fn test_set_secrets_response_never_contains_values() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "secrets": {
+                "MY_KEY": "super-secret-value-never-to-be-exposed"
+            }
+        });
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/apps/{APP_NAME}/secrets"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_text = String::from_utf8(bytes.to_vec()).unwrap();
+        // The response should not contain the secret value
+        assert!(
+            !response_text.contains("super-secret-value-never-to-be-exposed"),
+            "secrets response must not contain values"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_secret() {
+        let state = create_test_state();
+
+        // Set a secret first
+        let body = serde_json::json!({
+            "secrets": {
+                "TO_DELETE": "value"
+            }
+        });
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/apps/{APP_NAME}/secrets"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let app = build_router(state.clone());
+        let _ = app.oneshot(request).await.unwrap();
+
+        // Now delete it (use same state)
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/apps/{APP_NAME}/secrets/TO_DELETE"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let app2 = build_router(state);
+        let response = app2.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_remove_nonexistent_secret_returns_404() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/apps/{APP_NAME}/secrets/NONEXISTENT"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_secrets_require_auth() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        // No auth header
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/secrets"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_secrets_unknown_app_returns_404() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/apps/nonexistent/secrets")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_secrets_invalid_key_returns_400() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "secrets": {
+                "bad-key-name": "value"
+            }
+        });
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/apps/{APP_NAME}/secrets"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_delete_app_cleans_up_secrets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets_store = SecretsStore::new(tmp.path().join("secrets")).unwrap();
+
+        let mut apps = HashMap::new();
+        apps.insert(APP_NAME.to_string(), test_app_config(Some(APP_SECRET)));
+
+        let state = Arc::new(AppState {
+            config: test_slip_config(),
+            apps: RwLock::new(apps),
+            config_dir: PathBuf::from("/tmp/slip-test"),
+            deploy_locks: DashMap::new(),
+            runtime: Arc::new(
+                DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            ),
+            caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
+            health: HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
+            started_at: Utc::now(),
+            preview_states: Arc::new(DashMap::new()),
+            preview_locks: DashMap::new(),
+            secrets_store: secrets_store.clone(),
+        });
+
+        // Set a secret via the store directly
+        state
+            .secrets_store
+            .set(APP_NAME, "MY_KEY", "my_value")
+            .unwrap();
+        assert!(state.secrets_store.list(APP_NAME).unwrap().len() == 1);
+
+        let app = build_router(state.clone());
+
+        // Delete the app
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/apps/{APP_NAME}"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify secrets directory was cleaned up
+        assert!(
+            state.secrets_store.list(APP_NAME).unwrap().is_empty(),
+            "secrets should be removed when app is deleted"
         );
     }
 }

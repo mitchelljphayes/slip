@@ -415,6 +415,8 @@ pub(crate) struct PreviewSharedState {
     pub preview_states: Arc<DashMap<String, PreviewState>>,
     pub storage_path: PathBuf,
     pub credentials: Option<RegistryCredentials>,
+    /// Secrets store for injecting secrets into preview env vars.
+    pub secrets_store: Option<crate::secrets::SecretsStore>,
 }
 
 // ─── Helper: set preview status ───────────────────────────────────────────────
@@ -472,6 +474,7 @@ pub async fn execute_preview_deploy(state: Arc<crate::api::AppState>, ctx: Previ
         preview_states: state.preview_states.clone(),
         storage_path: state.config.storage.path.clone(),
         credentials: state.registry_credentials(),
+        secrets_store: Some(state.secrets_store.clone()),
     };
 
     if let Err(e) = execute_preview_deploy_inner(
@@ -778,11 +781,11 @@ pub(crate) async fn execute_preview_deploy_inner(
     // ── START ─────────────────────────────────────────────────────────────────
     update_preview_deploy_status(&shared.preview_states, &state_key, DeployStatus::Starting);
 
-    let env_vars: Vec<String> = effective_config
-        .env
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect();
+    let env_vars = crate::deploy::resolve_env_vars_for_app(
+        &effective_config,
+        shared.secrets_store.as_ref(),
+        app_name,
+    );
 
     let is_pod = merged.kind == "pod";
 
@@ -1721,6 +1724,7 @@ enabled = {enabled}
             preview_states,
             storage_path: tmp.path().to_path_buf(),
             credentials: None,
+            secrets_store: None,
         }
     }
 
@@ -2255,6 +2259,7 @@ enabled = {enabled}
             preview_states: preview_states.clone(),
             storage_path: tmp.path().to_path_buf(),
             credentials: None,
+            secrets_store: None,
         };
         let ctx = test_preview_ctx(); // preview_id = "pr-42"
 
@@ -2304,6 +2309,7 @@ enabled = {enabled}
             preview_states: preview_states.clone(),
             storage_path: tmp.path().to_path_buf(),
             credentials: None,
+            secrets_store: None,
         };
         let ctx = test_preview_ctx(); // preview_id = "pr-42"
 
@@ -2337,6 +2343,7 @@ enabled = {enabled}
             preview_states: preview_states.clone(),
             storage_path: tmp.path().to_path_buf(),
             credentials: None,
+            secrets_store: None,
         };
         let ctx = test_preview_ctx();
 
@@ -2779,6 +2786,7 @@ max = {max}
             preview_states: preview_states.clone(),
             storage_path: tmp.path().to_path_buf(),
             credentials: None,
+            secrets_store: None,
         };
         let ctx = test_preview_ctx();
 

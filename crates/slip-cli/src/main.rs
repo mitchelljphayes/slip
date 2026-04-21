@@ -64,6 +64,9 @@ enum Commands {
         #[arg(long)]
         strict: bool,
     },
+    /// Manage application secrets.
+    #[command(subcommand)]
+    Secrets(SecretsCommands),
 }
 
 #[derive(Subcommand)]
@@ -115,6 +118,30 @@ enum AppsCommands {
         /// Skip confirmation prompt.
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretsCommands {
+    /// List secret keys for an app.
+    List {
+        /// App name.
+        app: String,
+    },
+    /// Set one or more secrets for an app.
+    Set {
+        /// App name.
+        app: String,
+        /// Secret key=value pairs (e.g. KEY=VALUE).
+        #[arg(value_parser = parse_key_val, num_args = 1..)]
+        pairs: Vec<(String, String)>,
+    },
+    /// Remove a secret from an app.
+    Rm {
+        /// App name.
+        app: String,
+        /// Secret key to remove.
+        key: String,
     },
 }
 
@@ -182,6 +209,16 @@ struct DeployResponse {
     tag: String,
     #[allow(dead_code)]
     status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SecretsListResponse {
+    secrets: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetSecretsResponse {
+    set: Vec<String>,
 }
 
 // ─── HTTP client helpers ──────────────────────────────────────────────────────
@@ -393,6 +430,56 @@ async fn rollback(
     Ok(())
 }
 
+// ─── Secrets subcommand implementations ──────────────────────────────────────────
+
+async fn secrets_list(server: &str, token: &str, app: &str) -> Result<(), anyhow::Error> {
+    let client = create_client();
+    let url = format!("{server}/v1/apps/{app}/secrets");
+    let resp = api_request(&client, reqwest::Method::GET, &url, token, None).await?;
+    let data: SecretsListResponse = resp.json().await.context("failed to parse response")?;
+
+    if data.secrets.is_empty() {
+        println!("No secrets set for '{}'.", app);
+        return Ok(());
+    }
+
+    for key in &data.secrets {
+        println!("{key}");
+    }
+
+    Ok(())
+}
+
+async fn secrets_set(
+    server: &str,
+    token: &str,
+    app: &str,
+    pairs: Vec<(String, String)>,
+) -> Result<(), anyhow::Error> {
+    let client = create_client();
+    let url = format!("{server}/v1/apps/{app}/secrets");
+
+    let secrets: HashMap<String, String> = pairs.into_iter().collect();
+    let body = serde_json::json!({ "secrets": secrets });
+
+    let resp = api_request(&client, reqwest::Method::PUT, &url, token, Some(&body)).await?;
+
+    let data: SetSecretsResponse = resp.json().await.context("failed to parse response")?;
+    println!("✓ Set {} secret(s) for '{}'", data.set.len(), app);
+
+    Ok(())
+}
+
+async fn secrets_rm(server: &str, token: &str, app: &str, key: &str) -> Result<(), anyhow::Error> {
+    let client = create_client();
+    let url = format!("{server}/v1/apps/{app}/secrets/{key}");
+
+    api_request(&client, reqwest::Method::DELETE, &url, token, None).await?;
+
+    println!("✓ Removed secret '{}' from '{}'", key, app);
+    Ok(())
+}
+
 // ─── Main entry point ──────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -528,6 +615,22 @@ async fn main() -> anyhow::Result<()> {
                             "disabled"
                         }
                     );
+                }
+            }
+        }
+        Commands::Secrets(command) => {
+            let token = cli.token.context(
+                "SLIP_TOKEN is required for secrets commands. Set --token or SLIP_TOKEN env var.",
+            )?;
+            match command {
+                SecretsCommands::List { app } => {
+                    secrets_list(&cli.server, &token, &app).await?;
+                }
+                SecretsCommands::Set { app, pairs } => {
+                    secrets_set(&cli.server, &token, &app, pairs).await?;
+                }
+                SecretsCommands::Rm { app, key } => {
+                    secrets_rm(&cli.server, &token, &app, &key).await?;
                 }
             }
         }
