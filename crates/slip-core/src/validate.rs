@@ -136,10 +136,8 @@ pub fn validate_repo_config(config: &RepoConfig, base_dir: &Path) -> ValidationR
                 }
             }
         },
-        "container" => {
-            if config.app.manifest.is_some() {
-                result.add_warning("manifest is ignored for container kind".to_string());
-            }
+        "container" if config.app.manifest.is_some() => {
+            result.add_warning("manifest is ignored for container kind".to_string());
         }
         _ => {
             // Unknown kind - could warn, but for now just pass
