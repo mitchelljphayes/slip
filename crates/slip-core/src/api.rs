@@ -183,6 +183,12 @@ pub struct SecretsListResponse {
     pub secrets: Vec<String>,
 }
 
+/// Response for `DELETE /v1/previews/{app}` — IDs of torn-down previews.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TeardownAllResponse {
+    pub torn_down: Vec<String>,
+}
+
 /// Validate tag format (non-empty, valid charset for Docker container names).
 fn validate_tag(tag: &str) -> Result<(), AppError> {
     if tag.is_empty() {
@@ -372,7 +378,7 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         )
         .route(
             "/v1/previews/{app}",
-            axum::routing::get(handle_list_previews),
+            axum::routing::get(handle_list_previews).delete(handle_preview_teardown_all),
         )
         .route(
             "/v1/previews/{app}/{preview_id}",
@@ -419,6 +425,57 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
         return false;
     }
     a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+/// Verify authentication for preview endpoints.
+///
+/// Accepts either:
+/// - `Authorization: Bearer {token}` — validated against the management auth secret
+/// - `X-Slip-Signature` — HMAC-SHA256 validated against the app's secret (or global fallback)
+///
+/// The `hmac_body` parameter is the data to verify the HMAC signature over
+/// (e.g. `format!("{app}:{preview_id}")` for single teardown,
+/// `format!("{app}:*")` for teardown-all).
+async fn verify_preview_auth(
+    headers: &axum::http::HeaderMap,
+    state: &AppState,
+    app: &str,
+    hmac_body: &str,
+) -> Result<(), AppError> {
+    // 1. Try Bearer token first.
+    if let Some(auth_header) = headers.get("Authorization").and_then(|v| v.to_str().ok())
+        && let Some(token) = auth_header.strip_prefix("Bearer ")
+        && constant_time_eq(token, &state.config.auth.secret)
+    {
+        return Ok(());
+    }
+
+    // 2. Fall back to HMAC signature.
+    if let Some(sig_header) = headers
+        .get("X-Slip-Signature")
+        .and_then(|v| v.to_str().ok())
+    {
+        let app_cfg = state
+            .apps
+            .read()
+            .await
+            .get(app)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("unknown app: {app}")))?;
+
+        let secret = resolve_secret(app_cfg.app.secret.as_deref(), &state.config.auth.secret);
+
+        if verify_signature(sig_header, hmac_body.as_bytes(), secret) {
+            return Ok(());
+        }
+
+        warn!(app = %app, "preview auth rejected: invalid HMAC signature");
+        return Err(AppError::Unauthorized("invalid signature".to_string()));
+    }
+
+    Err(AppError::Unauthorized(
+        "missing Authorization or X-Slip-Signature header".to_string(),
+    ))
 }
 
 // ─── Management API handlers ───────────────────────────────────────────────────
@@ -1183,34 +1240,20 @@ fn to_preview_response(state: &PreviewState) -> PreviewStatusResponse {
 /// `DELETE /v1/previews/:app/:preview_id`
 ///
 /// Tears down a preview deployment: stops container/pod, removes Caddy route,
-/// clears state. Requires HMAC authentication (same as deploy endpoint).
+/// clears state. Accepts either Bearer token or HMAC signature authentication.
 async fn handle_preview_teardown(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Path((app, preview_id)): Path<(String, String)>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    // Validate HMAC signature.
-    let sig_header = headers
-        .get("X-Slip-Signature")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| AppError::Unauthorized("missing X-Slip-Signature header".to_string()))?;
-
-    let app_cfg = state
-        .apps
-        .read()
-        .await
-        .get(&app)
-        .cloned()
-        .ok_or_else(|| AppError::NotFound(format!("unknown app: {app}")))?;
-
-    let secret = resolve_secret(app_cfg.app.secret.as_deref(), &state.config.auth.secret);
-
-    // Sign over the path params (app + preview_id concatenated as the "body").
-    let body = format!("{app}:{preview_id}");
-    if !verify_signature(sig_header, body.as_bytes(), secret) {
-        warn!(app = %app, preview_id = %preview_id, "preview teardown rejected: invalid signature");
-        return Err(AppError::Unauthorized("invalid signature".to_string()));
+    // Validate app exists.
+    if !state.apps.read().await.contains_key(&app) {
+        return Err(AppError::NotFound(format!("unknown app: {app}")));
     }
+
+    // Verify auth (Bearer token or HMAC).
+    let hmac_body = format!("{app}:{preview_id}");
+    verify_preview_auth(&headers, &state, &app, &hmac_body).await?;
 
     teardown_preview(
         state.runtime.as_ref(),
@@ -1229,10 +1272,16 @@ async fn handle_preview_teardown(
 /// `GET /v1/previews/:app`
 ///
 /// Returns a list of all active previews for an app. No auth required (read-only).
+/// Returns 404 if the app is not registered.
 async fn handle_list_previews(
     State(state): State<Arc<AppState>>,
     Path(app): Path<String>,
-) -> (StatusCode, Json<Vec<PreviewStatusResponse>>) {
+) -> Result<(StatusCode, Json<Vec<PreviewStatusResponse>>), AppError> {
+    // Validate app exists.
+    if !state.apps.read().await.contains_key(&app) {
+        return Err(AppError::NotFound(format!("unknown app: {app}")));
+    }
+
     let prefix = format!("{app}:");
     let previews: Vec<PreviewStatusResponse> = state
         .preview_states
@@ -1241,22 +1290,82 @@ async fn handle_list_previews(
         .map(|entry| to_preview_response(entry.value()))
         .collect();
 
-    (StatusCode::OK, Json(previews))
+    Ok((StatusCode::OK, Json(previews)))
 }
 
 /// `GET /v1/previews/:app/:preview_id`
 ///
 /// Returns the status of a single preview. No auth required (read-only).
+/// Returns 404 if the app is not registered.
 async fn handle_preview_status(
     State(state): State<Arc<AppState>>,
     Path((app, preview_id)): Path<(String, String)>,
 ) -> Result<(StatusCode, Json<PreviewStatusResponse>), AppError> {
+    // Validate app exists.
+    if !state.apps.read().await.contains_key(&app) {
+        return Err(AppError::NotFound(format!("unknown app: {app}")));
+    }
+
     let key = format!("{app}:{preview_id}");
     let entry = state.preview_states.get(&key).ok_or_else(|| {
         AppError::NotFound(format!("preview '{preview_id}' not found for app '{app}'"))
     })?;
 
     Ok((StatusCode::OK, Json(to_preview_response(&entry))))
+}
+
+/// `DELETE /v1/previews/:app`
+///
+/// Tears down all preview deployments for an app. Accepts either Bearer token
+/// or HMAC signature authentication. Returns the list of torn-down preview IDs.
+async fn handle_preview_teardown_all(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(app): Path<String>,
+) -> Result<(StatusCode, Json<TeardownAllResponse>), AppError> {
+    // Validate app exists.
+    if !state.apps.read().await.contains_key(&app) {
+        return Err(AppError::NotFound(format!("unknown app: {app}")));
+    }
+
+    // Verify auth (Bearer token or HMAC).
+    let hmac_body = format!("{app}:*");
+    verify_preview_auth(&headers, &state, &app, &hmac_body).await?;
+
+    // Collect all preview IDs for this app.
+    let prefix = format!("{app}:");
+    let preview_ids: Vec<String> = state
+        .preview_states
+        .iter()
+        .filter(|entry| entry.key().starts_with(&prefix))
+        .map(|entry| entry.value().preview_id.clone())
+        .collect();
+
+    // Tear down each preview. Collect successfully torn-down IDs.
+    let mut torn_down = Vec::new();
+    for preview_id in &preview_ids {
+        if let Err(e) = teardown_preview(
+            state.runtime.as_ref(),
+            &state.caddy,
+            &state.preview_states,
+            &state.config.storage.path,
+            &app,
+            preview_id,
+        )
+        .await
+        {
+            warn!(
+                app = %app,
+                preview_id = %preview_id,
+                error = %e,
+                "teardown-all: individual teardown failed (continuing)"
+            );
+        } else {
+            torn_down.push(preview_id.clone());
+        }
+    }
+
+    Ok((StatusCode::OK, Json(TeardownAllResponse { torn_down })))
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -3177,5 +3286,252 @@ mod tests {
             state.secrets_store.list(APP_NAME).unwrap().is_empty(),
             "secrets should be removed when app is deleted"
         );
+    }
+
+    // ── Preview dual-auth and teardown-all tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_previews_unknown_app_returns_404() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/previews/nonexistent")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(payload.error.contains("nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn test_preview_teardown_with_bearer_token() {
+        use crate::deploy::AppStatus;
+        use crate::preview::PreviewState;
+
+        let state = create_test_state();
+
+        // Insert a preview.
+        state.preview_states.insert(
+            format!("{APP_NAME}:pr-bearer"),
+            PreviewState {
+                preview_id: "pr-bearer".to_string(),
+                app: APP_NAME.to_string(),
+                sha: "abc".to_string(),
+                status: AppStatus::Running,
+                container_id: None,
+                pod_name: None,
+                port: Some(54321),
+                tag: Some("v1".to_string()),
+                deployed_at: Utc::now(),
+                expires_at: None,
+                domain: "pr-bearer.preview.example.com".to_string(),
+                manifest_path: None,
+                deploy_id: None,
+            },
+        );
+
+        let app = build_router(state.clone());
+
+        // DELETE with Bearer token (no X-Slip-Signature).
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/previews/{APP_NAME}/pr-bearer"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify preview was removed from state.
+        assert!(
+            state
+                .preview_states
+                .get(&format!("{APP_NAME}:pr-bearer"))
+                .is_none(),
+            "preview should be removed after teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_preview_teardown_still_accepts_hmac() {
+        // Verify backward compatibility: HMAC auth still works.
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let body = format!("{APP_NAME}:pr-99");
+        let sig = sig_header(body.as_bytes(), APP_SECRET);
+
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/previews/{APP_NAME}/pr-99"))
+            .header("X-Slip-Signature", sig)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_teardown_all_previews_empty() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        // DELETE /v1/previews/{app} with Bearer token — no previews exist.
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/previews/{APP_NAME}"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: crate::api::TeardownAllResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(payload.torn_down.is_empty(), "should have no torn_down IDs");
+    }
+
+    #[tokio::test]
+    async fn test_teardown_all_previews_with_entries() {
+        use crate::deploy::AppStatus;
+        use crate::preview::PreviewState;
+
+        let state = create_test_state();
+
+        // Insert two previews.
+        state.preview_states.insert(
+            format!("{APP_NAME}:pr-a1"),
+            PreviewState {
+                preview_id: "pr-a1".to_string(),
+                app: APP_NAME.to_string(),
+                sha: "sha1".to_string(),
+                status: AppStatus::Running,
+                container_id: None,
+                pod_name: None,
+                port: Some(54001),
+                tag: Some("v1".to_string()),
+                deployed_at: Utc::now(),
+                expires_at: None,
+                domain: "pr-a1.preview.example.com".to_string(),
+                manifest_path: None,
+                deploy_id: None,
+            },
+        );
+        state.preview_states.insert(
+            format!("{APP_NAME}:pr-a2"),
+            PreviewState {
+                preview_id: "pr-a2".to_string(),
+                app: APP_NAME.to_string(),
+                sha: "sha2".to_string(),
+                status: AppStatus::Running,
+                container_id: None,
+                pod_name: None,
+                port: Some(54002),
+                tag: Some("v2".to_string()),
+                deployed_at: Utc::now(),
+                expires_at: None,
+                domain: "pr-a2.preview.example.com".to_string(),
+                manifest_path: None,
+                deploy_id: None,
+            },
+        );
+
+        let app = build_router(state.clone());
+
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/previews/{APP_NAME}"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: crate::api::TeardownAllResponse = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            payload.torn_down.len(),
+            2,
+            "should have torn down 2 previews"
+        );
+        assert!(payload.torn_down.contains(&"pr-a1".to_string()));
+        assert!(payload.torn_down.contains(&"pr-a2".to_string()));
+
+        // Verify state is cleared.
+        let prefix = format!("{APP_NAME}:");
+        let remaining: Vec<String> = state
+            .preview_states
+            .iter()
+            .filter(|e| e.key().starts_with(&prefix))
+            .map(|e| e.key().to_string())
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "all previews should be removed from state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_teardown_all_requires_auth() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        // DELETE /v1/previews/{app} without any auth header.
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/previews/{APP_NAME}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_teardown_all_unknown_app_returns_404() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/v1/previews/nonexistent")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_preview_status_unknown_app_returns_404() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/previews/nonexistent/some-preview")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

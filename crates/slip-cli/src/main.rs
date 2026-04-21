@@ -67,6 +67,9 @@ enum Commands {
     /// Manage application secrets.
     #[command(subcommand)]
     Secrets(SecretsCommands),
+    /// Manage preview deployments.
+    #[command(subcommand)]
+    Previews(PreviewsCommands),
 }
 
 #[derive(Subcommand)]
@@ -145,6 +148,25 @@ enum SecretsCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum PreviewsCommands {
+    /// List active previews for an app.
+    List {
+        /// App name.
+        app: String,
+    },
+    /// Tear down preview deployments.
+    Teardown {
+        /// App name.
+        app: String,
+        /// Preview ID to tear down.
+        preview: Option<String>,
+        /// Tear down all previews for the app.
+        #[arg(long)]
+        all: bool,
+    },
+}
+
 /// Parse a KEY=VALUE pair.
 fn parse_key_val(s: &str) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
     let pos = s
@@ -219,6 +241,22 @@ struct SecretsListResponse {
 #[derive(Debug, Deserialize)]
 struct SetSecretsResponse {
     set: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PreviewListItem {
+    preview_id: String,
+    tag: Option<String>,
+    deployed_at: String,
+    expires_at: Option<String>,
+    domain: String,
+    #[allow(dead_code)]
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeardownAllResponse {
+    torn_down: Vec<String>,
 }
 
 // ─── HTTP client helpers ──────────────────────────────────────────────────────
@@ -480,6 +518,128 @@ async fn secrets_rm(server: &str, token: &str, app: &str, key: &str) -> Result<(
     Ok(())
 }
 
+// ─── Previews subcommand implementations ────────────────────────────────────────
+
+/// Format a duration as a human-readable age string.
+///
+/// - < 60 minutes → `"{m}m"`
+/// - < 24 hours   → `"{h}h"`
+/// - otherwise    → `"{d}d"`
+fn format_age(deployed_at_str: &str) -> String {
+    let deployed = match chrono::DateTime::parse_from_rfc3339(deployed_at_str) {
+        Ok(dt) => dt.with_timezone(&chrono::Utc),
+        Err(_) => return "—".to_string(),
+    };
+    let elapsed = chrono::Utc::now() - deployed;
+    let total_mins = elapsed.num_minutes();
+    if total_mins < 60 {
+        format!("{total_mins}m")
+    } else if total_mins < 60 * 24 {
+        format!("{}h", elapsed.num_hours())
+    } else {
+        format!("{}d", elapsed.num_days())
+    }
+}
+
+/// Format TTL (time until expiry) as a human-readable string.
+///
+/// - `None`       → `"—"` (no expiry)
+/// - Expired      → `"expired"`
+/// - Otherwise    → `"{duration} left"` using same format as age
+fn format_ttl(expires_at: Option<&str>) -> String {
+    let expires_str = match expires_at {
+        Some(s) => s,
+        None => return "—".to_string(),
+    };
+
+    let expires = match chrono::DateTime::parse_from_rfc3339(expires_str) {
+        Ok(dt) => dt.with_timezone(&chrono::Utc),
+        Err(_) => return "—".to_string(),
+    };
+
+    let remaining = expires - chrono::Utc::now();
+    if remaining.num_seconds() <= 0 {
+        return "expired".to_string();
+    }
+
+    let total_mins = remaining.num_minutes();
+    if total_mins < 60 {
+        format!("{}m left", remaining.num_minutes())
+    } else if total_mins < 60 * 24 {
+        format!("{}h left", remaining.num_hours())
+    } else {
+        format!("{}d left", remaining.num_days())
+    }
+}
+
+async fn previews_list(server: &str, token: &str, app: &str) -> Result<(), anyhow::Error> {
+    let client = create_client();
+    let url = format!("{server}/v1/previews/{app}");
+    let resp = api_request(&client, reqwest::Method::GET, &url, token, None).await?;
+    let data: Vec<PreviewListItem> = resp.json().await.context("failed to parse response")?;
+
+    if data.is_empty() {
+        println!("No active previews for '{app}'.");
+        return Ok(());
+    }
+
+    // Print table header
+    println!(
+        "{:<20} {:<12} {:<8} {:<14} URL",
+        "PREVIEW", "TAG", "AGE", "TTL"
+    );
+    println!("{}", "-".repeat(70));
+
+    for item in &data {
+        let tag_display = match &item.tag {
+            Some(t) if t.len() > 10 => format!("{}...", &t[..7]),
+            Some(t) => t.clone(),
+            None => "—".to_string(),
+        };
+        let age = format_age(&item.deployed_at);
+        let ttl = format_ttl(item.expires_at.as_deref());
+        println!(
+            "{:<20} {:<12} {:<8} {:<14} {}",
+            item.preview_id, tag_display, age, ttl, item.domain
+        );
+    }
+
+    Ok(())
+}
+
+async fn previews_teardown(
+    server: &str,
+    token: &str,
+    app: &str,
+    preview: Option<String>,
+    all: bool,
+) -> Result<(), anyhow::Error> {
+    if !all && preview.is_none() {
+        anyhow::bail!("Specify a preview name or use --all");
+    }
+    if all && preview.is_some() {
+        anyhow::bail!("Cannot specify both a preview name and --all");
+    }
+
+    let client = create_client();
+
+    if all {
+        let url = format!("{server}/v1/previews/{app}");
+        let resp = api_request(&client, reqwest::Method::DELETE, &url, token, None).await?;
+        let data: TeardownAllResponse = resp.json().await.context("failed to parse response")?;
+        let n = data.torn_down.len();
+        let ids = data.torn_down.join(", ");
+        println!("✓ Torn down {n} preview(s) for '{app}': {ids}");
+    } else {
+        let preview_id = preview.as_deref().unwrap();
+        let url = format!("{server}/v1/previews/{app}/{preview_id}");
+        api_request(&client, reqwest::Method::DELETE, &url, token, None).await?;
+        println!("✓ Torn down preview '{preview_id}' for '{app}'");
+    }
+
+    Ok(())
+}
+
 // ─── Main entry point ──────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -631,6 +791,19 @@ async fn main() -> anyhow::Result<()> {
                 }
                 SecretsCommands::Rm { app, key } => {
                     secrets_rm(&cli.server, &token, &app, &key).await?;
+                }
+            }
+        }
+        Commands::Previews(command) => {
+            let token = cli.token.context(
+                "SLIP_TOKEN is required for previews commands. Set --token or SLIP_TOKEN env var.",
+            )?;
+            match command {
+                PreviewsCommands::List { app } => {
+                    previews_list(&cli.server, &token, &app).await?;
+                }
+                PreviewsCommands::Teardown { app, preview, all } => {
+                    previews_teardown(&cli.server, &token, &app, preview, all).await?;
                 }
             }
         }
