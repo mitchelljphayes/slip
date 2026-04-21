@@ -41,6 +41,9 @@ enum Commands {
     Rollback {
         /// App name.
         app: String,
+        /// Target tag to roll back to (defaults to previous tag).
+        #[arg(long)]
+        to: Option<String>,
     },
     /// Tail container logs.
     Logs {
@@ -164,6 +167,21 @@ struct UpdateAppRequest {
     secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     env: Option<HashMap<String, String>>,
+}
+
+#[derive(Serialize)]
+struct RollbackRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    to: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeployResponse {
+    deploy_id: String,
+    app: String,
+    tag: String,
+    #[allow(dead_code)]
+    status: String,
 }
 
 // ─── HTTP client helpers ──────────────────────────────────────────────────────
@@ -347,6 +365,34 @@ async fn apps_rm(server: &str, token: &str, name: &str, force: bool) -> Result<(
     Ok(())
 }
 
+async fn rollback(
+    server: &str,
+    token: &str,
+    app: &str,
+    to: Option<String>,
+) -> Result<(), anyhow::Error> {
+    let client = create_client();
+    let url = format!("{server}/v1/apps/{app}/rollback");
+
+    let body = RollbackRequest { to };
+    let resp = api_request(
+        &client,
+        reqwest::Method::POST,
+        &url,
+        token,
+        Some(&serde_json::to_value(&body)?),
+    )
+    .await?;
+
+    let deploy: DeployResponse = resp.json().await.context("failed to parse response")?;
+    println!(
+        "✓ Rollback initiated for '{}' → tag '{}' (deploy_id: {})",
+        deploy.app, deploy.tag, deploy.deploy_id
+    );
+
+    Ok(())
+}
+
 // ─── Main entry point ──────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -418,8 +464,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Deploy { app, tag } => {
             println!("slip deploy {app} {tag} — not yet implemented (Phase 2)");
         }
-        Commands::Rollback { app } => {
-            println!("slip rollback {app} — not yet implemented (Phase 2)");
+        Commands::Rollback { app, to } => {
+            let token = cli.token.context(
+                "SLIP_TOKEN is required for rollback. Set --token or SLIP_TOKEN env var.",
+            )?;
+            rollback(&cli.server, &token, &app, to).await?;
         }
         Commands::Logs { app, since } => {
             let since_str = since.as_deref().unwrap_or("now");

@@ -156,6 +156,32 @@ pub struct UpdateAppRequest {
     pub preview: Option<crate::config::AppPreviewConfig>,
 }
 
+/// Request body for `POST /v1/apps/{name}/rollback`.
+#[derive(Debug, Deserialize)]
+pub struct RollbackRequest {
+    /// Target tag to roll back to. If omitted, uses `previous_tag` from runtime state.
+    #[serde(default)]
+    pub to: Option<String>,
+}
+
+/// Validate tag format (non-empty, valid charset for Docker container names).
+fn validate_tag(tag: &str) -> Result<(), AppError> {
+    if tag.is_empty() {
+        return Err(AppError::BadRequest("tag must not be empty".to_string()));
+    }
+    // Docker container names must match [a-zA-Z0-9][a-zA-Z0-9_.-]*
+    // We use the tag in the container name, so validate it here.
+    if !tag
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(AppError::BadRequest(
+            "tag contains invalid characters (allowed: alphanumeric, -, _, .)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Response for `GET /v1/apps` and `GET /v1/apps/{name}`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppResponse {
@@ -297,6 +323,10 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
             axum::routing::get(handle_get_app)
                 .patch(handle_update_app)
                 .delete(handle_delete_app),
+        )
+        .route(
+            "/v1/apps/{name}/rollback",
+            axum::routing::post(handle_rollback),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -592,6 +622,93 @@ async fn handle_delete_app(
     Ok((StatusCode::OK, Json(serde_json::json!({"status": "ok"}))))
 }
 
+/// `POST /v1/apps/{name}/rollback` — Roll back to the previous version.
+async fn handle_rollback(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<RollbackRequest>,
+) -> Result<(StatusCode, Json<DeployResponse>), AppError> {
+    // Look up app config.
+    let app_cfg = state
+        .apps
+        .read()
+        .await
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(format!("app '{}' not found", name)))?;
+
+    // Resolve target tag.
+    let target_tag = match req.to {
+        Some(ref tag) => {
+            validate_tag(tag)?;
+            tag.clone()
+        }
+        None => {
+            let app_states = state.app_states.read().await;
+            let previous_tag = app_states.get(&name).and_then(|s| s.previous_tag.clone());
+            drop(app_states);
+            match previous_tag {
+                Some(tag) => tag,
+                None => {
+                    return Err(AppError::Conflict(
+                        "no previous tag to roll back to".to_string(),
+                    ));
+                }
+            }
+        }
+    };
+
+    // Acquire per-app deploy lock (non-blocking).
+    let lock = {
+        let lock_entry = state
+            .deploy_locks
+            .entry(name.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())));
+        lock_entry.clone()
+    };
+
+    let guard = lock
+        .try_lock_owned()
+        .map_err(|_| AppError::Conflict(format!("deploy already in progress for '{}'", name)))?;
+
+    // Generate deploy_id.
+    let deploy_id = format!("dep_{}", ulid::Ulid::new().to_string().to_lowercase());
+
+    info!(
+        deploy_id = %deploy_id,
+        app = %name,
+        tag = %target_tag,
+        "rollback accepted"
+    );
+
+    let response = DeployResponse {
+        deploy_id: deploy_id.clone(),
+        app: name.clone(),
+        tag: target_tag.clone(),
+        status: "accepted".to_string(),
+        preview_url: None,
+    };
+
+    // Build deploy context and record it.
+    let deploy_ctx = DeployContext::new(
+        deploy_id.clone(),
+        name.clone(),
+        app_cfg.app.image.clone(),
+        target_tag.clone(),
+        TriggerSource::Rollback,
+    );
+    state.record_deploy(&deploy_ctx);
+
+    // Spawn deploy orchestrator.
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        let _guard = guard;
+        execute_deploy(state_clone, deploy_ctx).await;
+    });
+
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
 // ─── Deploy handler ───────────────────────────────────────────────────────────
 
 /// `POST /v1/deploy`
@@ -649,21 +766,8 @@ async fn handle_deploy(
         )));
     }
 
-    // 8. Validate tag is non-empty and contains only valid characters.
-    if request.tag.is_empty() {
-        return Err(AppError::BadRequest("tag must not be empty".to_string()));
-    }
-    // Docker container names must match [a-zA-Z0-9][a-zA-Z0-9_.-]*
-    // We use the tag in the container name, so validate it here.
-    if !request
-        .tag
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
-    {
-        return Err(AppError::BadRequest(
-            "tag contains invalid characters (allowed: alphanumeric, -, _, .)".to_string(),
-        ));
-    }
+    // 8. Validate tag format.
+    validate_tag(&request.tag)?;
 
     // ── Preview deploy path ──────────────────────────────────────────────────
     if let Some(ref preview_info) = request.preview {
@@ -2373,5 +2477,250 @@ mod tests {
         // Verify app was removed
         let apps = state.apps.read().await;
         assert!(!apps.contains_key(APP_NAME));
+    }
+
+    // ── Rollback API tests ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_rollback_no_previous_tag_returns_409() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({});
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/apps/{APP_NAME}/rollback"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(payload.error.contains("no previous tag"));
+    }
+
+    #[tokio::test]
+    async fn test_rollback_with_previous_tag_returns_202() {
+        let state = create_test_state();
+
+        // Pre-populate app_states with previous_tag.
+        {
+            let mut app_states = state.app_states.write().await;
+            app_states.insert(
+                APP_NAME.to_string(),
+                AppRuntimeState {
+                    status: AppStatus::Running,
+                    current_tag: Some("v2.0".to_string()),
+                    previous_tag: Some("v1.0".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let app = build_router(state);
+
+        let body = serde_json::json!({});
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/apps/{APP_NAME}/rollback"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: DeployResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload.tag, "v1.0");
+        assert_eq!(payload.app, APP_NAME);
+        assert_eq!(payload.status, "accepted");
+        assert!(payload.deploy_id.starts_with("dep_"));
+    }
+
+    #[tokio::test]
+    async fn test_rollback_with_explicit_to_tag_returns_202() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({"to": "v0.9"});
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/apps/{APP_NAME}/rollback"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: DeployResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload.tag, "v0.9");
+    }
+
+    #[tokio::test]
+    async fn test_rollback_unknown_app_returns_404() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/apps/nonexistent/rollback")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_rollback_requires_auth() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({});
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/apps/{APP_NAME}/rollback"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_rollback_empty_to_tag_returns_400() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({"to": ""});
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/apps/{APP_NAME}/rollback"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(payload.error.contains("tag"));
+    }
+
+    #[tokio::test]
+    async fn test_rollback_concurrent_returns_409() {
+        use tokio::sync::Mutex;
+
+        let mut apps = HashMap::new();
+        apps.insert(APP_NAME.to_string(), test_app_config(Some(APP_SECRET)));
+
+        let deploy_locks: DashMap<String, Arc<Mutex<()>>> = DashMap::new();
+        // Pre-insert a locked mutex so the handler cannot acquire it.
+        let locked = Arc::new(Mutex::new(()));
+        let _guard = locked.clone().try_lock_owned().unwrap();
+        deploy_locks.insert(APP_NAME.to_string(), locked);
+
+        let state = Arc::new(AppState {
+            config: test_slip_config(),
+            apps: RwLock::new(apps),
+            config_dir: PathBuf::from("/tmp/slip-test"),
+            deploy_locks,
+            runtime: Arc::new(
+                DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            ),
+            caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
+            health: HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
+            started_at: Utc::now(),
+            preview_states: Arc::new(DashMap::new()),
+            preview_locks: DashMap::new(),
+        });
+
+        let app = build_router(state);
+
+        let body = serde_json::json!({"to": "v1.0"});
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/apps/{APP_NAME}/rollback"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(payload.error.contains("in progress"));
+    }
+
+    #[tokio::test]
+    async fn test_rollback_then_rollback_again() {
+        let state = create_test_state();
+
+        // Pre-populate app_states with current=v2.0, previous=v1.0.
+        {
+            let mut app_states = state.app_states.write().await;
+            app_states.insert(
+                APP_NAME.to_string(),
+                AppRuntimeState {
+                    status: AppStatus::Running,
+                    current_tag: Some("v2.0".to_string()),
+                    previous_tag: Some("v1.0".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let app = build_router(state);
+
+        // POST /v1/apps/testapp/rollback with empty body → 202, tag should be "v1.0"
+        let body = serde_json::json!({});
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/apps/{APP_NAME}/rollback"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: DeployResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            payload.tag, "v1.0",
+            "rollback should target previous_tag v1.0"
+        );
     }
 }

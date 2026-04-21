@@ -32,7 +32,7 @@ pub enum DeployStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerSource {
     Webhook,
@@ -1981,5 +1981,105 @@ container = "web"
             Some("testapp-oldpod"),
             "new pod should have a different name"
         );
+    }
+
+    // ── Rollback deploy tests ────────────────────────────────────────────────
+
+    /// Deploy with TriggerSource::Rollback should complete and record the
+    /// correct trigger source.
+    #[tokio::test]
+    async fn test_rollback_deploy_uses_trigger_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::new();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        let ctx = DeployContext::new(
+            "dep_rollback001".to_string(),
+            "testapp".to_string(),
+            "ghcr.io/org/testapp".to_string(),
+            "v1.0.0".to_string(),
+            TriggerSource::Rollback,
+        );
+        let deploy_id = ctx.id.clone();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            ctx,
+        )
+        .await;
+
+        // Deploy should complete successfully.
+        let recorded = deploys.get(&deploy_id).unwrap();
+        assert_eq!(recorded.status, DeployStatus::Completed);
+        assert!(recorded.error.is_none());
+        // Verify trigger source is Rollback.
+        assert_eq!(recorded.triggered_by, TriggerSource::Rollback);
+    }
+
+    /// Rollback should flip current_tag ↔ previous_tag.
+    /// Pre-populate with current=v2.0, previous=v1.0, then deploy v1.0 (rollback).
+    /// After deploy: current=v1.0, previous=v2.0.
+    #[tokio::test]
+    async fn test_rollback_updates_previous_tag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
+
+        // Pre-populate app state with current=v2.0, previous=v1.0.
+        let mut initial_states = HashMap::new();
+        initial_states.insert(
+            "testapp".to_string(),
+            AppRuntimeState {
+                status: AppStatus::Running,
+                current_tag: Some("v2.0".to_string()),
+                previous_tag: Some("v1.0".to_string()),
+                current_container_id: Some("old-container".to_string()),
+                current_port: Some(50000),
+                ..Default::default()
+            },
+        );
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(initial_states);
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::new();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        // Deploy v1.0 — simulating a rollback.
+        let ctx = DeployContext::new(
+            "dep_rollback002".to_string(),
+            "testapp".to_string(),
+            "ghcr.io/org/testapp".to_string(),
+            "v1.0".to_string(),
+            TriggerSource::Rollback,
+        );
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            ctx,
+        )
+        .await;
+
+        // After rollback deploy: current_tag=v1.0, previous_tag=v2.0.
+        let states = app_states.read().await;
+        let app = states.get("testapp").expect("app state should exist");
+        assert_eq!(app.current_tag.as_deref(), Some("v1.0"));
+        assert_eq!(app.previous_tag.as_deref(), Some("v2.0"));
     }
 }
