@@ -197,6 +197,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Build application state ──────────────────────────────────────────────
+    let secrets_store = slip_core::SecretsStore::new(slip_config.storage.path.join("secrets"))
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to initialize secrets store");
+            anyhow::anyhow!("secrets store error: {e}")
+        })?;
+
     let state = Arc::new(AppState {
         config: slip_config,
         apps: RwLock::new(apps),
@@ -210,6 +216,7 @@ async fn main() -> anyhow::Result<()> {
         started_at: Utc::now(),
         preview_states,
         preview_locks: DashMap::new(),
+        secrets_store,
     });
 
     // ── Spawn background tasks ────────────────────────────────────────────────
