@@ -62,5 +62,9 @@ tar = "0.4"
 # Regex (for env var resolution)
 regex = "1"
 
+# SQLite
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+rusqlite_migration = "1"
+
 # Shared crate
 slip-core = { path = "crates/slip-core" }

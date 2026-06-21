@@ -17,6 +17,7 @@ use tracing::{info, warn};
 use crate::auth::{resolve_secret, verify_signature};
 use crate::caddy::CaddyClient;
 use crate::config::{AppConfig, SlipConfig};
+use crate::db::Db;
 use crate::deploy::{AppRuntimeState, DeployContext, TriggerSource, execute_deploy};
 use crate::health::HealthChecker;
 use crate::preview::{
@@ -90,6 +91,12 @@ pub struct AppStatusResponse {
     pub deployed_at: Option<DateTime<Utc>>,
     pub container_id: Option<String>,
     pub port: Option<u16>,
+    /// Latest deploy ID for this app (from the deploy history cache).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deploy_id: Option<String>,
+    /// How the latest deploy was triggered (from the deploy history cache).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggered_by: Option<String>,
 }
 
 /// Response for `GET /v1/deploys/:deploy_id`.
@@ -295,8 +302,14 @@ pub struct AppState {
     pub health: HealthChecker,
     /// Runtime state for each app (current container, port, tag, etc.).
     pub app_states: RwLock<HashMap<String, AppRuntimeState>>,
-    /// Recent deploy contexts keyed by deploy_id (capped at 100).
+    /// Recent deploy contexts keyed by app name (latest deploy per app).
+    ///
+    /// This is a write-through cache: every deploy is persisted to SQLite and
+    /// also stored here for fast reads.  On daemon startup the cache is
+    /// populated from SQLite.
     pub deploys: DashMap<String, DeployContext>,
+    /// SQLite-backed deploy history store.
+    pub db: Db,
     /// Timestamp when the daemon was started (used for uptime calculation).
     pub started_at: DateTime<Utc>,
     /// Active preview deployment states keyed by `"{app}:{preview_id}"`.
@@ -311,9 +324,26 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Record (insert/update) a deploy context, evicting an entry if the map exceeds 100.
+    /// Record (insert/update) a deploy context.
+    ///
+    /// Persists to SQLite (fire-and-forget via `tokio::spawn`) and updates the
+    /// in-memory cache synchronously.  If the SQLite write fails it is logged
+    /// but the deploy continues — deploy history is best-effort persistence.
     pub fn record_deploy(&self, ctx: &DeployContext) {
-        crate::deploy::record_deploy(&self.deploys, ctx);
+        // Persist to SQLite (fire-and-forget via spawn_blocking).
+        let db = self.db.clone();
+        let ctx_clone = ctx.clone();
+        tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = db.insert_deploy(&ctx_clone) {
+                    tracing::error!(deploy_id = %ctx_clone.id, error = %e, "failed to persist deploy to SQLite");
+                }
+            })
+            .await
+            .ok();
+        });
+        // Update in-memory cache (synchronous, always succeeds)
+        self.deploys.insert(ctx.app.clone(), ctx.clone());
     }
 
     /// Build registry credentials from the configured GHCR token, if any.
@@ -678,15 +708,39 @@ async fn handle_rollback(
             tag.clone()
         }
         None => {
-            let app_states = state.app_states.read().await;
-            let previous_tag = app_states.get(&name).and_then(|s| s.previous_tag.clone());
-            drop(app_states);
-            match previous_tag {
-                Some(tag) => tag,
-                None => {
-                    return Err(AppError::Conflict(
-                        "no previous tag to roll back to".to_string(),
-                    ));
+            // First, try to find the previous successful deploy from SQLite.
+            let current_deploy_id = state
+                .app_states
+                .read()
+                .await
+                .get(&name)
+                .and_then(|s| s.deploy_id.clone())
+                .unwrap_or_default();
+            let db = state.db.clone();
+            let name_clone = name.clone();
+            let previous_from_db: Option<String> = tokio::task::spawn_blocking(move || {
+                match db.get_previous_successful_deploy(&name_clone, &current_deploy_id) {
+                    Ok(Some(ctx)) => Some(ctx.tag),
+                    _ => None,
+                }
+            })
+            .await
+            .unwrap_or(None);
+
+            if let Some(tag) = previous_from_db {
+                tag
+            } else {
+                // Fall back to previous_tag from runtime state (backward compat).
+                let app_states = state.app_states.read().await;
+                let previous_tag = app_states.get(&name).and_then(|s| s.previous_tag.clone());
+                drop(app_states);
+                match previous_tag {
+                    Some(tag) => tag,
+                    None => {
+                        return Err(AppError::Conflict(
+                            "no previous tag to roll back to".to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -1082,6 +1136,8 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                     deployed_at: None,
                     container_id: None,
                     port: None,
+                    deploy_id: None,
+                    triggered_by: None,
                 },
                 Some(runtime) => {
                     let status_str = match runtime.status {
@@ -1096,10 +1152,26 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                         deployed_at: runtime.deployed_at,
                         container_id: runtime.current_container_id.clone(),
                         port: runtime.current_port,
+                        deploy_id: None,
+                        triggered_by: None,
                     }
                 }
             };
-            (app_name.clone(), app_status)
+
+            // Supplement with deploy metadata from the in-memory cache
+            let mut enriched = app_status;
+            if let Some(cached) = state.deploys.get(&app_name) {
+                enriched.deploy_id = Some(cached.id.clone());
+                enriched.triggered_by = Some(
+                    match cached.triggered_by {
+                        crate::deploy::TriggerSource::Webhook => "webhook",
+                        crate::deploy::TriggerSource::Cli => "cli",
+                        crate::deploy::TriggerSource::Rollback => "rollback",
+                    }
+                    .to_string(),
+                );
+            }
+            (app_name.clone(), enriched)
         })
         .collect();
 
@@ -1285,6 +1357,7 @@ mod tests {
         RegistryConfig, ResourceConfig, RoutingConfig, RuntimeConfig, ServerConfig, SlipConfig,
         StorageConfig,
     };
+    use crate::db::Db;
     use crate::deploy::{AppRuntimeState, AppStatus, DeployContext, DeployStatus, TriggerSource};
     use crate::docker::DockerClient;
     use crate::health::HealthChecker;
@@ -1358,6 +1431,7 @@ mod tests {
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
+            db: Db::open_in_memory().unwrap(),
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
@@ -1613,6 +1687,7 @@ mod tests {
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
+            db: Db::open_in_memory().unwrap(),
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
@@ -1668,6 +1743,7 @@ mod tests {
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
+            db: Db::open_in_memory().unwrap(),
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
@@ -1775,6 +1851,70 @@ mod tests {
         assert_eq!(testapp["port"], 8080);
     }
 
+    // ── GET /v1/status — includes deploy_id/triggered_by from cache ────────────
+
+    #[tokio::test]
+    async fn test_status_includes_deploy_metadata() {
+        let state = create_test_state();
+
+        // Pre-populate runtime state with a Running app.
+        {
+            let mut app_states = state.app_states.write().await;
+            app_states.insert(
+                APP_NAME.to_string(),
+                AppRuntimeState {
+                    status: AppStatus::Running,
+                    current_tag: Some("v1.2.3".to_string()),
+                    current_container_id: Some("abc123".to_string()),
+                    current_port: Some(8080),
+                    deployed_at: Some(Utc::now()),
+                    deploy_id: Some("dep_test".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Populate the cache with a deploy entry keyed by app name.
+        let ctx = DeployContext {
+            id: "dep_meta001".to_string(),
+            app: APP_NAME.to_string(),
+            image: APP_IMAGE.to_string(),
+            tag: "v1.2.3".to_string(),
+            status: DeployStatus::Completed,
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            error: None,
+            triggered_by: TriggerSource::Webhook,
+            new_container_id: Some("abc123".to_string()),
+            new_port: Some(8080),
+            new_pod_name: None,
+            new_manifest_path: None,
+        };
+        state.deploys.insert(ctx.app.clone(), ctx);
+
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/status")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let testapp = &payload["apps"][APP_NAME];
+        assert_eq!(testapp["status"], "running");
+        assert_eq!(testapp["tag"], "v1.2.3");
+        assert_eq!(testapp["deploy_id"], "dep_meta001");
+        assert_eq!(testapp["triggered_by"], "webhook");
+    }
+
     // ── GET /v1/deploys/:deploy_id — found ────────────────────────────────────
 
     #[tokio::test]
@@ -1796,7 +1936,10 @@ mod tests {
             new_pod_name: None,
             new_manifest_path: None,
         };
-        state.deploys.insert(ctx.id.clone(), ctx);
+        // Insert into SQLite (the handler reads from SQLite in Phase 4).
+        state.db.insert_deploy(&ctx).unwrap();
+        // Also populate the cache (keyed by app name for latest-deploy lookups).
+        state.deploys.insert(ctx.app.clone(), ctx.clone());
 
         let app = build_router(state);
 
@@ -1875,6 +2018,7 @@ mod tests {
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
+            db: Db::open_in_memory().unwrap(),
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
@@ -2263,6 +2407,7 @@ mod tests {
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
+            db: Db::open_in_memory().unwrap(),
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
@@ -2432,6 +2577,7 @@ mod tests {
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
+            db: Db::open_in_memory().unwrap(),
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
@@ -2539,6 +2685,7 @@ mod tests {
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
+            db: Db::open_in_memory().unwrap(),
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
@@ -2738,6 +2885,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rollback_uses_sqlite_previous_deploy() {
+        let state = create_test_state();
+
+        // Insert a completed deploy into SQLite with tag "v1.0".
+        let previous_ctx = DeployContext {
+            id: "dep_prev001".to_string(),
+            app: APP_NAME.to_string(),
+            image: APP_IMAGE.to_string(),
+            tag: "v1.0".to_string(),
+            status: DeployStatus::Completed,
+            started_at: Utc::now() - chrono::Duration::hours(1),
+            finished_at: Some(Utc::now() - chrono::Duration::minutes(30)),
+            error: None,
+            triggered_by: TriggerSource::Webhook,
+            new_container_id: Some("ctr_prev".to_string()),
+            new_port: Some(8080),
+            new_pod_name: None,
+            new_manifest_path: None,
+        };
+        state.db.insert_deploy(&previous_ctx).unwrap();
+
+        // Set up app_states with a deploy_id (so the handler excludes the
+        // current deploy from the SQLite query) but NO previous_tag.
+        {
+            let mut app_states = state.app_states.write().await;
+            app_states.insert(
+                APP_NAME.to_string(),
+                AppRuntimeState {
+                    status: AppStatus::Running,
+                    current_tag: Some("v2.0".to_string()),
+                    deploy_id: Some("dep_current".to_string()),
+                    previous_tag: None, // Must fall back to SQLite.
+                    ..Default::default()
+                },
+            );
+        }
+
+        let app = build_router(state);
+
+        let body = serde_json::json!({});
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/apps/{APP_NAME}/rollback"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: DeployResponse = serde_json::from_slice(&bytes).unwrap();
+        // The tag should come from SQLite (v1.0), not from previous_tag (which is None).
+        assert_eq!(payload.tag, "v1.0");
+        assert_eq!(payload.app, APP_NAME);
+        assert_eq!(payload.status, "accepted");
+        assert!(payload.deploy_id.starts_with("dep_"));
+    }
+
+    #[tokio::test]
     async fn test_rollback_with_explicit_to_tag_returns_202() {
         let state = create_test_state();
         let app = build_router(state);
@@ -2845,6 +3055,7 @@ mod tests {
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
+            db: Db::open_in_memory().unwrap(),
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
@@ -3146,6 +3357,7 @@ mod tests {
             health: HealthChecker::new(),
             app_states: RwLock::new(HashMap::new()),
             deploys: DashMap::new(),
+            db: Db::open_in_memory().unwrap(),
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),

@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use slip_core::preview::preview_reaper;
 use slip_core::runtime::RuntimeBackend;
 use slip_core::{
-    AppState, CaddyClient, DockerClient, HealthChecker, PodmanBackend, build_router,
+    AppState, CaddyClient, Db, DockerClient, HealthChecker, PodmanBackend, build_router,
     load_app_states, load_config, load_preview_states, reconcile_preview_routes, reconcile_routes,
     verify_containers,
 };
@@ -177,6 +177,12 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(error = %e, "caddy route reconciliation failed on startup (non-fatal)");
     }
 
+    // ── Initialize SQLite deploy history ──────────────────────────────────────
+    let db_path = slip_config.storage.path.join("slip.db");
+    let db = Db::open(&db_path)
+        .map_err(|e| anyhow::anyhow!("failed to open database at {}: {e}", db_path.display()))?;
+    tracing::info!(path = %db_path.display(), "deploy history database opened");
+
     // ── Load persisted preview states ────────────────────────────────────────
     let persisted_previews = load_preview_states(&state_dir);
     if !persisted_previews.is_empty() {
@@ -213,11 +219,31 @@ async fn main() -> anyhow::Result<()> {
         health: HealthChecker::new(),
         app_states: RwLock::new(verified_states),
         deploys: DashMap::new(),
+        db,
         started_at: Utc::now(),
         preview_states,
         preview_locks: DashMap::new(),
         secrets_store,
     });
+
+    // ── Populate in-memory deploy cache from SQLite ──────────────────────────
+    match state.db.get_latest_deploys_per_app() {
+        Ok(latest) => {
+            for (app, ctx) in latest {
+                state.deploys.insert(app, ctx);
+            }
+            tracing::info!(
+                count = state.deploys.len(),
+                "loaded deploy history from SQLite"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to load deploy history from SQLite (starting with empty cache)"
+            );
+        }
+    }
 
     // ── Spawn background tasks ────────────────────────────────────────────────
     tokio::spawn(preview_reaper(state.clone()));
