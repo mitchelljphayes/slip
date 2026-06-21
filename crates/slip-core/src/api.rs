@@ -1253,9 +1253,15 @@ async fn handle_deploy_status(
     State(state): State<Arc<AppState>>,
     Path(deploy_id): Path<String>,
 ) -> Result<(StatusCode, Json<DeployStatusResponse>), AppError> {
-    let ctx = state
-        .deploys
-        .get(&deploy_id)
+    let db = state.db.clone();
+    let deploy_id_clone = deploy_id.clone();
+    let ctx = tokio::task::spawn_blocking(move || db.get_deploy(&deploy_id_clone))
+        .await
+        .map_err(|e| AppError::Internal(format!("task join error: {e}")))?
+        .map_err(|e| {
+            tracing::error!(deploy_id = %deploy_id, error = %e, "database error reading deploy");
+            AppError::Internal("database error".to_string())
+        })?
         .ok_or_else(|| AppError::NotFound("deploy not found".to_string()))?;
 
     let status_str = match ctx.status {
