@@ -274,7 +274,15 @@ pub(crate) async fn execute_deploy_inner(
                         set_app_failed(shared.app_states, &app_name);
                         return;
                     }
-                    Some(crate::merge::merge_config(&app_config, &repo_config))
+                    match crate::merge::merge_config(&app_config, &repo_config) {
+                        Ok(merged) => Some(merged),
+                        Err(e) => {
+                            ctx.fail(&format!("config merge failed: {e}"));
+                            record_deploy(shared.deploys, &ctx);
+                            set_app_failed(shared.app_states, &app_name);
+                            return;
+                        }
+                    }
                 }
                 Err(e) => {
                     ctx.fail(&format!("failed to parse repo config: {e}"));
@@ -369,6 +377,7 @@ pub(crate) async fn execute_deploy_inner(
             pod_suffix: pod_suffix.clone(),
             env_vars: env_vars.clone(),
             image_overrides: std::collections::HashMap::new(),
+            volumes: merged_cfg.volumes.clone(),
         };
 
         let rendered_yaml = match crate::manifest::render_manifest(&manifest_bytes, &render_ctx) {
@@ -506,7 +515,12 @@ pub(crate) async fn execute_deploy_inner(
             }
         }
     } else {
-        // ── CONTAINER DEPLOY FLOW (unchanged) ────────────────────────────
+        // ── CONTAINER DEPLOY FLOW ─────────────────────────────────────────
+
+        let container_volumes: Vec<crate::merge::MergedVolume> = merged
+            .as_ref()
+            .map(|m| m.volumes.clone())
+            .unwrap_or_default();
 
         match runtime
             .create_and_start(
@@ -517,6 +531,7 @@ pub(crate) async fn execute_deploy_inner(
                 env_vars,
                 &effective_config.network.name,
                 &effective_config.resources,
+                &container_volumes,
             )
             .await
         {
@@ -937,6 +952,7 @@ mod tests {
             _env_vars: Vec<String>,
             _network: &'a str,
             _resources: &'a crate::config::ResourceConfig,
+            _volumes: &'a [crate::merge::MergedVolume],
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<(String, u16), RuntimeError>> + Send + 'a>,
         > {
@@ -1237,6 +1253,7 @@ mod tests {
             resources: ResourceConfig::default(),
             network: crate::config::NetworkConfig::default(),
             preview: None,
+            volumes: Vec::new(),
         }
     }
 
@@ -2240,6 +2257,7 @@ container = "web"
             resources: ResourceConfig::default(),
             network: crate::config::NetworkConfig::default(),
             preview: None,
+            volumes: Vec::new(),
         };
 
         let vars = resolve_env_vars_for_app(&app_config, None, "testapp");
@@ -2274,6 +2292,7 @@ container = "web"
             resources: ResourceConfig::default(),
             network: crate::config::NetworkConfig::default(),
             preview: None,
+            volumes: Vec::new(),
         };
 
         let vars = resolve_env_vars_for_app(&app_config, Some(&store), "testapp");
@@ -2307,6 +2326,7 @@ container = "web"
             resources: ResourceConfig::default(),
             network: crate::config::NetworkConfig::default(),
             preview: None,
+            volumes: Vec::new(),
         };
 
         let vars = resolve_env_vars_for_app(&app_config, Some(&store), "testapp");
@@ -2335,6 +2355,7 @@ container = "web"
             resources: ResourceConfig::default(),
             network: crate::config::NetworkConfig::default(),
             preview: None,
+            volumes: Vec::new(),
         };
 
         let vars = resolve_env_vars_for_app(&app_config, None, "testapp");

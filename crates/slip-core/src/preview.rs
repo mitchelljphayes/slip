@@ -347,6 +347,34 @@ pub(crate) fn effective_preview_resources(
     result
 }
 
+/// Derive preview-specific host paths for volumes.
+///
+/// For each merged volume, creates a new `MergedVolume` with `host_path`
+/// modified to `{original_host_path}/previews/{preview_id}/`.  This prevents
+/// data cross-contamination between concurrent previews.
+///
+/// Preserves `mount_path` and `read_only` unchanged.
+pub(crate) fn derive_preview_volumes(
+    volumes: &[crate::merge::MergedVolume],
+    preview_id: &str,
+) -> Vec<crate::merge::MergedVolume> {
+    volumes
+        .iter()
+        .map(|v| {
+            let preview_host_path = format!(
+                "{}/previews/{}/",
+                v.host_path.trim_end_matches('/'),
+                preview_id
+            );
+            crate::merge::MergedVolume {
+                host_path: preview_host_path,
+                mount_path: v.mount_path.clone(),
+                read_only: v.read_only,
+            }
+        })
+        .collect()
+}
+
 /// Return the lesser of `requested` and `cap` as a human-readable memory string.
 ///
 /// Both values are parsed to bytes via [`parse_memory_limit`]. If either cannot
@@ -611,7 +639,13 @@ pub(crate) async fn execute_preview_deploy_inner(
                             ));
                         }
                     }
-                    crate::merge::merge_config(&shared.app_config, &repo_config)
+                    match crate::merge::merge_config(&shared.app_config, &repo_config) {
+                        Ok(merged) => merged,
+                        Err(e) => {
+                            fail_preview(&shared.preview_states, &state_key);
+                            return Err(DeployError::Message(format!("config merge failed: {e}")));
+                        }
+                    }
                 }
                 Err(e) => {
                     fail_preview(&shared.preview_states, &state_key);
@@ -790,6 +824,11 @@ pub(crate) async fn execute_preview_deploy_inner(
         app_name,
     );
 
+    // ── PREVIEW VOLUMES ───────────────────────────────────────────────────────
+    // Derive isolated host paths for preview deploys to prevent data
+    // cross-contamination between concurrent previews.
+    let preview_volumes = derive_preview_volumes(&merged.volumes, preview_id);
+
     let is_pod = merged.kind == "pod";
 
     let (container_id, host_port, pod_name, manifest_path) = if is_pod {
@@ -833,6 +872,7 @@ pub(crate) async fn execute_preview_deploy_inner(
             pod_suffix: pod_suffix.clone(),
             env_vars: env_vars.clone(),
             image_overrides: std::collections::HashMap::new(),
+            volumes: preview_volumes.clone(),
         };
 
         let rendered_yaml = match crate::manifest::render_manifest(&manifest_bytes, &render_ctx) {
@@ -897,6 +937,7 @@ pub(crate) async fn execute_preview_deploy_inner(
                 env_vars,
                 &effective_config.network.name,
                 &effective_config.resources,
+                &preview_volumes,
             )
             .await
         {
@@ -1413,6 +1454,7 @@ mod tests {
             _env_vars: Vec<String>,
             _network: &'a str,
             _resources: &'a crate::config::ResourceConfig,
+            _volumes: &'a [crate::merge::MergedVolume],
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<(String, u16), RuntimeError>> + Send + 'a>,
         > {
@@ -1727,6 +1769,7 @@ mod tests {
             resources: ResourceConfig::default(),
             network: crate::config::NetworkConfig::default(),
             preview: None,
+            volumes: Vec::new(),
         }
     }
 
@@ -3187,5 +3230,51 @@ enabled = true
             second.last().map(|s| s.as_str()) == Some("seed-cmd"),
             "second exec should be seed: {second:?}"
         );
+    }
+
+    // ── Preview volume tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn derive_preview_volumes_transforms_host_path() {
+        let volumes = vec![
+            crate::merge::MergedVolume {
+                host_path: "/data/myapp".to_string(),
+                mount_path: "/app/data".to_string(),
+                read_only: false,
+            },
+            crate::merge::MergedVolume {
+                host_path: "/var/lib/slip/config".to_string(),
+                mount_path: "/app/config".to_string(),
+                read_only: true,
+            },
+        ];
+
+        let preview = super::derive_preview_volumes(&volumes, "pr-42");
+
+        assert_eq!(preview.len(), 2);
+        assert_eq!(preview[0].host_path, "/data/myapp/previews/pr-42/");
+        assert_eq!(preview[0].mount_path, "/app/data");
+        assert!(!preview[0].read_only);
+        assert_eq!(preview[1].host_path, "/var/lib/slip/config/previews/pr-42/");
+        assert_eq!(preview[1].mount_path, "/app/config");
+        assert!(preview[1].read_only);
+    }
+
+    #[test]
+    fn derive_preview_volumes_empty_input() {
+        let volumes: Vec<crate::merge::MergedVolume> = vec![];
+        let preview = super::derive_preview_volumes(&volumes, "pr-42");
+        assert!(preview.is_empty());
+    }
+
+    #[test]
+    fn derive_preview_volumes_preserves_read_only() {
+        let volumes = vec![crate::merge::MergedVolume {
+            host_path: "/data/app".to_string(),
+            mount_path: "/mnt".to_string(),
+            read_only: true,
+        }];
+        let preview = super::derive_preview_volumes(&volumes, "test-1");
+        assert!(preview[0].read_only);
     }
 }

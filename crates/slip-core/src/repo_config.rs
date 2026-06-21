@@ -8,6 +8,19 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+/// A volume declaration from the repo config.
+///
+/// The repo declares what mount points the app needs (`mount_path`) and whether
+/// the mount should be read-only.  The server config provides the `host_path`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RepoVolume {
+    /// Absolute path inside the container where the volume is mounted.
+    pub mount_path: String,
+    /// Mount the volume read-only inside the container.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
 /// Repo-side config extracted from `/slip/slip.toml` in the container image.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RepoConfig {
@@ -19,6 +32,9 @@ pub struct RepoConfig {
     #[serde(default)]
     pub defaults: RepoDefaults,
     pub preview: Option<PreviewConfig>,
+    /// Volume mount points the app needs.
+    #[serde(default)]
+    pub volumes: Vec<RepoVolume>,
 }
 
 /// Basic application identity from the repo config.
@@ -355,5 +371,84 @@ ttl = "30m"
         let cfg = parse_repo_config(toml.as_bytes()).unwrap();
         let preview = cfg.preview.as_ref().unwrap();
         assert_eq!(preview.ttl, Some(Duration::from_secs(30 * 60)));
+    }
+
+    // ── Volume parsing ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_repo_config_with_volumes() {
+        let toml = r#"
+[app]
+name = "myapp"
+
+[[volumes]]
+mount_path = "/app/data"
+read_only = false
+
+[[volumes]]
+mount_path = "/app/config"
+read_only = true
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        assert_eq!(cfg.volumes.len(), 2);
+        assert_eq!(cfg.volumes[0].mount_path, "/app/data");
+        assert!(!cfg.volumes[0].read_only);
+        assert_eq!(cfg.volumes[1].mount_path, "/app/config");
+        assert!(cfg.volumes[1].read_only);
+    }
+
+    #[test]
+    fn parse_repo_config_volume_read_only_defaults_to_false() {
+        let toml = r#"
+[app]
+name = "myapp"
+
+[[volumes]]
+mount_path = "/app/data"
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        assert_eq!(cfg.volumes.len(), 1);
+        assert!(!cfg.volumes[0].read_only);
+    }
+
+    #[test]
+    fn parse_repo_config_volume_rejects_host_path() {
+        // host_path should NOT be accepted in repo config — it's server-only.
+        // serde ignores unknown fields by default, so this parses successfully
+        // but host_path is not stored on the struct.
+        let toml = r#"
+[app]
+name = "myapp"
+
+[[volumes]]
+mount_path = "/app/data"
+host_path = "/data/myapp"
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        assert_eq!(cfg.volumes.len(), 1);
+        assert_eq!(cfg.volumes[0].mount_path, "/app/data");
+        // host_path is not a field on RepoVolume, so it's silently ignored
+    }
+
+    #[test]
+    fn parse_repo_config_empty_volumes() {
+        let toml = r#"
+[app]
+name = "myapp"
+
+volumes = []
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        assert!(cfg.volumes.is_empty());
+    }
+
+    #[test]
+    fn parse_repo_config_no_volumes_key() {
+        let toml = r#"
+[app]
+name = "myapp"
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        assert!(cfg.volumes.is_empty());
     }
 }

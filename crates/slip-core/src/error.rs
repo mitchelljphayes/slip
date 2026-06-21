@@ -40,6 +40,13 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+
+    /// A volume declared in the repo config has no matching `host_path` in the
+    /// server config.
+    #[error(
+        "volume mount '{mount_path}' declared in repo config has no corresponding host_path in server config"
+    )]
+    VolumeMissingHostPath { mount_path: String },
 }
 
 /// Errors that can occur during container health checking.
