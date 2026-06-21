@@ -11,7 +11,10 @@ use bollard::container::{
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
-use bollard::models::{ContainerInspectResponse, HostConfig, PortBinding};
+use bollard::models::{
+    ContainerInspectResponse, HostConfig, Mount, MountBindOptions, MountBindOptionsPropagationEnum,
+    MountTypeEnum, PortBinding,
+};
 use bollard::network::CreateNetworkOptions;
 use futures_util::StreamExt;
 use tracing::{debug, info, warn};
@@ -107,6 +110,7 @@ impl DockerClient {
         env_vars: Vec<String>,
         network: &str,
         resources: &ResourceConfig,
+        volumes: &[crate::merge::MergedVolume],
     ) -> Result<(String, u16), DockerError> {
         // Container name: slip-{app_name}-{tag_prefix}-{random_suffix}
         // Random suffix prevents name collision on re-deploy of same tag
@@ -137,11 +141,34 @@ impl DockerClient {
         let memory = parse_memory_limit(&resources.memory);
         let nano_cpus = parse_cpu_limit(&resources.cpus);
 
+        // Volume mounts (structured Mount API, not legacy Binds)
+        let mounts: Option<Vec<Mount>> = if volumes.is_empty() {
+            None
+        } else {
+            Some(
+                volumes
+                    .iter()
+                    .map(|v| Mount {
+                        typ: Some(MountTypeEnum::BIND),
+                        source: Some(v.host_path.clone()),
+                        target: Some(v.mount_path.clone()),
+                        read_only: Some(v.read_only),
+                        bind_options: Some(MountBindOptions {
+                            propagation: Some(MountBindOptionsPropagationEnum::RPRIVATE),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })
+                    .collect(),
+            )
+        };
+
         let host_config = HostConfig {
             port_bindings: Some(port_bindings),
             network_mode: Some(network.to_string()),
             memory,
             nano_cpus,
+            mounts,
             ..Default::default()
         };
 
@@ -507,6 +534,7 @@ impl RuntimeBackend for DockerClient {
         env_vars: Vec<String>,
         network: &'a str,
         resources: &'a ResourceConfig,
+        volumes: &'a [crate::merge::MergedVolume],
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(String, u16), RuntimeError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -519,6 +547,7 @@ impl RuntimeBackend for DockerClient {
                 env_vars,
                 network,
                 resources,
+                volumes,
             )
             .await
             .map_err(RuntimeError::from)

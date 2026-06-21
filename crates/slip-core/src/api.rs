@@ -567,6 +567,7 @@ async fn handle_create_app(
         resources: req.resources.unwrap_or_default(),
         network: req.network.unwrap_or_default(),
         preview: req.preview,
+        volumes: Vec::new(),
     };
 
     // Check for conflicts and insert atomically (TOCTOU fix)
@@ -1520,10 +1521,9 @@ mod tests {
             resources: ResourceConfig::default(),
             network: NetworkConfig::default(),
             preview: None,
+            volumes: Vec::new(),
         }
     }
-
-    /// Build an `Arc<AppState>` for tests. Uses per-app secret when `use_app_secret` is true.
     ///
     /// Each call creates a fresh tempdir for the secrets store, avoiding
     /// interference between parallel tests.

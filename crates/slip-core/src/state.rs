@@ -677,6 +677,7 @@ mod tests {
                 env: HashMap::new(),
                 env_file: None,
                 preview: None,
+                volumes: Vec::new(),
             },
         );
 
@@ -757,6 +758,7 @@ mod tests {
                 env: HashMap::new(),
                 env_file: None,
                 preview: None,
+                volumes: Vec::new(),
             },
         );
 
