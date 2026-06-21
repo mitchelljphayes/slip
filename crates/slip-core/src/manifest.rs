@@ -1,14 +1,15 @@
 //! Pod manifest rendering for `podman kube play`.
 //!
-//! Transforms a raw Kubernetes Pod YAML at deploy-time by applying six
+//! Transforms a raw Kubernetes Pod YAML at deploy-time by applying seven
 //! mutations in order:
 //!
 //! 1. Set a versioned pod name (append `{pod_suffix}`).
-//! 2. Update the primary container's image tag.
-//! 3. Apply per-sidecar image overrides.
-//! 4. Set `hostPort: 0` on every container port (ephemeral port assignment).
-//! 5. Inject env vars (no-clobber; creates `env` array if absent).
-//! 6. Inject host-path volumes (no-clobber; skips on name/mount-path collision).
+//! 2. Resolve `${tag}` placeholders in all container image fields.
+//! 3. Update the primary container's image tag.
+//! 4. Apply per-sidecar image overrides.
+//! 5. Set `hostPort: 0` on every container port (ephemeral port assignment).
+//! 6. Inject env vars (no-clobber; creates `env` array if absent).
+//! 7. Inject host-path volumes (no-clobber; skips on name/mount-path collision).
 
 use std::collections::HashMap;
 
@@ -56,14 +57,16 @@ pub enum ManifestError {
 
 /// Render a pod manifest with deploy-time transformations.
 ///
-/// Applies the six standard transformations (versioned name, primary image
-/// tag, sidecar overrides, ephemeral host ports, env-var injection, volume
-/// injection) and returns the mutated YAML as a `String`.
+/// Applies the seven standard transformations (versioned name, `${tag}`
+/// placeholder resolution, primary image tag, sidecar overrides, ephemeral
+/// host ports, env-var injection, volume injection) and returns the mutated
+/// YAML as a `String`.
 pub fn render_manifest(raw_yaml: &[u8], ctx: &RenderContext) -> Result<String, ManifestError> {
     let mut doc: Value =
         serde_yaml::from_slice(raw_yaml).map_err(|e| ManifestError::InvalidYaml(e.to_string()))?;
 
     set_versioned_name(&mut doc, &ctx.pod_suffix)?;
+    resolve_tag_placeholders(&mut doc, &ctx.tag);
     update_primary_image(&mut doc, &ctx.primary_image, &ctx.tag);
     apply_sidecar_overrides(&mut doc, &ctx.image_overrides);
     set_host_ports_zero(&mut doc);
@@ -102,11 +105,33 @@ fn set_versioned_name(doc: &mut Value, pod_suffix: &str) -> Result<(), ManifestE
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Transformation 2 — primary container image tag
+// Transformation 2 — ${tag} placeholder resolution
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Replace `${tag}` with the actual tag in all container image fields.
+///
+/// This runs BEFORE `update_primary_image()` and `apply_sidecar_overrides()`,
+/// so overrides take precedence over placeholder resolution.
+fn resolve_tag_placeholders(doc: &mut Value, tag: &str) {
+    for containers in all_container_lists_mut(doc) {
+        for container in containers {
+            if let Some(image_val) = container.get_mut("image")
+                && let Some(image_str) = image_val.as_str()
+                && image_str.contains("${tag}")
+            {
+                let resolved = image_str.replace("${tag}", tag);
+                *image_val = Value::String(resolved);
+            }
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Transformation 3 — primary container image tag
 // ────────────────────────────────────────────────────────────────────────────
 
 fn update_primary_image(doc: &mut Value, primary_image: &str, tag: &str) {
-    if let Some(containers) = get_containers_mut(doc) {
+    for containers in all_container_lists_mut(doc) {
         for container in containers {
             if let Some(image_val) = container.get_mut("image")
                 && let Some(image_str) = image_val.as_str()
@@ -433,13 +458,6 @@ fn image_base(image: &str) -> &str {
     } else {
         image
     }
-}
-
-/// Return a mutable reference to `spec.containers` if present.
-fn get_containers_mut(doc: &mut Value) -> Option<&mut Vec<Value>> {
-    doc.get_mut("spec")?
-        .get_mut("containers")?
-        .as_sequence_mut()
 }
 
 /// Return mutable references to every container list in the document
@@ -792,6 +810,13 @@ spec:
             .as_sequence()
             .expect("env must exist in initContainer");
         assert!(env.iter().any(|e| e["name"].as_str() == Some("INIT_VAR")));
+
+        // init container image should also be updated (Phase 1 fix)
+        assert_eq!(
+            init_migrate["image"].as_str().unwrap(),
+            "ghcr.io/org/stat-stream:abc123",
+            "init container image should be updated by update_primary_image"
+        );
     }
 
     // ── Volume injection tests ────────────────────────────────────────────────
@@ -1126,5 +1151,171 @@ spec:
         let name = sanitize_volume_name("myapp", &long_path);
         assert!(name.len() <= 63);
         assert!(name.ends_with(|c: char| c.is_ascii_alphanumeric()));
+    }
+
+    // ── ${tag} placeholder tests ──────────────────────────────────────────────
+
+    #[test]
+    fn tag_placeholder_resolved_in_primary_container() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  containers:
+    - name: web
+      image: ghcr.io/org/myapp:${tag}
+"#;
+        let mut doc: Value = serde_yaml::from_str(yaml).unwrap();
+        resolve_tag_placeholders(&mut doc, "v1.2.3");
+        let container = &doc["spec"]["containers"][0];
+        assert_eq!(
+            container["image"].as_str().unwrap(),
+            "ghcr.io/org/myapp:v1.2.3"
+        );
+    }
+
+    #[test]
+    fn tag_placeholder_resolved_in_init_container() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  initContainers:
+    - name: init-setup
+      image: ghcr.io/org/myapp:${tag}
+  containers:
+    - name: web
+      image: ghcr.io/org/myapp:latest
+"#;
+        let mut doc: Value = serde_yaml::from_str(yaml).unwrap();
+        resolve_tag_placeholders(&mut doc, "abc123");
+        let init_container = &doc["spec"]["initContainers"][0];
+        assert_eq!(
+            init_container["image"].as_str().unwrap(),
+            "ghcr.io/org/myapp:abc123"
+        );
+        // Regular container should be unchanged (no ${tag})
+        let container = &doc["spec"]["containers"][0];
+        assert_eq!(
+            container["image"].as_str().unwrap(),
+            "ghcr.io/org/myapp:latest"
+        );
+    }
+
+    #[test]
+    fn tag_placeholder_resolved_in_sidecar() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  containers:
+    - name: web
+      image: ghcr.io/org/myapp:latest
+    - name: redis
+      image: redis:${tag}
+"#;
+        let mut doc: Value = serde_yaml::from_str(yaml).unwrap();
+        resolve_tag_placeholders(&mut doc, "7-alpine");
+        let redis = &doc["spec"]["containers"][1];
+        assert_eq!(redis["image"].as_str().unwrap(), "redis:7-alpine");
+    }
+
+    #[test]
+    fn tag_placeholder_override_wins_over_placeholder() {
+        // ${tag} is resolved first, then sidecar override replaces it.
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  containers:
+    - name: web
+      image: ghcr.io/org/myapp:${tag}
+    - name: redis
+      image: redis:${tag}
+"#;
+        let mut doc: Value = serde_yaml::from_str(yaml).unwrap();
+        // Simulate the full pipeline: resolve_tag_placeholders then apply_sidecar_overrides
+        resolve_tag_placeholders(&mut doc, "7-alpine");
+        let mut overrides = HashMap::new();
+        overrides.insert("redis".to_string(), "redis:8-alpine".to_string());
+        apply_sidecar_overrides(&mut doc, &overrides);
+        // redis should have the override (8-alpine), not the placeholder-resolved value
+        let redis = &doc["spec"]["containers"][1];
+        assert_eq!(redis["image"].as_str().unwrap(), "redis:8-alpine");
+        // web should have the placeholder-resolved value
+        let web = &doc["spec"]["containers"][0];
+        assert_eq!(web["image"].as_str().unwrap(), "ghcr.io/org/myapp:7-alpine");
+    }
+
+    #[test]
+    fn tag_placeholder_noop_when_not_present() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  containers:
+    - name: web
+      image: ghcr.io/org/myapp:latest
+"#;
+        let mut doc: Value = serde_yaml::from_str(yaml).unwrap();
+        resolve_tag_placeholders(&mut doc, "v1.0.0");
+        let container = &doc["spec"]["containers"][0];
+        assert_eq!(
+            container["image"].as_str().unwrap(),
+            "ghcr.io/org/myapp:latest"
+        );
+    }
+
+    #[test]
+    fn tag_placeholder_integration_with_render_manifest() {
+        // Full pipeline: ${tag} in primary, init, and sidecar
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  initContainers:
+    - name: init-migrate
+      image: ghcr.io/org/myapp:${tag}
+  containers:
+    - name: web
+      image: ghcr.io/org/myapp:${tag}
+    - name: redis
+      image: redis:${tag}
+"#;
+        let ctx = RenderContext {
+            app_name: "myapp".to_string(),
+            tag: "v2.0.0".to_string(),
+            primary_image: "ghcr.io/org/myapp".to_string(),
+            pod_suffix: "xyz".to_string(),
+            env_vars: vec![],
+            image_overrides: HashMap::new(),
+            volumes: Vec::new(),
+        };
+        let result = render_manifest(yaml.as_bytes(), &ctx).unwrap();
+        let doc = parse_output(&result);
+
+        // Primary container: ${tag} resolved, then update_primary_image sets it
+        let web = &doc["spec"]["containers"][0];
+        assert_eq!(web["image"].as_str().unwrap(), "ghcr.io/org/myapp:v2.0.0");
+
+        // Init container: ${tag} resolved, then update_primary_image sets it
+        let init = &doc["spec"]["initContainers"][0];
+        assert_eq!(init["image"].as_str().unwrap(), "ghcr.io/org/myapp:v2.0.0");
+
+        // Sidecar: ${tag} resolved (no override, so stays as resolved)
+        let redis = &doc["spec"]["containers"][1];
+        assert_eq!(redis["image"].as_str().unwrap(), "redis:v2.0.0");
     }
 }

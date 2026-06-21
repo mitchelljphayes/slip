@@ -36,6 +36,12 @@ enum Commands {
         app: String,
         /// Image tag to deploy.
         tag: String,
+        /// Per-container image overrides (container=registry/image:tag, repeatable).
+        #[arg(long = "image", value_parser = parse_key_val)]
+        image: Vec<(String, String)>,
+        /// App secret for HMAC signing (or set SLIP_SECRET env var).
+        #[arg(long)]
+        secret: Option<String>,
     },
     /// Roll back to the previous version.
     Rollback {
@@ -440,6 +446,67 @@ async fn apps_rm(server: &str, token: &str, name: &str, force: bool) -> Result<(
     Ok(())
 }
 
+async fn deploy(
+    server: &str,
+    app: &str,
+    tag: &str,
+    images: Vec<(String, String)>,
+    secret: Option<String>,
+) -> Result<(), anyhow::Error> {
+    let client = create_client();
+
+    // Build the images map from --image flags.
+    let images_map: HashMap<String, String> = images.into_iter().collect();
+
+    // Build the JSON payload.
+    let mut body = serde_json::json!({
+        "app": app,
+        "tag": tag,
+    });
+    if !images_map.is_empty() {
+        body["images"] = serde_json::to_value(&images_map)?;
+    }
+
+    let body_bytes = serde_json::to_vec(&body)?;
+
+    // Resolve secret: --secret flag, SLIP_SECRET env var, or prompt.
+    let secret = match secret {
+        Some(s) => s,
+        None => std::env::var("SLIP_SECRET").unwrap_or_else(|_| {
+            eprintln!("No secret provided. Set --secret or SLIP_SECRET env var.");
+            std::process::exit(1);
+        }),
+    };
+
+    // Compute HMAC signature.
+    let sig = slip_core::auth::compute_signature(&body_bytes, &secret);
+    let sig_header = format!("sha256={sig}");
+
+    let url = format!("{server}/v1/deploy");
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("X-Slip-Signature", &sig_header)
+        .body(body_bytes)
+        .send()
+        .await
+        .context("HTTP request failed")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("API error ({}): {}", status, text);
+    }
+
+    let deploy_resp: DeployResponse = resp.json().await.context("failed to parse response")?;
+    println!(
+        "✓ Deploy accepted for '{}' → tag '{}' (deploy_id: {})",
+        deploy_resp.app, deploy_resp.tag, deploy_resp.deploy_id
+    );
+
+    Ok(())
+}
+
 async fn rollback(
     server: &str,
     token: &str,
@@ -708,8 +775,13 @@ async fn main() -> anyhow::Result<()> {
             let target = app.as_deref().unwrap_or("all apps");
             println!("slip status {target} — not yet implemented (Phase 2)");
         }
-        Commands::Deploy { app, tag } => {
-            println!("slip deploy {app} {tag} — not yet implemented (Phase 2)");
+        Commands::Deploy {
+            app,
+            tag,
+            image,
+            secret,
+        } => {
+            deploy(&cli.server, &app, &tag, image, secret).await?;
         }
         Commands::Rollback { app, to } => {
             let token = cli.token.context(

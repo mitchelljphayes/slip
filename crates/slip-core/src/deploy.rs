@@ -79,6 +79,9 @@ pub struct DeployContext {
     pub app: String,
     pub image: String,
     pub tag: String,
+    /// Optional per-container image overrides: container_name → full image reference.
+    #[serde(default)]
+    pub images: HashMap<String, String>,
     pub status: DeployStatus,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -111,6 +114,7 @@ impl DeployContext {
             app,
             image,
             tag,
+            images: HashMap::new(),
             status: DeployStatus::Accepted,
             started_at: Utc::now(),
             finished_at: None,
@@ -246,13 +250,36 @@ pub(crate) async fn execute_deploy_inner(
     );
 
     if let Err(e) = runtime
-        .pull_image(&ctx.image, &ctx.tag, shared.credentials)
+        .pull_image(&ctx.image, &ctx.tag, shared.credentials.clone())
         .await
     {
         ctx.fail(&format!("image pull failed: {e}"));
         record_deploy(shared.deploys, &ctx);
         set_app_failed(shared.app_states, &app_name);
         return;
+    }
+
+    // Pull sidecar images from ctx.images (if any).
+    for (container_name, full_ref) in &ctx.images {
+        let (sidecar_image, sidecar_tag) = parse_image_ref(full_ref);
+        tracing::info!(
+            app = %app_name,
+            container = %container_name,
+            image = %sidecar_image,
+            tag = %sidecar_tag,
+            "pulling sidecar image"
+        );
+        if let Err(e) = runtime
+            .pull_image(sidecar_image, sidecar_tag, shared.credentials.clone())
+            .await
+        {
+            ctx.fail(&format!(
+                "sidecar image pull failed for '{container_name}': {e}"
+            ));
+            record_deploy(shared.deploys, &ctx);
+            set_app_failed(shared.app_states, &app_name);
+            return;
+        }
     }
 
     // ── EXTRACT + MERGE CONFIG ────────────────────────────────────────────────
@@ -379,7 +406,7 @@ pub(crate) async fn execute_deploy_inner(
             primary_image: effective_config.app.image.clone(),
             pod_suffix: pod_suffix.clone(),
             env_vars: env_vars.clone(),
-            image_overrides: std::collections::HashMap::new(),
+            image_overrides: ctx.images.clone(),
             volumes: merged_cfg.volumes.clone(),
         };
 
@@ -722,6 +749,32 @@ pub(crate) async fn execute_deploy_inner(
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
+
+/// Parse a full image reference into (image_base, tag).
+///
+/// Handles both `registry/image:tag` and `registry/image@sha256:...` formats.
+/// For digest references, the tag portion is the full digest string.
+///
+/// Examples:
+/// - `"ghcr.io/org/app:v1.2.3"` → `("ghcr.io/org/app", "v1.2.3")`
+/// - `"redis:7-alpine"` → `("redis", "7-alpine")`
+/// - `"ghcr.io/org/app@sha256:abc123"` → `("ghcr.io/org/app", "sha256:abc123")`
+fn parse_image_ref(full_ref: &str) -> (&str, &str) {
+    // Check for digest reference first (@sha256:...)
+    if let Some(at_pos) = full_ref.rfind('@') {
+        let image = &full_ref[..at_pos];
+        let tag = &full_ref[at_pos + 1..];
+        return (image, tag);
+    }
+    // Standard tag reference (image:tag)
+    if let Some(colon_pos) = full_ref.rfind(':') {
+        let image = &full_ref[..colon_pos];
+        let tag = &full_ref[colon_pos + 1..];
+        return (image, tag);
+    }
+    // No tag — use "latest"
+    (full_ref, "latest")
+}
 
 /// Record (insert/update) a deploy context in the in-memory cache.
 ///
@@ -2415,5 +2468,43 @@ container = "web"
 
         let vars = resolve_env_vars_for_app(&app_config, None, "testapp");
         assert_eq!(vars, vec!["KEY_A=val_a"]);
+    }
+
+    // ── parse_image_ref tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_image_ref_standard_tag() {
+        let (image, tag) = parse_image_ref("ghcr.io/org/app:v1.2.3");
+        assert_eq!(image, "ghcr.io/org/app");
+        assert_eq!(tag, "v1.2.3");
+    }
+
+    #[test]
+    fn parse_image_ref_digest() {
+        let (image, tag) = parse_image_ref("ghcr.io/org/app@sha256:abc123def456");
+        assert_eq!(image, "ghcr.io/org/app");
+        assert_eq!(tag, "sha256:abc123def456");
+    }
+
+    #[test]
+    fn parse_image_ref_no_tag_defaults_latest() {
+        let (image, tag) = parse_image_ref("ghcr.io/org/app");
+        assert_eq!(image, "ghcr.io/org/app");
+        assert_eq!(tag, "latest");
+    }
+
+    #[test]
+    fn parse_image_ref_short_name() {
+        let (image, tag) = parse_image_ref("redis:7-alpine");
+        assert_eq!(image, "redis");
+        assert_eq!(tag, "7-alpine");
+    }
+
+    #[test]
+    fn parse_image_ref_registry_with_port() {
+        // registry:5000 is a port, not a tag
+        let (image, tag) = parse_image_ref("registry:5000/img:v1");
+        assert_eq!(image, "registry:5000/img");
+        assert_eq!(tag, "v1");
     }
 }
