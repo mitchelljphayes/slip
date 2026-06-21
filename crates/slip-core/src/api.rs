@@ -45,11 +45,18 @@ pub struct PreviewRequestInfo {
 #[derive(Debug, Deserialize)]
 pub struct DeployRequest {
     pub app: String,
-    pub image: String,
+    /// Image base (e.g., "ghcr.io/org/stat-stream"). Optional — server resolves
+    /// from app config when omitted.
+    #[serde(default)]
+    pub image: Option<String>,
     pub tag: String,
     /// If present, this is a preview deploy rather than a production deploy.
     #[serde(default)]
     pub preview: Option<PreviewRequestInfo>,
+    /// Optional per-container image overrides: container_name → full image reference.
+    /// Values are full image references (e.g., "ghcr.io/org/dagster:v1.2.3").
+    #[serde(default)]
+    pub images: HashMap<String, String>,
 }
 
 /// Successful deploy response (202 Accepted).
@@ -1010,11 +1017,19 @@ async fn handle_deploy(
         return Err(AppError::Unauthorized("invalid signature".to_string()));
     }
 
-    // 7. Validate image matches config.
-    if request.image != app_cfg.app.image {
+    // 7. Resolve image (optional in request — fall back to app config).
+    let resolved_image = request
+        .image
+        .clone()
+        .unwrap_or_else(|| app_cfg.app.image.clone());
+
+    // 7b. Validate image matches config (only if explicitly provided).
+    if let Some(ref req_image) = request.image
+        && *req_image != app_cfg.app.image
+    {
         return Err(AppError::BadRequest(format!(
             "image mismatch: expected '{}', got '{}'",
-            app_cfg.app.image, request.image
+            app_cfg.app.image, req_image
         )));
     }
 
@@ -1095,10 +1110,11 @@ async fn handle_deploy(
         let preview_ctx = PreviewDeployContext {
             deploy_id,
             app_name: request.app.clone(),
-            image: request.image.clone(),
+            image: resolved_image.clone(),
             tag: request.tag.clone(),
             preview_id: preview_info.id.clone(),
             sha: preview_info.sha.clone(),
+            images: request.images.clone(),
         };
 
         let state_clone = state.clone();
@@ -1148,10 +1164,15 @@ async fn handle_deploy(
     let deploy_ctx = DeployContext::new(
         deploy_id.clone(),
         request.app.clone(),
-        request.image.clone(),
+        resolved_image.clone(),
         request.tag.clone(),
         TriggerSource::Webhook,
     );
+    // Pass images through to the deploy context
+    let deploy_ctx = DeployContext {
+        images: request.images.clone(),
+        ..deploy_ctx
+    };
     state.record_deploy(&deploy_ctx);
 
     let state_clone = state.clone();
@@ -1607,6 +1628,49 @@ mod tests {
         assert_eq!(preview.sha, "abc123def456");
     }
 
+    // ── DeployRequest images field ─────────────────────────────────────────────
+
+    #[test]
+    fn test_deploy_request_with_images_field_deserializes() {
+        let json = r#"{
+            "app": "myapp",
+            "image": "ghcr.io/org/myapp",
+            "tag": "v1.0.0",
+            "images": {
+                "dagster-daemon": "ghcr.io/org/dagster:v1.2.3",
+                "redis": "redis:8-alpine"
+            }
+        }"#;
+        let req: crate::api::DeployRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.images.len(), 2);
+        assert_eq!(
+            req.images.get("dagster-daemon").unwrap(),
+            "ghcr.io/org/dagster:v1.2.3"
+        );
+        assert_eq!(req.images.get("redis").unwrap(), "redis:8-alpine");
+    }
+
+    #[test]
+    fn test_deploy_request_without_images_field_defaults_empty() {
+        let json = r#"{"app":"myapp","image":"ghcr.io/org/myapp","tag":"v1.0.0"}"#;
+        let req: crate::api::DeployRequest = serde_json::from_str(json).unwrap();
+        assert!(
+            req.images.is_empty(),
+            "images must be empty when field is absent"
+        );
+    }
+
+    #[test]
+    fn test_deploy_request_without_image_field_defaults_empty() {
+        // image is optional — defaults to None
+        let json = r#"{"app":"myapp","tag":"v1.0.0"}"#;
+        let req: crate::api::DeployRequest = serde_json::from_str(json).unwrap();
+        assert!(
+            req.image.is_none(),
+            "image must be None when field is absent"
+        );
+    }
+
     // ── 202 Accepted ──────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -2012,6 +2076,7 @@ mod tests {
             triggered_by: TriggerSource::Webhook,
             new_container_id: Some("abc123".to_string()),
             new_port: Some(8080),
+            images: HashMap::new(),
             new_pod_name: None,
             new_manifest_path: None,
             rollback_failed: false,
@@ -2054,6 +2119,7 @@ mod tests {
             app: APP_NAME.to_string(),
             image: APP_IMAGE.to_string(),
             tag: "v2.0.0".to_string(),
+            images: HashMap::new(),
             status: DeployStatus::Completed,
             started_at: Utc::now(),
             finished_at: Some(Utc::now()),
@@ -3023,6 +3089,7 @@ mod tests {
             app: APP_NAME.to_string(),
             image: APP_IMAGE.to_string(),
             tag: "v1.0".to_string(),
+            images: HashMap::new(),
             status: DeployStatus::Completed,
             started_at: Utc::now() - chrono::Duration::hours(1),
             finished_at: Some(Utc::now() - chrono::Duration::minutes(30)),

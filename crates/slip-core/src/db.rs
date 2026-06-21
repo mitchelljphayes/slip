@@ -4,6 +4,7 @@
 //! `Arc<Mutex<>>`.  All public methods are **synchronous** — callers are
 //! responsible for dispatching blocking work to `tokio::task::spawn_blocking`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -247,6 +248,7 @@ fn row_to_deploy(row: &rusqlite::Row) -> rusqlite::Result<DeployContext> {
         app: row.get("app")?,
         image: row.get("image")?,
         tag: row.get("tag")?,
+        images: HashMap::new(),
         status,
         started_at: row.get("started_at")?,
         finished_at: row.get("finished_at")?,
@@ -281,6 +283,7 @@ mod tests {
             app: app.to_string(),
             image: "ghcr.io/org/app".to_string(),
             tag: "v1.0".to_string(),
+            images: HashMap::new(),
             status,
             started_at: Utc::now(),
             finished_at: None,
@@ -406,6 +409,7 @@ mod tests {
             app: "myapp".to_string(),
             image: "ghcr.io/org/app".to_string(),
             tag: "v2.0".to_string(),
+            images: HashMap::new(),
             status: DeployStatus::Completed,
             started_at: Utc::now(),
             finished_at: Some(Utc::now()),

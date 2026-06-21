@@ -3,6 +3,7 @@
 //! A "preview" is an ephemeral container/pod deployment for a pull request or
 //! branch. Each preview has a unique ID, a subdomain, and an optional TTL.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -437,6 +438,8 @@ pub struct PreviewDeployContext {
     pub tag: String,
     pub preview_id: String,
     pub sha: String,
+    /// Optional per-container image overrides: container_name → full image reference.
+    pub images: HashMap<String, String>,
 }
 
 /// The parts of `AppState` that the preview deploy orchestrator needs.
@@ -888,7 +891,7 @@ pub(crate) async fn execute_preview_deploy_inner(
             primary_image: effective_config.app.image.clone(),
             pod_suffix: pod_suffix.clone(),
             env_vars: env_vars.clone(),
-            image_overrides: std::collections::HashMap::new(),
+            image_overrides: ctx.images.clone(),
             volumes: preview_volumes.clone(),
         };
 
@@ -1870,6 +1873,7 @@ enabled = {enabled}
             tag: "sha-abc123".to_string(),
             preview_id: "pr-42".to_string(),
             sha: "abc123def456".to_string(),
+            images: HashMap::new(),
         }
     }
 
