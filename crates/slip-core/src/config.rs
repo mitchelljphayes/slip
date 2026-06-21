@@ -344,10 +344,20 @@ pub struct AppInfo {
 }
 
 /// HTTP routing configuration.
+///
+/// For `"container"` and `"pod"` app kinds, both `domain` and `port` are required
+/// and validated at config load time. For `"worker"` apps, both are optional and
+/// should be omitted — workers do not receive inbound HTTP traffic.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RoutingConfig {
-    pub domain: String,
-    pub port: u16,
+    /// The domain name for this app (e.g. "myapp.example.com").
+    /// Required for HTTP apps; omitted for workers.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// The container port the app listens on (e.g. 3000).
+    /// Required for HTTP apps; omitted for workers.
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 /// Container health-check configuration.
@@ -823,8 +833,8 @@ name = "slip"
         let cfg: AppConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.app.name, "myapp");
         assert_eq!(cfg.app.image, "ghcr.io/org/myapp:latest");
-        assert_eq!(cfg.routing.domain, "myapp.example.com");
-        assert_eq!(cfg.routing.port, 3000);
+        assert_eq!(cfg.routing.domain.as_deref(), Some("myapp.example.com"));
+        assert_eq!(cfg.routing.port, Some(3000));
         assert_eq!(cfg.health.path.as_deref(), Some("/healthz"));
         assert_eq!(cfg.health.interval, Duration::from_secs(2));
         assert_eq!(cfg.health.timeout, Duration::from_secs(5));
@@ -968,7 +978,7 @@ LOG_LEVEL = "info"
         let (_cfg, apps) = load_config(dir.path()).unwrap();
         assert!(apps.contains_key("webapp"));
         let app = &apps["webapp"];
-        assert_eq!(app.routing.port, 3000);
+        assert_eq!(app.routing.port, Some(3000));
         assert_eq!(app.env["LOG_LEVEL"], "info");
     }
 

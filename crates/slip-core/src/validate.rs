@@ -66,6 +66,10 @@ pub enum ValidationError {
     /// Volume validation error.
     #[error("volume error: {message}")]
     VolumeValidationError { message: String },
+
+    /// Unknown app kind.
+    #[error("unknown app kind '{kind}': valid values are 'container', 'pod', and 'worker'")]
+    InvalidKind { kind: String },
 }
 
 // ─── Validation Result ────────────────────────────────────────────────────────
@@ -143,8 +147,25 @@ pub fn validate_repo_config(config: &RepoConfig, base_dir: &Path) -> ValidationR
         "container" if config.app.manifest.is_some() => {
             result.add_warning("manifest is ignored for container kind".to_string());
         }
-        _ => {
-            // Unknown kind - could warn, but for now just pass
+        "container" => {
+            // No additional validation needed for container kind
+        }
+        "worker" => {
+            if config.app.manifest.is_some() {
+                result.add_warning("manifest is ignored for worker kind".to_string());
+            }
+            if config.routing.port.is_some() {
+                result.add_warning(
+                    "routing.port is set but will be ignored for worker kind; \
+                     workers do not receive inbound HTTP traffic"
+                        .to_string(),
+                );
+            }
+        }
+        other => {
+            result.add_error(ValidationError::InvalidKind {
+                kind: other.to_string(),
+            });
         }
     }
 
@@ -243,7 +264,8 @@ fn validate_preview_config(
         });
     }
 
-    // Warn if preview enabled but no routing port
+    // Warn if preview enabled but no routing port (only for non-worker kinds)
+    // Workers don't need a routing port — they don't receive inbound HTTP traffic.
     if preview.enabled && routing.port.is_none() {
         result.add_warning(
             "preview is enabled but no routing.port is specified; \

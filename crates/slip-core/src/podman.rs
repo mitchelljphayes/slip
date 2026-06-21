@@ -204,15 +204,23 @@ impl RuntimeBackend for PodmanBackend {
 
             info!(container_name, image, tag, "creating container (podman)");
 
-            let port_key = format!("{container_port}/tcp");
-            let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
-            port_bindings.insert(
-                port_key.clone(),
-                Some(vec![PortBinding {
-                    host_ip: Some("127.0.0.1".to_string()),
-                    host_port: None,
-                }]),
-            );
+            // Port bindings: only create when container_port > 0.
+            // Workers pass container_port=0 to skip port binding entirely.
+            let port_bindings: Option<HashMap<String, Option<Vec<PortBinding>>>> =
+                if container_port > 0 {
+                    let port_key = format!("{container_port}/tcp");
+                    let mut bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
+                    bindings.insert(
+                        port_key,
+                        Some(vec![PortBinding {
+                            host_ip: Some("127.0.0.1".to_string()),
+                            host_port: None,
+                        }]),
+                    );
+                    Some(bindings)
+                } else {
+                    None
+                };
 
             let mut labels: HashMap<String, String> = HashMap::new();
             labels.insert("slip.app".to_string(), app_name.to_string());
@@ -245,7 +253,7 @@ impl RuntimeBackend for PodmanBackend {
             };
 
             let host_config = HostConfig {
-                port_bindings: Some(port_bindings),
+                port_bindings,
                 network_mode: Some(network.to_string()),
                 memory,
                 nano_cpus,
@@ -295,8 +303,13 @@ impl RuntimeBackend for PodmanBackend {
                 return Err(RuntimeError::ContainerNotRunning(container_id));
             }
 
-            let host_port = extract_host_port(&info, container_port)
-                .map_err(|_| RuntimeError::NoPortAssigned)?;
+            // When container_port is 0 (worker), return 0 as host port — no port assigned.
+            let host_port = if container_port > 0 {
+                extract_host_port(&info, container_port)
+                    .map_err(|_| RuntimeError::NoPortAssigned)?
+            } else {
+                0
+            };
             info!(
                 container_id,
                 host_port, "container started and running (podman)"

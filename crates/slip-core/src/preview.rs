@@ -49,11 +49,15 @@ pub struct PreviewState {
     /// When this preview expires (None = no expiry).
     pub expires_at: Option<DateTime<Utc>>,
     /// Fully-qualified preview domain (e.g. "pr-42.preview.example.com").
-    pub domain: String,
+    /// `None` for worker previews (no domain).
+    pub domain: Option<String>,
     /// Path to the rendered pod manifest (pod-mode only).
     pub manifest_path: Option<PathBuf>,
     /// Current deploy ID (transient — not persisted).
     pub deploy_id: Option<String>,
+    /// App kind: "container", "pod", or "worker".
+    /// Used during teardown to determine whether to remove Caddy routes.
+    pub kind: Option<String>,
 }
 
 /// Serde-serializable subset of [`PreviewState`] for on-disk persistence.
@@ -70,9 +74,14 @@ pub struct PersistedPreviewState {
     pub tag: Option<String>,
     pub deployed_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
-    pub domain: String,
+    #[serde(default)]
+    pub domain: Option<String>,
     #[serde(default)]
     pub manifest_path: Option<PathBuf>,
+    /// App kind: "container", "pod", or "worker".
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 // ─── Conversions ──────────────────────────────────────────────────────────────
@@ -91,6 +100,7 @@ impl From<&PreviewState> for PersistedPreviewState {
             expires_at: s.expires_at,
             domain: s.domain.clone(),
             manifest_path: s.manifest_path.clone(),
+            kind: s.kind.clone(),
         }
     }
 }
@@ -117,6 +127,7 @@ impl From<PersistedPreviewState> for PreviewState {
             domain: p.domain,
             manifest_path: p.manifest_path,
             deploy_id: None,
+            kind: p.kind,
         }
     }
 }
@@ -549,20 +560,11 @@ pub(crate) async fn execute_preview_deploy_inner(
         .get(&state_key)
         .and_then(|s| s.manifest_path.clone());
 
-    // Resolve the preview domain before inserting initial state.
-    let resolved_domain = resolve_preview_domain(
-        preview_id,
-        app_name,
-        &shared.config.preview,
-        &shared.app_config.preview,
-    )
-    .map_err(|e| DeployError::Message(format!("domain resolution failed: {e}")))?;
-
     // Record the deploy timestamp once so it's consistent.
     let deployed_at = Utc::now();
 
     // Insert initial preview state entry (Deploying).
-    // expires_at starts as None — we'll fill it in after extracting repo config.
+    // expires_at and domain start as None — we'll fill them in after extracting repo config.
     {
         let initial = PreviewState {
             preview_id: preview_id.clone(),
@@ -575,9 +577,10 @@ pub(crate) async fn execute_preview_deploy_inner(
             tag: Some(ctx.tag.clone()),
             deployed_at,
             expires_at: None,
-            domain: resolved_domain.clone(),
+            domain: None,
             manifest_path: None,
             deploy_id: Some(ctx.deploy_id.clone()),
+            kind: None,
         };
         shared.preview_states.insert(state_key.clone(), initial);
     }
@@ -695,6 +698,30 @@ pub(crate) async fn execute_preview_deploy_inner(
     }
 
     let mut effective_config = merged.app.clone();
+
+    // Determine if this is a worker preview.
+    let is_worker = merged.kind == "worker";
+
+    // Resolve the preview domain (skipped for workers — they have no domain).
+    let resolved_domain = if is_worker {
+        None
+    } else {
+        Some(
+            resolve_preview_domain(
+                preview_id,
+                app_name,
+                &shared.config.preview,
+                &shared.app_config.preview,
+            )
+            .map_err(|e| DeployError::Message(format!("domain resolution failed: {e}")))?,
+        )
+    };
+
+    // Update the initial state entry with the resolved domain and kind.
+    if let Some(mut entry) = shared.preview_states.get_mut(&state_key) {
+        entry.domain = resolved_domain.clone();
+        entry.kind = Some(merged.kind.clone());
+    }
 
     // ── RESOURCE CAPPING (SLIP-58) ────────────────────────────────────────────
     // Compute preview-specific resource limits, capped at server maximums.
@@ -924,34 +951,46 @@ pub(crate) async fn execute_preview_deploy_inner(
             return Err(DeployError::Message(format!("pod deploy failed: {e}")));
         }
 
-        let routing_container = merged.routing_container.as_deref().unwrap_or("web");
-        let routing_port = effective_config.routing.port;
+        // For workers, skip port discovery — they don't receive inbound traffic.
+        let host_port = if is_worker {
+            0
+        } else {
+            let routing_container = merged.routing_container.as_deref().unwrap_or("web");
+            let routing_port = effective_config.routing.port.unwrap_or(0);
 
-        let host_port = match runtime
-            .pod_container_port(&pod_name, routing_container, routing_port)
-            .await
-        {
-            Ok(port) => port,
-            Err(e) => {
-                fail_preview(&shared.preview_states, &state_key);
-                if let Err(te) = runtime.teardown_pod(&manifest_path).await {
-                    tracing::warn!(error = %te, "failed to teardown pod after port lookup failure");
+            match runtime
+                .pod_container_port(&pod_name, routing_container, routing_port)
+                .await
+            {
+                Ok(port) => port,
+                Err(e) => {
+                    fail_preview(&shared.preview_states, &state_key);
+                    if let Err(te) = runtime.teardown_pod(&manifest_path).await {
+                        tracing::warn!(error = %te, "failed to teardown pod after port lookup failure");
+                    }
+                    return Err(DeployError::Message(format!(
+                        "failed to get pod container port: {e}"
+                    )));
                 }
-                return Err(DeployError::Message(format!(
-                    "failed to get pod container port: {e}"
-                )));
             }
         };
 
         (None, host_port, Some(pod_name), Some(manifest_path))
     } else {
         // ── CONTAINER DEPLOY ─────────────────────────────────────────────────
+        // For workers, pass container_port=0 so Docker/Podman skip port binding.
+        let container_port = if is_worker {
+            0
+        } else {
+            effective_config.routing.port.unwrap_or(0)
+        };
+
         let (container_id, host_port) = match runtime
             .create_and_start(
                 &preview_app_name,
                 &ctx.image,
                 &ctx.tag,
-                effective_config.routing.port,
+                container_port,
                 env_vars,
                 &effective_config.network.name,
                 &effective_config.resources,
@@ -974,7 +1013,10 @@ pub(crate) async fn execute_preview_deploy_inner(
         if let Some(mut entry) = shared.preview_states.get_mut(&state_key) {
             entry.container_id = container_id.clone();
             entry.pod_name = pod_name.clone();
-            entry.port = Some(host_port);
+            // Workers don't have a port — they don't receive inbound traffic.
+            if !is_worker {
+                entry.port = Some(host_port);
+            }
             entry.manifest_path = manifest_path.clone();
         }
     }
@@ -986,22 +1028,80 @@ pub(crate) async fn execute_preview_deploy_inner(
         DeployStatus::HealthChecking,
     );
 
-    if let Err(e) = health.check(host_port, &effective_config.health).await {
-        tracing::error!(
-            app = %app_name,
-            preview_id = %preview_id,
-            error = %e,
-            "preview health check failed"
-        );
-        fail_preview(&shared.preview_states, &state_key);
-        // Clean up container/pod on health failure.
-        if let Some(ref cid) = container_id {
-            let _ = runtime.stop_and_remove(cid).await;
+    if is_worker {
+        // Workers use container_is_running() instead of HTTP health check.
+        let check_id = container_id.as_ref().or(pod_name.as_ref());
+        match check_id {
+            Some(id) => match runtime.container_is_running(id).await {
+                Ok(true) => {
+                    tracing::info!(
+                        app = %app_name,
+                        preview_id = %preview_id,
+                        "worker preview container is running"
+                    );
+                }
+                Ok(false) => {
+                    tracing::error!(
+                        app = %app_name,
+                        preview_id = %preview_id,
+                        "worker preview container is not running"
+                    );
+                    fail_preview(&shared.preview_states, &state_key);
+                    if let Some(ref cid) = container_id {
+                        let _ = runtime.stop_and_remove(cid).await;
+                    }
+                    if let Some(ref manifest) = manifest_path {
+                        let _ = runtime.teardown_pod(manifest).await;
+                    }
+                    return Err(DeployError::Message(
+                        "worker preview container not running after start".to_string(),
+                    ));
+                }
+                Err(e) => {
+                    tracing::error!(
+                        app = %app_name,
+                        preview_id = %preview_id,
+                        error = %e,
+                        "failed to check worker preview container state"
+                    );
+                    fail_preview(&shared.preview_states, &state_key);
+                    if let Some(ref cid) = container_id {
+                        let _ = runtime.stop_and_remove(cid).await;
+                    }
+                    if let Some(ref manifest) = manifest_path {
+                        let _ = runtime.teardown_pod(manifest).await;
+                    }
+                    return Err(DeployError::Message(format!(
+                        "worker preview container state check failed: {e}"
+                    )));
+                }
+            },
+            None => {
+                fail_preview(&shared.preview_states, &state_key);
+                return Err(DeployError::Message(
+                    "worker preview: no container or pod ID available for health check".to_string(),
+                ));
+            }
         }
-        if let Some(ref manifest) = manifest_path {
-            let _ = runtime.teardown_pod(manifest).await;
+    } else {
+        // HTTP apps use the standard HTTP health check.
+        if let Err(e) = health.check(host_port, &effective_config.health).await {
+            tracing::error!(
+                app = %app_name,
+                preview_id = %preview_id,
+                error = %e,
+                "preview health check failed"
+            );
+            fail_preview(&shared.preview_states, &state_key);
+            // Clean up container/pod on health failure.
+            if let Some(ref cid) = container_id {
+                let _ = runtime.stop_and_remove(cid).await;
+            }
+            if let Some(ref manifest) = manifest_path {
+                let _ = runtime.teardown_pod(manifest).await;
+            }
+            return Err(DeployError::Message(format!("health check failed: {e}")));
         }
-        return Err(DeployError::Message(format!("health check failed: {e}")));
     }
 
     // ── POST-DEPLOY HOOKS (SLIP-57) ───────────────────────────────────────────
@@ -1078,37 +1178,39 @@ pub(crate) async fn execute_preview_deploy_inner(
         }
     }
 
-    // ── SET CADDY ROUTE ───────────────────────────────────────────────────────
-    update_preview_deploy_status(&shared.preview_states, &state_key, DeployStatus::Switching);
+    // ── SET CADDY ROUTE (skipped for workers) ─────────────────────────────────
+    if !is_worker {
+        update_preview_deploy_status(&shared.preview_states, &state_key, DeployStatus::Switching);
 
-    // Use the resolved domain from earlier (set on initial state insert).
-    if let Err(e) = caddy
-        .set_route(&preview_app_name, &resolved_domain, host_port)
-        .await
-    {
-        tracing::error!(
-            app = %app_name,
-            preview_id = %preview_id,
-            error = %e,
-            "preview caddy route update failed"
-        );
-        fail_preview(&shared.preview_states, &state_key);
-        if let Some(ref cid) = container_id {
-            let _ = runtime.stop_and_remove(cid).await;
+        // Use the resolved domain from earlier.
+        let domain = resolved_domain.as_deref().unwrap_or("");
+        if let Err(e) = caddy.set_route(&preview_app_name, domain, host_port).await {
+            tracing::error!(
+                app = %app_name,
+                preview_id = %preview_id,
+                error = %e,
+                "preview caddy route update failed"
+            );
+            fail_preview(&shared.preview_states, &state_key);
+            if let Some(ref cid) = container_id {
+                let _ = runtime.stop_and_remove(cid).await;
+            }
+            if let Some(ref manifest) = manifest_path {
+                let _ = runtime.teardown_pod(manifest).await;
+            }
+            return Err(DeployError::Message(format!(
+                "caddy route update failed: {e}"
+            )));
         }
-        if let Some(ref manifest) = manifest_path {
-            let _ = runtime.teardown_pod(manifest).await;
-        }
-        return Err(DeployError::Message(format!(
-            "caddy route update failed: {e}"
-        )));
     }
 
     // ── COMPLETED ─────────────────────────────────────────────────────────────
     {
         if let Some(mut entry) = shared.preview_states.get_mut(&state_key) {
             entry.status = AppStatus::Running;
-            entry.port = Some(host_port);
+            if !is_worker {
+                entry.port = Some(host_port);
+            }
         }
     }
 
@@ -1147,8 +1249,9 @@ fn fail_preview(preview_states: &DashMap<String, PreviewState>, key: &str) {
 
 /// Tear down a preview deployment.
 ///
-/// Stops/removes the container or pod, removes the Caddy route, clears the
-/// in-memory state, and deletes the persisted state file.
+/// Stops/removes the container or pod, removes the Caddy route (unless the
+/// preview is a worker), clears the in-memory state, and deletes the persisted
+/// state file.
 pub async fn teardown_preview(
     runtime: &dyn RuntimeBackend,
     caddy: &dyn ReverseProxy,
@@ -1161,12 +1264,13 @@ pub async fn teardown_preview(
     let preview_app_name = format!("{app_name}-preview-{preview_id}");
 
     // Look up state.
-    let (container_id, pod_name, manifest_path) = {
+    let (container_id, pod_name, manifest_path, is_worker) = {
         match preview_states.get(&key) {
             Some(entry) => (
                 entry.container_id.clone(),
                 entry.pod_name.clone(),
                 entry.manifest_path.clone(),
+                entry.kind.as_deref() == Some("worker"),
             ),
             None => {
                 tracing::warn!(
@@ -1205,15 +1309,17 @@ pub async fn teardown_preview(
         }
     }
 
-    // Remove Caddy route.
-    tracing::info!(app = %app_name, preview_id = %preview_id, "removing preview Caddy route");
-    if let Err(e) = caddy.remove_route(&preview_app_name).await {
-        tracing::warn!(
-            app = %app_name,
-            preview_id = %preview_id,
-            error = %e,
-            "failed to remove Caddy route for preview (non-fatal)"
-        );
+    // Remove Caddy route (skipped for workers — they don't have routes).
+    if !is_worker {
+        tracing::info!(app = %app_name, preview_id = %preview_id, "removing preview Caddy route");
+        if let Err(e) = caddy.remove_route(&preview_app_name).await {
+            tracing::warn!(
+                app = %app_name,
+                preview_id = %preview_id,
+                error = %e,
+                "failed to remove Caddy route for preview (non-fatal)"
+            );
+        }
     }
 
     // Remove from in-memory state.
@@ -1764,8 +1870,8 @@ mod tests {
                 secret: None,
             },
             routing: RoutingConfig {
-                domain: "testapp.example.com".to_string(),
-                port: 3000,
+                domain: Some("testapp.example.com".to_string()),
+                port: Some(3000),
             },
             health: HealthConfig {
                 path: None,
@@ -1951,9 +2057,10 @@ enabled = {enabled}
                 tag: Some("sha-old".to_string()),
                 deployed_at: Utc::now(),
                 expires_at: None,
-                domain: "pr-42.preview.example.com".to_string(),
+                domain: Some("pr-42.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: Some("dep_old".to_string()),
+                kind: None,
             },
         );
 
@@ -2056,9 +2163,10 @@ enabled = {enabled}
                 tag: Some("v1".to_string()),
                 deployed_at: Utc::now(),
                 expires_at: None,
-                domain: "pr-1.preview.example.com".to_string(),
+                domain: Some("pr-1.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
+                kind: None,
             },
         );
 
@@ -2138,9 +2246,10 @@ enabled = {enabled}
             tag: Some("sha-abc123".to_string()),
             deployed_at: Utc::now(),
             expires_at: None,
-            domain: "pr-42.preview.example.com".to_string(),
+            domain: Some("pr-42.preview.example.com".to_string()),
             manifest_path: None,
             deploy_id: Some("dep_transient".to_string()),
+            kind: None,
         }
     }
 
@@ -2154,7 +2263,10 @@ enabled = {enabled}
         assert_eq!(persisted.sha, "abc123def456");
         assert_eq!(persisted.container_id.as_deref(), Some("ctr-abc123"));
         assert_eq!(persisted.port, Some(54321));
-        assert_eq!(persisted.domain, "pr-42.preview.example.com");
+        assert_eq!(
+            persisted.domain.as_deref(),
+            Some("pr-42.preview.example.com")
+        );
 
         // deploy_id is NOT in PersistedPreviewState — compile-time guarantee.
     }
@@ -2171,8 +2283,9 @@ enabled = {enabled}
             tag: Some("v1".to_string()),
             deployed_at: Utc::now(),
             expires_at: None,
-            domain: "pr-1.preview.example.com".to_string(),
+            domain: Some("pr-1.preview.example.com".to_string()),
             manifest_path: None,
+            kind: None,
         };
 
         let state = PreviewState::from(persisted);
@@ -2195,8 +2308,9 @@ enabled = {enabled}
             tag: None,
             deployed_at: Utc::now(),
             expires_at: None,
-            domain: "pr-2.preview.example.com".to_string(),
+            domain: Some("pr-2.preview.example.com".to_string()),
             manifest_path: None,
+            kind: None,
         };
 
         let state = PreviewState::from(persisted);
@@ -2358,7 +2472,8 @@ enabled = {enabled}
         // State domain should be resolved correctly.
         let state = preview_states.get("testapp:pr-42").unwrap();
         assert_eq!(
-            state.domain, "pr-42.preview.example.com",
+            state.domain.as_deref(),
+            Some("pr-42.preview.example.com"),
             "domain should be pr-42.preview.example.com"
         );
 
@@ -2407,7 +2522,8 @@ enabled = {enabled}
 
         let state = preview_states.get("testapp:pr-42").unwrap();
         assert_eq!(
-            state.domain, "pr-42.preview.app.com",
+            state.domain.as_deref(),
+            Some("pr-42.preview.app.com"),
             "app-level domain should override server domain"
         );
     }
@@ -2472,9 +2588,10 @@ enabled = {enabled}
                 tag: Some("v1".to_string()),
                 deployed_at: Utc::now(),
                 expires_at: None,
-                domain: "pr-42.preview.example.com".to_string(),
+                domain: Some("pr-42.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
+                kind: None,
             },
         );
 
@@ -2609,9 +2726,10 @@ enabled = {enabled}
                 tag: Some("v1".to_string()),
                 deployed_at: past - ChronoDuration::hours(1),
                 expires_at: Some(past), // already expired
-                domain: "pr-expired.preview.example.com".to_string(),
+                domain: Some("pr-expired.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
+                kind: None,
             },
         );
 
@@ -2640,9 +2758,10 @@ enabled = {enabled}
                 tag: Some("v2".to_string()),
                 deployed_at: Utc::now(),
                 expires_at: Some(future), // not yet expired
-                domain: "pr-fresh.preview.example.com".to_string(),
+                domain: Some("pr-fresh.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
+                kind: None,
             },
         );
 
@@ -2671,9 +2790,10 @@ enabled = {enabled}
                 tag: Some("v3".to_string()),
                 deployed_at: Utc::now() - ChronoDuration::days(100),
                 expires_at: None, // no TTL configured
-                domain: "pr-no-ttl.preview.example.com".to_string(),
+                domain: Some("pr-no-ttl.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
+                kind: None,
             },
         );
 
@@ -2728,9 +2848,10 @@ max = {max}
                 tag: Some("old-tag".to_string()),
                 deployed_at: old_time, // oldest
                 expires_at: None,
-                domain: "pr-old.preview.example.com".to_string(),
+                domain: Some("pr-old.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
+                kind: None,
             },
         );
         preview_states.insert(
@@ -2746,9 +2867,10 @@ max = {max}
                 tag: Some("newer-tag".to_string()),
                 deployed_at: newer_time, // not oldest
                 expires_at: None,
-                domain: "pr-newer.preview.example.com".to_string(),
+                domain: Some("pr-newer.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
+                kind: None,
             },
         );
 
@@ -2813,9 +2935,10 @@ max = {max}
                 tag: Some("existing-tag".to_string()),
                 deployed_at: Utc::now() - ChronoDuration::hours(1),
                 expires_at: None,
-                domain: "pr-existing.preview.example.com".to_string(),
+                domain: Some("pr-existing.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
+                kind: None,
             },
         );
 

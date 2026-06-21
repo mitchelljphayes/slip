@@ -33,6 +33,10 @@ pub struct PersistedAppState {
     /// Path to the rendered manifest for the current pod.
     #[serde(default)]
     pub current_manifest_path: Option<PathBuf>,
+    /// App kind: "container", "pod", or "worker".
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 impl From<&AppRuntimeState> for PersistedAppState {
@@ -45,6 +49,7 @@ impl From<&AppRuntimeState> for PersistedAppState {
             deployed_at: s.deployed_at,
             current_pod_name: s.current_pod_name.clone(),
             current_manifest_path: s.current_manifest_path.clone(),
+            kind: s.kind.clone(),
         }
     }
 }
@@ -68,6 +73,7 @@ impl From<PersistedAppState> for AppRuntimeState {
             deploy_id: None,
             current_pod_name: p.current_pod_name,
             current_manifest_path: p.current_manifest_path,
+            kind: p.kind,
         }
     }
 }
@@ -211,6 +217,9 @@ pub async fn verify_containers(
 ///
 /// Looks up each app's domain from `app_configs`. Apps without a config entry
 /// are skipped with a warning.
+///
+/// Worker apps are implicitly skipped because they have `current_port = None`
+/// (the `?` operator on `state.current_port?` returns `None` for workers).
 pub async fn reconcile_routes(
     caddy: &CaddyClient,
     states: &HashMap<String, AppRuntimeState>,
@@ -232,7 +241,7 @@ pub async fn reconcile_routes(
             };
             Some(RouteInfo {
                 app_name: app_name.clone(),
-                domain: config.routing.domain.clone(),
+                domain: config.routing.domain.clone().unwrap_or_default(),
                 port,
             })
         })
@@ -254,6 +263,9 @@ pub async fn reconcile_routes(
 /// For each preview state with status `Running` and a non-empty domain, calls
 /// `set_route` to ensure the Caddy route exists. This recovers routes that were
 /// lost due to a Caddy restart while slipd was down.
+///
+/// Worker previews are implicitly skipped because they have `port = None`
+/// (the `?` operator on `state.port?` returns `None` for workers).
 pub async fn reconcile_preview_routes(
     caddy: &CaddyClient,
     preview_states: &DashMap<String, PreviewState>,
@@ -266,14 +278,15 @@ pub async fn reconcile_preview_routes(
                 return None;
             }
             let port = state.port?;
-            if state.domain.is_empty() {
+            let domain = state.domain.as_deref()?;
+            if domain.is_empty() {
                 return None;
             }
             // The Caddy route app_name for previews is "{app}-preview-{preview_id}".
             let preview_app_name = format!("{}-preview-{}", state.app, state.preview_id);
             Some(RouteInfo {
                 app_name: preview_app_name,
-                domain: state.domain.clone(),
+                domain: domain.to_string(),
                 port,
             })
         })
@@ -461,6 +474,7 @@ mod tests {
             deploy_id: Some("dep_01abc".to_string()),
             current_pod_name: None,
             current_manifest_path: None,
+            kind: None,
         }
     }
 
@@ -499,6 +513,63 @@ mod tests {
         assert!(restored.deploy_id.is_none());
 
         // Status should be inferred from container_id presence
+        assert_eq!(restored.status, AppStatus::Running);
+    }
+
+    // ── Kind persistence ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_kind_persisted_across_save_load() {
+        let dir = TempDir::new().unwrap();
+        let state_dir = dir.path();
+        let app_name = "workerapp";
+
+        // Save with kind = "worker"
+        let original = AppRuntimeState {
+            status: AppStatus::Running,
+            current_tag: Some("v1".to_string()),
+            current_container_id: Some("ctr-xyz".to_string()),
+            current_port: None,
+            deployed_at: Some(Utc::now()),
+            kind: Some("worker".to_string()),
+            ..Default::default()
+        };
+        save_app_state(state_dir, app_name, &original).expect("save should succeed");
+
+        let loaded = load_app_states(state_dir).expect("load should succeed");
+        let restored = &loaded[app_name];
+
+        assert_eq!(
+            restored.kind.as_deref(),
+            Some("worker"),
+            "kind should be preserved across save/load"
+        );
+        assert_eq!(restored.status, AppStatus::Running);
+    }
+
+    #[test]
+    fn test_kind_backward_compat_missing_field() {
+        // Simulate an old state file without the `kind` field.
+        let dir = TempDir::new().unwrap();
+        let state_dir = dir.path();
+        let app_name = "oldapp";
+
+        let old_json = serde_json::json!({
+            "current_tag": "v1",
+            "current_container_id": "ctr-old",
+            "current_port": 8080,
+            "deployed_at": null
+        });
+        let path = state_dir.join(format!("{app_name}.json"));
+        std::fs::write(&path, serde_json::to_string_pretty(&old_json).unwrap()).unwrap();
+
+        let loaded = load_app_states(state_dir).expect("load should succeed");
+        let restored = &loaded[app_name];
+
+        assert!(
+            restored.kind.is_none(),
+            "old state files without kind should deserialize to None"
+        );
         assert_eq!(restored.status, AppStatus::Running);
     }
 
@@ -667,8 +738,8 @@ mod tests {
                     secret: None,
                 },
                 routing: crate::config::RoutingConfig {
-                    domain: "app1.example.com".to_string(),
-                    port: 80,
+                    domain: Some("app1.example.com".to_string()),
+                    port: Some(80),
                 },
                 health: crate::config::HealthConfig::default(),
                 deploy: crate::config::DeployConfig::default(),
@@ -748,8 +819,8 @@ mod tests {
                     secret: None,
                 },
                 routing: crate::config::RoutingConfig {
-                    domain: "app1.example.com".to_string(),
-                    port: 80,
+                    domain: Some("app1.example.com".to_string()),
+                    port: Some(80),
                 },
                 health: crate::config::HealthConfig::default(),
                 deploy: crate::config::DeployConfig::default(),
@@ -813,9 +884,10 @@ mod tests {
             tag: Some("sha-deadbeef".to_string()),
             deployed_at: Utc::now(),
             expires_at: None,
-            domain: "pr-99.preview.example.com".to_string(),
+            domain: Some("pr-99.preview.example.com".to_string()),
             manifest_path: None,
             deploy_id: Some("dep_transient_xyz".to_string()),
+            kind: None,
         }
     }
 
@@ -930,9 +1002,10 @@ mod tests {
             tag: Some("v1".to_string()),
             deployed_at: Utc::now(),
             expires_at: None,
-            domain: domain.to_string(),
+            domain: Some(domain.to_string()),
             manifest_path: None,
             deploy_id: None,
+            kind: None,
         }
     }
 
@@ -999,9 +1072,10 @@ mod tests {
                 tag: None,
                 deployed_at: Utc::now(),
                 expires_at: None,
-                domain: "pr-2.preview.example.com".to_string(),
+                domain: Some("pr-2.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
+                kind: None,
             },
         );
 
