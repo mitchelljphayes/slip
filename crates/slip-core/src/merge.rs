@@ -13,7 +13,10 @@
 //! - Extra repo metadata (kind, manifest, pod containers, preview) is kept
 //!   alongside the merged `AppConfig` in `MergedConfig`.
 
+use std::collections::HashMap;
+
 use crate::config::AppConfig;
+use crate::error::ConfigError;
 use crate::repo_config::{PreviewConfig, RepoConfig};
 
 /// Merge repo config into server app config.
@@ -21,9 +24,13 @@ use crate::repo_config::{PreviewConfig, RepoConfig};
 /// The repo config provides defaults for fields the server config leaves unset.
 /// The server config always wins for domain, secrets, and explicitly-set resources.
 ///
+/// Volumes are matched by `mount_path`. Every repo-declared volume must have a
+/// matching server `host_path`, or an error is returned. Server-only volumes
+/// (no matching repo volume) are included as extra mounts.
+///
 /// Returns a [`MergedConfig`] containing the merged `AppConfig` plus extra
 /// metadata from the repo that has no home in the Phase 1 `AppConfig` schema.
-pub fn merge_config(server: &AppConfig, repo: &RepoConfig) -> MergedConfig {
+pub fn merge_config(server: &AppConfig, repo: &RepoConfig) -> Result<MergedConfig, ConfigError> {
     let mut merged = server.clone();
 
     // ── Health: repo provides path default if server didn't set one ──────────
@@ -41,14 +48,71 @@ pub fn merge_config(server: &AppConfig, repo: &RepoConfig) -> MergedConfig {
         }
     }
 
-    MergedConfig {
+    // ── Volumes: match repo volumes to server volumes by mount_path ──────────
+    let server_volumes: HashMap<&str, &crate::config::VolumeConfig> = server
+        .volumes
+        .iter()
+        .map(|v| (v.mount_path.as_str(), v))
+        .collect();
+
+    let mut merged_volumes = Vec::new();
+
+    for repo_vol in &repo.volumes {
+        match server_volumes.get(repo_vol.mount_path.as_str()) {
+            Some(server_vol) => {
+                // Server always wins for read_only
+                merged_volumes.push(MergedVolume {
+                    host_path: server_vol.host_path.clone(),
+                    mount_path: repo_vol.mount_path.clone(),
+                    read_only: server_vol.read_only,
+                });
+            }
+            None => {
+                return Err(ConfigError::VolumeMissingHostPath {
+                    mount_path: repo_vol.mount_path.clone(),
+                });
+            }
+        }
+    }
+
+    // Server-only volumes (no matching repo volume) are included as extra mounts
+    for server_vol in &server.volumes {
+        if !repo
+            .volumes
+            .iter()
+            .any(|rv| rv.mount_path == server_vol.mount_path)
+        {
+            merged_volumes.push(MergedVolume {
+                host_path: server_vol.host_path.clone(),
+                mount_path: server_vol.mount_path.clone(),
+                read_only: server_vol.read_only,
+            });
+        }
+    }
+
+    Ok(MergedConfig {
         app: merged,
         kind: repo.app.kind.clone(),
         manifest: repo.app.manifest.clone(),
         health_container: repo.health.container.clone(),
         routing_container: repo.routing.container.clone(),
         preview: repo.preview.clone(),
-    }
+        volumes: merged_volumes,
+    })
+}
+
+/// A fully resolved volume after merging repo and server config.
+///
+/// Combines the server's `host_path` with the repo's `mount_path` and `read_only`.
+/// `read_only` follows server-wins precedence.
+#[derive(Debug, Clone)]
+pub struct MergedVolume {
+    /// Absolute path on the host filesystem (from server config).
+    pub host_path: String,
+    /// Absolute path inside the container (from repo config).
+    pub mount_path: String,
+    /// Whether the mount should be read-only (server wins, then repo).
+    pub read_only: bool,
 }
 
 /// The result of merging repo + server config.
@@ -70,6 +134,8 @@ pub struct MergedConfig {
     pub routing_container: Option<String>,
     /// Preview environment configuration from the repo.
     pub preview: Option<PreviewConfig>,
+    /// Resolved volume mounts (merged from server + repo configs).
+    pub volumes: Vec<MergedVolume>,
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -116,6 +182,7 @@ mod tests {
             resources: ResourceConfig::default(),
             network: NetworkConfig::default(),
             preview: None,
+            volumes: Vec::new(),
         }
     }
 
@@ -131,17 +198,16 @@ mod tests {
             defaults: RepoDefaults::default(),
             preview: None,
             deploy: crate::repo_config::RepoDeployConfig::default(),
+            volumes: Vec::new(),
         }
     }
-
-    // ── Server-only (no repo config fields) ──────────────────────────────────
 
     #[test]
     fn merge_server_only_unchanged() {
         let server = base_server_config();
         let repo = minimal_repo_config("testapp");
 
-        let merged = merge_config(&server, &repo);
+        let merged = merge_config(&server, &repo).unwrap();
 
         // App config should be unchanged
         assert_eq!(merged.app.routing.domain, "testapp.example.com");
@@ -154,6 +220,7 @@ mod tests {
         assert_eq!(merged.kind, "container");
         assert!(merged.manifest.is_none());
         assert!(merged.preview.is_none());
+        assert!(merged.volumes.is_empty());
     }
 
     // ── Repo provides health path; server has none ────────────────────────────
@@ -164,7 +231,7 @@ mod tests {
         let mut repo = minimal_repo_config("testapp");
         repo.health.path = Some("/healthz".to_string());
 
-        let merged = merge_config(&server, &repo);
+        let merged = merge_config(&server, &repo).unwrap();
 
         assert_eq!(merged.app.health.path.as_deref(), Some("/healthz"));
     }
@@ -179,7 +246,7 @@ mod tests {
         let mut repo = minimal_repo_config("testapp");
         repo.health.path = Some("/repo-health".to_string());
 
-        let merged = merge_config(&server, &repo);
+        let merged = merge_config(&server, &repo).unwrap();
 
         // Server's path should be preserved
         assert_eq!(merged.app.health.path.as_deref(), Some("/server-health"));
@@ -196,7 +263,7 @@ mod tests {
             cpus: Some("0.5".to_string()),
         });
 
-        let merged = merge_config(&server, &repo);
+        let merged = merge_config(&server, &repo).unwrap();
 
         assert_eq!(merged.app.resources.memory.as_deref(), Some("512m"));
         assert_eq!(merged.app.resources.cpus.as_deref(), Some("0.5"));
@@ -216,7 +283,7 @@ mod tests {
             cpus: Some("0.25".to_string()),
         });
 
-        let merged = merge_config(&server, &repo);
+        let merged = merge_config(&server, &repo).unwrap();
 
         // Server's resources should win
         assert_eq!(merged.app.resources.memory.as_deref(), Some("1g"));
@@ -237,7 +304,7 @@ mod tests {
             cpus: Some("0.5".to_string()),
         });
 
-        let merged = merge_config(&server, &repo);
+        let merged = merge_config(&server, &repo).unwrap();
 
         // Server's memory wins, repo's cpus fill the gap
         assert_eq!(merged.app.resources.memory.as_deref(), Some("1g"));
@@ -255,11 +322,182 @@ mod tests {
         repo.health.container = Some("web".to_string());
         repo.routing.container = Some("web".to_string());
 
-        let merged = merge_config(&server, &repo);
+        let merged = merge_config(&server, &repo).unwrap();
 
         assert_eq!(merged.kind, "pod");
         assert_eq!(merged.manifest.as_deref(), Some("pod.yaml"));
         assert_eq!(merged.health_container.as_deref(), Some("web"));
         assert_eq!(merged.routing_container.as_deref(), Some("web"));
+    }
+
+    // ── Volume merge tests ─────────────────────────────────────────────────────
+
+    fn server_with_volumes(volumes: Vec<crate::config::VolumeConfig>) -> AppConfig {
+        let mut server = base_server_config();
+        server.volumes = volumes;
+        server
+    }
+
+    fn repo_with_volumes(volumes: Vec<crate::repo_config::RepoVolume>) -> RepoConfig {
+        let mut repo = minimal_repo_config("testapp");
+        repo.volumes = volumes;
+        repo
+    }
+
+    #[test]
+    fn merge_volumes_server_only() {
+        let server = server_with_volumes(vec![crate::config::VolumeConfig {
+            host_path: "/data/myapp".to_string(),
+            mount_path: "/app/data".to_string(),
+            read_only: false,
+        }]);
+        let repo = minimal_repo_config("testapp");
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        assert_eq!(merged.volumes.len(), 1);
+        assert_eq!(merged.volumes[0].host_path, "/data/myapp");
+        assert_eq!(merged.volumes[0].mount_path, "/app/data");
+        assert!(!merged.volumes[0].read_only);
+    }
+
+    #[test]
+    fn merge_volumes_repo_only_errors() {
+        let server = base_server_config();
+        let repo = repo_with_volumes(vec![crate::repo_config::RepoVolume {
+            mount_path: "/app/data".to_string(),
+            read_only: false,
+        }]);
+
+        let err = merge_config(&server, &repo).unwrap_err();
+
+        match err {
+            crate::error::ConfigError::VolumeMissingHostPath { mount_path } => {
+                assert_eq!(mount_path, "/app/data");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn merge_volumes_matching_repo_and_server() {
+        let server = server_with_volumes(vec![crate::config::VolumeConfig {
+            host_path: "/data/myapp".to_string(),
+            mount_path: "/app/data".to_string(),
+            read_only: false,
+        }]);
+        let repo = repo_with_volumes(vec![crate::repo_config::RepoVolume {
+            mount_path: "/app/data".to_string(),
+            read_only: true,
+        }]);
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        assert_eq!(merged.volumes.len(), 1);
+        assert_eq!(merged.volumes[0].host_path, "/data/myapp");
+        assert_eq!(merged.volumes[0].mount_path, "/app/data");
+        // Server's read_only (false) wins over repo's (true)
+        assert!(!merged.volumes[0].read_only);
+    }
+
+    #[test]
+    fn merge_volumes_server_extra_included() {
+        let server = server_with_volumes(vec![
+            crate::config::VolumeConfig {
+                host_path: "/data/shared".to_string(),
+                mount_path: "/shared".to_string(),
+                read_only: true,
+            },
+            crate::config::VolumeConfig {
+                host_path: "/data/myapp".to_string(),
+                mount_path: "/app/data".to_string(),
+                read_only: false,
+            },
+        ]);
+        let repo = repo_with_volumes(vec![crate::repo_config::RepoVolume {
+            mount_path: "/app/data".to_string(),
+            read_only: false,
+        }]);
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        assert_eq!(merged.volumes.len(), 2);
+        // Server-only volume (no repo match) is included
+        let shared = merged
+            .volumes
+            .iter()
+            .find(|v| v.mount_path == "/shared")
+            .unwrap();
+        assert_eq!(shared.host_path, "/data/shared");
+        assert!(shared.read_only);
+        // Matched volume
+        let data = merged
+            .volumes
+            .iter()
+            .find(|v| v.mount_path == "/app/data")
+            .unwrap();
+        assert_eq!(data.host_path, "/data/myapp");
+    }
+
+    #[test]
+    fn merge_volumes_read_only_server_wins() {
+        let server = server_with_volumes(vec![crate::config::VolumeConfig {
+            host_path: "/data/myapp".to_string(),
+            mount_path: "/app/data".to_string(),
+            read_only: true,
+        }]);
+        let repo = repo_with_volumes(vec![crate::repo_config::RepoVolume {
+            mount_path: "/app/data".to_string(),
+            read_only: false,
+        }]);
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        assert_eq!(merged.volumes.len(), 1);
+        // Server's read_only (true) wins over repo's (false)
+        assert!(merged.volumes[0].read_only);
+    }
+
+    #[test]
+    fn merge_volumes_multiple_different_paths() {
+        let server = server_with_volumes(vec![
+            crate::config::VolumeConfig {
+                host_path: "/data/config".to_string(),
+                mount_path: "/app/config".to_string(),
+                read_only: true,
+            },
+            crate::config::VolumeConfig {
+                host_path: "/data/uploads".to_string(),
+                mount_path: "/app/uploads".to_string(),
+                read_only: false,
+            },
+        ]);
+        let repo = repo_with_volumes(vec![
+            crate::repo_config::RepoVolume {
+                mount_path: "/app/config".to_string(),
+                read_only: false,
+            },
+            crate::repo_config::RepoVolume {
+                mount_path: "/app/uploads".to_string(),
+                read_only: true,
+            },
+        ]);
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        assert_eq!(merged.volumes.len(), 2);
+        // Server wins for read_only on both
+        let config = merged
+            .volumes
+            .iter()
+            .find(|v| v.mount_path == "/app/config")
+            .unwrap();
+        assert!(config.read_only);
+        let uploads = merged
+            .volumes
+            .iter()
+            .find(|v| v.mount_path == "/app/uploads")
+            .unwrap();
+        assert!(!uploads.read_only);
     }
 }

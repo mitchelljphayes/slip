@@ -347,6 +347,34 @@ pub(crate) fn effective_preview_resources(
     result
 }
 
+/// Derive preview-specific volumes with isolated host paths.
+///
+/// For each merged volume, creates a new `MergedVolume` with `host_path` modified
+/// to `{original_host_path}/previews/{preview_id}/`. Preserves `mount_path` and
+/// `read_only` unchanged.
+///
+/// Example: `/var/lib/slip/data/myapp` → `/var/lib/slip/data/myapp/previews/pr-42/`
+pub(crate) fn derive_preview_volumes(
+    volumes: &[crate::merge::MergedVolume],
+    preview_id: &str,
+) -> Vec<crate::merge::MergedVolume> {
+    volumes
+        .iter()
+        .map(|v| {
+            let preview_host_path = format!(
+                "{}/previews/{}/",
+                v.host_path.trim_end_matches('/'),
+                preview_id
+            );
+            crate::merge::MergedVolume {
+                host_path: preview_host_path,
+                mount_path: v.mount_path.clone(),
+                read_only: v.read_only,
+            }
+        })
+        .collect()
+}
+
 /// Return the lesser of `requested` and `cap` as a human-readable memory string.
 ///
 /// Both values are parsed to bytes via [`parse_memory_limit`]. If either cannot
@@ -611,7 +639,13 @@ pub(crate) async fn execute_preview_deploy_inner(
                             ));
                         }
                     }
-                    crate::merge::merge_config(&shared.app_config, &repo_config)
+                    match crate::merge::merge_config(&shared.app_config, &repo_config) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            fail_preview(&shared.preview_states, &state_key);
+                            return Err(DeployError::Message(format!("config merge failed: {e}")));
+                        }
+                    }
                 }
                 Err(e) => {
                     fail_preview(&shared.preview_states, &state_key);
@@ -642,6 +676,24 @@ pub(crate) async fn execute_preview_deploy_inner(
         }
     };
 
+    // Validate merged volumes at deploy time (defense-in-depth).
+    let vol_result = crate::validate::validate_merged_volumes(&merged.volumes);
+    if !vol_result.is_valid() {
+        fail_preview(&shared.preview_states, &state_key);
+        let errors: Vec<String> = vol_result.errors.iter().map(|e| e.to_string()).collect();
+        return Err(DeployError::Message(format!(
+            "volume validation failed at deploy time: {}",
+            errors.join("; ")
+        )));
+    }
+    for warning in &vol_result.warnings {
+        tracing::warn!(
+            app = %app_name,
+            preview_id = %preview_id,
+            "volume warning: {warning}"
+        );
+    }
+
     let mut effective_config = merged.app.clone();
 
     // ── RESOURCE CAPPING (SLIP-58) ────────────────────────────────────────────
@@ -652,6 +704,11 @@ pub(crate) async fn execute_preview_deploy_inner(
         &effective_config.resources,
     );
     effective_config.resources = preview_resources;
+
+    // ── PREVIEW VOLUMES ─────────────────────────────────────────────────────────
+    // Derive isolated host paths for preview volumes to prevent data
+    // cross-contamination between concurrent previews.
+    let preview_volumes = derive_preview_volumes(&merged.volumes, preview_id);
 
     // ── COMPUTE EXPIRES_AT (TTL) ──────────────────────────────────────────────
     // Priority: repo preview.ttl → server preview.default_ttl → None
@@ -833,6 +890,7 @@ pub(crate) async fn execute_preview_deploy_inner(
             pod_suffix: pod_suffix.clone(),
             env_vars: env_vars.clone(),
             image_overrides: std::collections::HashMap::new(),
+            volumes: preview_volumes.clone(),
         };
 
         let rendered_yaml = match crate::manifest::render_manifest(&manifest_bytes, &render_ctx) {
@@ -897,6 +955,7 @@ pub(crate) async fn execute_preview_deploy_inner(
                 env_vars,
                 &effective_config.network.name,
                 &effective_config.resources,
+                &preview_volumes,
             )
             .await
         {
@@ -1417,6 +1476,7 @@ mod tests {
             _env_vars: Vec<String>,
             _network: &'a str,
             _resources: &'a crate::config::ResourceConfig,
+            _volumes: &'a [crate::merge::MergedVolume],
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<(String, u16), RuntimeError>> + Send + 'a>,
         > {
@@ -1723,6 +1783,7 @@ mod tests {
             resources: ResourceConfig::default(),
             network: crate::config::NetworkConfig::default(),
             preview: None,
+            volumes: Vec::new(),
         }
     }
 
@@ -3183,5 +3244,64 @@ enabled = true
             second.last().map(|s| s.as_str()) == Some("seed-cmd"),
             "second exec should be seed: {second:?}"
         );
+    }
+
+    // ── Preview volume derivation tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_derive_preview_volumes_transforms_host_path() {
+        let volumes = vec![crate::merge::MergedVolume {
+            host_path: "/var/lib/slip/data/myapp".to_string(),
+            mount_path: "/app/data".to_string(),
+            read_only: false,
+        }];
+        let preview_id = "pr-42";
+        let result = derive_preview_volumes(&volumes, preview_id);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].host_path,
+            "/var/lib/slip/data/myapp/previews/pr-42/"
+        );
+        assert_eq!(result[0].mount_path, "/app/data");
+        assert!(!result[0].read_only);
+    }
+
+    #[test]
+    fn test_derive_preview_volumes_preserves_read_only() {
+        let volumes = vec![crate::merge::MergedVolume {
+            host_path: "/data/config".to_string(),
+            mount_path: "/app/config".to_string(),
+            read_only: true,
+        }];
+        let result = derive_preview_volumes(&volumes, "pr-7");
+        assert_eq!(result.len(), 1);
+        assert!(result[0].read_only);
+    }
+
+    #[test]
+    fn test_derive_preview_volumes_empty_input() {
+        let volumes = vec![];
+        let result = derive_preview_volumes(&volumes, "pr-42");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_derive_preview_volumes_multiple_volumes() {
+        let volumes = vec![
+            crate::merge::MergedVolume {
+                host_path: "/data/app1".to_string(),
+                mount_path: "/app/data".to_string(),
+                read_only: false,
+            },
+            crate::merge::MergedVolume {
+                host_path: "/data/app2".to_string(),
+                mount_path: "/app/config".to_string(),
+                read_only: true,
+            },
+        ];
+        let result = derive_preview_volumes(&volumes, "pr-99");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].host_path, "/data/app1/previews/pr-99/");
+        assert_eq!(result[1].host_path, "/data/app2/previews/pr-99/");
     }
 }

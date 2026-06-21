@@ -15,7 +15,10 @@ use bollard::container::{
     StopContainerOptions,
 };
 use bollard::image::CreateImageOptions;
-use bollard::models::{HostConfig, PortBinding};
+use bollard::models::{
+    HostConfig, Mount, MountBindOptions, MountBindOptionsPropagationEnum, MountTypeEnum,
+    PortBinding,
+};
 use bollard::network::CreateNetworkOptions;
 use futures_util::StreamExt;
 use tracing::{debug, info, warn};
@@ -25,6 +28,7 @@ use crate::docker::{
     extract_file_from_tar, extract_host_port, parse_cpu_limit, parse_memory_limit,
 };
 use crate::error::RuntimeError;
+use crate::merge::MergedVolume;
 use crate::runtime::{PodInfo, RegistryCredentials, RuntimeBackend};
 
 /// Podman container runtime backend.
@@ -190,6 +194,7 @@ impl RuntimeBackend for PodmanBackend {
         env_vars: Vec<String>,
         network: &'a str,
         resources: &'a ResourceConfig,
+        volumes: &'a [MergedVolume],
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(String, u16), RuntimeError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -217,11 +222,34 @@ impl RuntimeBackend for PodmanBackend {
             let memory = parse_memory_limit(&resources.memory);
             let nano_cpus = parse_cpu_limit(&resources.cpus);
 
+            // Volume mounts
+            let mounts: Option<Vec<Mount>> = if volumes.is_empty() {
+                None
+            } else {
+                Some(
+                    volumes
+                        .iter()
+                        .map(|v| Mount {
+                            typ: Some(MountTypeEnum::BIND),
+                            source: Some(v.host_path.clone()),
+                            target: Some(v.mount_path.clone()),
+                            read_only: Some(v.read_only),
+                            bind_options: Some(MountBindOptions {
+                                propagation: Some(MountBindOptionsPropagationEnum::RPRIVATE),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        })
+                        .collect(),
+                )
+            };
+
             let host_config = HostConfig {
                 port_bindings: Some(port_bindings),
                 network_mode: Some(network.to_string()),
                 memory,
                 nano_cpus,
+                mounts,
                 ..Default::default()
             };
 

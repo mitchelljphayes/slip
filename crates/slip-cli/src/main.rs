@@ -63,6 +63,10 @@ enum Commands {
         /// Also validate image references in pod manifests.
         #[arg(long)]
         strict: bool,
+        /// Path to server config directory (e.g. /etc/slip).
+        /// When provided, also validates merged volumes against server config.
+        #[arg(long)]
+        server_config: Option<String>,
     },
     /// Manage application secrets.
     #[command(subcommand)]
@@ -564,7 +568,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init => {
             println!("slip init — not yet implemented (Phase 2)");
         }
-        Commands::Validate { path, strict } => {
+        Commands::Validate {
+            path,
+            strict,
+            server_config,
+        } => {
             let content = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -597,7 +605,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Print success summary
-            if let Some(cfg) = config {
+            if let Some(ref cfg) = config {
                 println!("✓ Valid repo config");
                 println!("  app:  {}", cfg.app.name);
                 println!("  kind: {}", cfg.app.kind);
@@ -615,6 +623,53 @@ async fn main() -> anyhow::Result<()> {
                             "disabled"
                         }
                     );
+                }
+            }
+
+            // If --server-config was provided, also validate merged volumes
+            if let Some(server_config_path) = server_config
+                && let Some(ref cfg) = config
+            {
+                let server_config_path = std::path::Path::new(&server_config_path);
+                match slip_core::config::load_config(server_config_path) {
+                    Ok((_slip_cfg, apps)) => {
+                        if let Some(server_app) = apps.get(&cfg.app.name) {
+                            match slip_core::merge::merge_config(server_app, cfg) {
+                                Ok(merged) => {
+                                    let vol_result = slip_core::validate::validate_merged_volumes(
+                                        &merged.volumes,
+                                    );
+                                    for warning in &vol_result.warnings {
+                                        println!("⚠ {}", warning);
+                                    }
+                                    for error in &vol_result.errors {
+                                        eprintln!("✗ {}", error);
+                                    }
+                                    if !vol_result.is_valid() {
+                                        std::process::exit(1);
+                                    }
+                                    if !merged.volumes.is_empty() {
+                                        println!("  volumes: {} configured", merged.volumes.len());
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("✗ Config merge failed: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                        } else {
+                            eprintln!(
+                                "✗ App '{}' not found in server config at '{}'",
+                                cfg.app.name,
+                                server_config_path.display()
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("✗ Failed to load server config: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
         }

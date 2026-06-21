@@ -62,6 +62,10 @@ pub enum ValidationError {
     /// Invalid image reference (strict mode).
     #[error("invalid image reference '{image}': {reason}")]
     InvalidImageRef { image: String, reason: String },
+
+    /// Volume validation error.
+    #[error("volume error: {message}")]
+    VolumeValidationError { message: String },
 }
 
 // ─── Validation Result ────────────────────────────────────────────────────────
@@ -151,6 +155,10 @@ pub fn validate_repo_config(config: &RepoConfig, base_dir: &Path) -> ValidationR
 
     // Validate deploy strategy
     validate_deploy_strategy(&config.deploy.strategy, &mut result);
+
+    // Validate volumes
+    let volume_result = validate_volumes(&config.volumes);
+    result.merge(volume_result);
 
     result
 }
@@ -443,6 +451,188 @@ fn validate_single_image_ref(image: &str, result: &mut ValidationResult) {
             "image '{image}' has no tag (implies :latest); consider pinning to a specific version"
         ));
     }
+}
+
+/// Host path prefixes that are blocked for security reasons.
+///
+/// Mounting these paths would enable container escape or host compromise.
+const BLOCKED_PATH_PREFIXES: &[&str] = &[
+    "/",
+    "/etc",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/boot",
+    "/root",
+    "/var/run",
+    "/run",
+    "/var/lib/docker",
+    "/var/lib/containers",
+    "/var/lib/podman",
+];
+
+/// Specific socket paths that are blocked.
+const BLOCKED_SOCKET_PATHS: &[&str] = &["/var/run/docker.sock", "/run/docker.sock"];
+
+/// Validate repo-side volume declarations.
+///
+/// Checks:
+/// - Every `mount_path` is absolute (starts with `/`)
+/// - No duplicate `mount_path` values
+pub fn validate_volumes(volumes: &[crate::repo_config::RepoVolume]) -> ValidationResult {
+    let mut result = ValidationResult::new();
+
+    let mut seen_mount_paths: Vec<&str> = Vec::new();
+
+    for vol in volumes {
+        // Check mount_path is absolute
+        if !vol.mount_path.starts_with('/') {
+            result.add_error(ValidationError::VolumeValidationError {
+                message: format!(
+                    "volume mount_path '{}' must be an absolute path (starting with /)",
+                    vol.mount_path
+                ),
+            });
+            continue;
+        }
+
+        // Check for duplicate mount_path
+        if seen_mount_paths.contains(&vol.mount_path.as_str()) {
+            result.add_error(ValidationError::VolumeValidationError {
+                message: format!("duplicate volume mount_path '{}'", vol.mount_path),
+            });
+            continue;
+        }
+        seen_mount_paths.push(&vol.mount_path);
+    }
+
+    result
+}
+
+/// Canonicalize a path by resolving `..` and `.` components without requiring
+/// the path to exist on disk.
+///
+/// This prevents path traversal attacks where a path like
+/// `/var/lib/slip/../../etc` would bypass the blocklist.
+fn canonicalize_path(path: &str) -> String {
+    let mut components: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => continue,
+            ".." => {
+                components.pop();
+            }
+            other => {
+                components.push(other);
+            }
+        }
+    }
+    let mut result = String::new();
+    for component in components {
+        result.push('/');
+        result.push_str(component);
+    }
+    if result.is_empty() {
+        result.push('/');
+    }
+    result
+}
+
+/// Validate merged volumes (server + repo combined).
+///
+/// Checks:
+/// - Every `host_path` is absolute
+/// - No `host_path` matches a blocked prefix or socket path
+/// - No path traversal (`..`) components
+/// - No duplicate `mount_path` values
+/// - No duplicate `host_path` values (warning)
+pub fn validate_merged_volumes(volumes: &[crate::merge::MergedVolume]) -> ValidationResult {
+    let mut result = ValidationResult::new();
+
+    let mut seen_mount_paths: Vec<&str> = Vec::new();
+    let mut seen_host_paths: Vec<&str> = Vec::new();
+
+    for vol in volumes {
+        // Check host_path is absolute
+        if !vol.host_path.starts_with('/') {
+            result.add_error(ValidationError::VolumeValidationError {
+                message: format!(
+                    "volume host_path '{}' must be an absolute path (starting with /)",
+                    vol.host_path
+                ),
+            });
+            continue;
+        }
+
+        // Check for path traversal (..) components
+        if vol.host_path.split('/').any(|component| component == "..") {
+            result.add_error(ValidationError::VolumeValidationError {
+                message: format!(
+                    "volume host_path '{}' contains path traversal ('..') which is not allowed",
+                    vol.host_path
+                ),
+            });
+            continue;
+        }
+
+        // Canonicalize the path to resolve any .. and . components
+        // before checking the blocklist (defense-in-depth).
+        let canonical = canonicalize_path(&vol.host_path);
+
+        // Check blocked socket paths
+        if BLOCKED_SOCKET_PATHS.contains(&canonical.as_str()) {
+            result.add_error(ValidationError::VolumeValidationError {
+                message: format!(
+                    "volume host_path '{}' is blocked for security reasons",
+                    vol.host_path
+                ),
+            });
+            continue;
+        }
+
+        // Check blocked prefixes against canonicalized path
+        let normalized = canonical.trim_end_matches('/');
+        for blocked in BLOCKED_PATH_PREFIXES {
+            if normalized == *blocked || normalized.starts_with(&format!("{blocked}/")) {
+                result.add_error(ValidationError::VolumeValidationError {
+                    message: format!(
+                        "volume host_path '{}' is blocked for security reasons (matches '{}')",
+                        vol.host_path, blocked
+                    ),
+                });
+                break;
+            }
+        }
+        // Special case: root path "/" becomes "" after trim, which is also blocked
+        if normalized.is_empty() && canonical.starts_with('/') {
+            result.add_error(ValidationError::VolumeValidationError {
+                message: format!(
+                    "volume host_path '{}' is blocked for security reasons (matches '/')",
+                    vol.host_path
+                ),
+            });
+        }
+
+        // Check for duplicate mount_path
+        if seen_mount_paths.contains(&vol.mount_path.as_str()) {
+            result.add_error(ValidationError::VolumeValidationError {
+                message: format!("duplicate volume mount_path '{}'", vol.mount_path),
+            });
+            continue;
+        }
+        seen_mount_paths.push(&vol.mount_path);
+
+        // Check for duplicate host_path (warning, not error)
+        if seen_host_paths.contains(&vol.host_path.as_str()) {
+            result.add_warning(format!(
+                "duplicate volume host_path '{}' mounted to multiple mount paths",
+                vol.host_path
+            ));
+        }
+        seen_host_paths.push(&vol.host_path);
+    }
+
+    result
 }
 
 // ─── Convenience Function ─────────────────────────────────────────────────────
@@ -856,5 +1046,243 @@ name = "myapp"
             }
             _ => panic!("expected TomlParse error"),
         }
+    }
+
+    // ── Volume validation tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn validate_volumes_valid_absolute_paths() {
+        let volumes = vec![
+            crate::repo_config::RepoVolume {
+                mount_path: "/data".to_string(),
+                read_only: false,
+            },
+            crate::repo_config::RepoVolume {
+                mount_path: "/app/config".to_string(),
+                read_only: true,
+            },
+        ];
+        let result = validate_volumes(&volumes);
+        assert!(result.is_valid(), "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn validate_volumes_relative_path_errors() {
+        let volumes = vec![crate::repo_config::RepoVolume {
+            mount_path: "data".to_string(),
+            read_only: false,
+        }];
+        let result = validate_volumes(&volumes);
+        assert!(!result.is_valid());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::VolumeValidationError { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_volumes_duplicate_mount_path_errors() {
+        let volumes = vec![
+            crate::repo_config::RepoVolume {
+                mount_path: "/data".to_string(),
+                read_only: false,
+            },
+            crate::repo_config::RepoVolume {
+                mount_path: "/data".to_string(),
+                read_only: true,
+            },
+        ];
+        let result = validate_volumes(&volumes);
+        assert!(!result.is_valid());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::VolumeValidationError { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_volumes_empty_passes() {
+        let volumes = vec![];
+        let result = validate_volumes(&volumes);
+        assert!(result.is_valid());
+    }
+
+    #[test]
+    fn validate_merged_volumes_blocked_etc() {
+        let volumes = vec![crate::merge::MergedVolume {
+            host_path: "/etc".to_string(),
+            mount_path: "/app/etc".to_string(),
+            read_only: true,
+        }];
+        let result = validate_merged_volumes(&volumes);
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn validate_merged_volumes_blocked_proc() {
+        let volumes = vec![crate::merge::MergedVolume {
+            host_path: "/proc".to_string(),
+            mount_path: "/app/proc".to_string(),
+            read_only: true,
+        }];
+        let result = validate_merged_volumes(&volumes);
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn validate_merged_volumes_blocked_sys() {
+        let volumes = vec![crate::merge::MergedVolume {
+            host_path: "/sys".to_string(),
+            mount_path: "/app/sys".to_string(),
+            read_only: true,
+        }];
+        let result = validate_merged_volumes(&volumes);
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn validate_merged_volumes_blocked_root() {
+        let volumes = vec![crate::merge::MergedVolume {
+            host_path: "/".to_string(),
+            mount_path: "/host".to_string(),
+            read_only: true,
+        }];
+        let result = validate_merged_volumes(&volumes);
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn validate_merged_volumes_blocked_docker_sock() {
+        let volumes = vec![crate::merge::MergedVolume {
+            host_path: "/var/run/docker.sock".to_string(),
+            mount_path: "/var/run/docker.sock".to_string(),
+            read_only: true,
+        }];
+        let result = validate_merged_volumes(&volumes);
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn validate_merged_volumes_allowed_paths() {
+        let volumes = vec![
+            crate::merge::MergedVolume {
+                host_path: "/data/app".to_string(),
+                mount_path: "/app/data".to_string(),
+                read_only: false,
+            },
+            crate::merge::MergedVolume {
+                host_path: "/var/lib/slip/volumes/foo".to_string(),
+                mount_path: "/app/foo".to_string(),
+                read_only: true,
+            },
+        ];
+        let result = validate_merged_volumes(&volumes);
+        assert!(result.is_valid(), "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn validate_merged_volumes_empty_passes() {
+        let volumes = vec![];
+        let result = validate_merged_volumes(&volumes);
+        assert!(result.is_valid());
+    }
+
+    #[test]
+    fn validate_merged_volumes_relative_host_path_errors() {
+        let volumes = vec![crate::merge::MergedVolume {
+            host_path: "relative/path".to_string(),
+            mount_path: "/app/data".to_string(),
+            read_only: false,
+        }];
+        let result = validate_merged_volumes(&volumes);
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn validate_merged_volumes_duplicate_mount_path_errors() {
+        let volumes = vec![
+            crate::merge::MergedVolume {
+                host_path: "/data/one".to_string(),
+                mount_path: "/app/data".to_string(),
+                read_only: false,
+            },
+            crate::merge::MergedVolume {
+                host_path: "/data/two".to_string(),
+                mount_path: "/app/data".to_string(),
+                read_only: false,
+            },
+        ];
+        let result = validate_merged_volumes(&volumes);
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn validate_merged_volumes_path_traversal_errors() {
+        let volumes = vec![crate::merge::MergedVolume {
+            host_path: "/var/lib/slip/../../etc".to_string(),
+            mount_path: "/app/data".to_string(),
+            read_only: false,
+        }];
+        let result = validate_merged_volumes(&volumes);
+        assert!(!result.is_valid());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::VolumeValidationError { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_merged_volumes_blocked_podman() {
+        let volumes = vec![crate::merge::MergedVolume {
+            host_path: "/var/lib/podman".to_string(),
+            mount_path: "/app/data".to_string(),
+            read_only: true,
+        }];
+        let result = validate_merged_volumes(&volumes);
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn validate_merged_volumes_duplicate_host_path_warns() {
+        let volumes = vec![
+            crate::merge::MergedVolume {
+                host_path: "/data/shared".to_string(),
+                mount_path: "/app/data".to_string(),
+                read_only: false,
+            },
+            crate::merge::MergedVolume {
+                host_path: "/data/shared".to_string(),
+                mount_path: "/app/other".to_string(),
+                read_only: true,
+            },
+        ];
+        let result = validate_merged_volumes(&volumes);
+        // Should be valid (no errors), but have warnings
+        assert!(result.is_valid());
+        assert!(!result.warnings.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("duplicate volume host_path"))
+        );
+    }
+
+    #[test]
+    fn validate_merged_volumes_canonicalized_blocklist_caught() {
+        // A path that resolves to /etc via .. should be caught
+        let volumes = vec![crate::merge::MergedVolume {
+            host_path: "/var/../etc".to_string(),
+            mount_path: "/app/data".to_string(),
+            read_only: false,
+        }];
+        let result = validate_merged_volumes(&volumes);
+        assert!(!result.is_valid());
     }
 }

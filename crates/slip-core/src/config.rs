@@ -297,6 +297,22 @@ pub struct AppPreviewConfig {
     pub max: Option<u32>,
 }
 
+/// Server-side volume configuration for host-path mounts.
+///
+/// The server config provides the `host_path` (where on the host the data lives),
+/// while the repo config declares the `mount_path` and `read_only` (what the app needs).
+/// Volumes are matched by `mount_path` during config merge.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VolumeConfig {
+    /// Absolute path on the host filesystem.
+    pub host_path: String,
+    /// Absolute path inside the container.
+    pub mount_path: String,
+    /// Whether the mount should be read-only (default: false).
+    #[serde(default)]
+    pub read_only: bool,
+}
+
 /// Per-application configuration loaded from `apps/<name>.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
@@ -314,6 +330,9 @@ pub struct AppConfig {
     /// Optional per-app preview configuration.
     #[serde(default)]
     pub preview: Option<AppPreviewConfig>,
+    /// Host-path volume mounts for this app.
+    #[serde(default)]
+    pub volumes: Vec<VolumeConfig>,
 }
 
 /// Basic application identity.
@@ -1014,5 +1033,106 @@ secret = "${SLIP_TEST_SECRET_TOKEN}"
 
         let (cfg, _) = load_config(dir.path()).unwrap();
         assert_eq!(cfg.auth.secret, "resolved-secret");
+    }
+
+    // ── Volume config parsing ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_app_config_with_volumes() {
+        let toml = r#"
+[app]
+name = "myapp"
+image = "ghcr.io/org/myapp:latest"
+
+[routing]
+domain = "myapp.example.com"
+port = 3000
+
+[health]
+
+[deploy]
+
+[[volumes]]
+host_path = "/data/myapp"
+mount_path = "/app/data"
+read_only = false
+
+[[volumes]]
+host_path = "/data/config"
+mount_path = "/app/config"
+read_only = true
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.volumes.len(), 2);
+        assert_eq!(cfg.volumes[0].host_path, "/data/myapp");
+        assert_eq!(cfg.volumes[0].mount_path, "/app/data");
+        assert!(!cfg.volumes[0].read_only);
+        assert_eq!(cfg.volumes[1].host_path, "/data/config");
+        assert_eq!(cfg.volumes[1].mount_path, "/app/config");
+        assert!(cfg.volumes[1].read_only);
+    }
+
+    #[test]
+    fn parse_app_config_volume_read_only_defaults_to_false() {
+        let toml = r#"
+[app]
+name = "myapp"
+image = "ghcr.io/org/myapp:latest"
+
+[routing]
+domain = "myapp.example.com"
+port = 3000
+
+[health]
+
+[deploy]
+
+[[volumes]]
+host_path = "/data/myapp"
+mount_path = "/app/data"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.volumes.len(), 1);
+        assert!(!cfg.volumes[0].read_only);
+    }
+
+    #[test]
+    fn parse_app_config_empty_volumes() {
+        let toml = r#"
+[app]
+name = "myapp"
+image = "ghcr.io/org/myapp:latest"
+
+[routing]
+domain = "myapp.example.com"
+port = 3000
+
+[health]
+
+[deploy]
+
+volumes = []
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.volumes.is_empty());
+    }
+
+    #[test]
+    fn parse_app_config_no_volumes_key() {
+        let toml = r#"
+[app]
+name = "myapp"
+image = "ghcr.io/org/myapp:latest"
+
+[routing]
+domain = "myapp.example.com"
+port = 3000
+
+[health]
+
+[deploy]
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.volumes.is_empty());
     }
 }

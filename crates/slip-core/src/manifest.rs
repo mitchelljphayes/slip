@@ -13,6 +13,8 @@ use std::collections::HashMap;
 
 use serde_yaml::Value;
 
+use crate::merge::MergedVolume;
+
 /// Context for rendering a pod manifest.
 pub struct RenderContext {
     /// The app name (e.g., `"stat-stream"`).
@@ -27,6 +29,8 @@ pub struct RenderContext {
     pub env_vars: Vec<String>,
     /// Optional image overrides for sidecars: `container_name → full image:tag`.
     pub image_overrides: HashMap<String, String>,
+    /// Volumes to inject into the pod manifest.
+    pub volumes: Vec<MergedVolume>,
 }
 
 /// Errors that can occur during manifest rendering.
@@ -63,6 +67,7 @@ pub fn render_manifest(raw_yaml: &[u8], ctx: &RenderContext) -> Result<String, M
     apply_sidecar_overrides(&mut doc, &ctx.image_overrides);
     set_host_ports_zero(&mut doc);
     inject_env_vars(&mut doc, &ctx.env_vars);
+    inject_volumes(&mut doc, ctx)?;
 
     serde_yaml::to_string(&doc).map_err(|e| ManifestError::InvalidYaml(e.to_string()))
 }
@@ -222,6 +227,207 @@ fn inject_env_vars(doc: &mut Value, env_vars: &[String]) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Transformation 6 — inject hostPath volumes
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Sanitize a mount path into a valid Kubernetes DNS label volume name.
+///
+/// Pattern: `slip-{app_name}-{sanitized-mount-path}`
+/// - Strips leading `/` from mount_path
+/// - Replaces remaining `/` with `-`
+/// - Removes non-DNS-label characters (anything not `[a-z0-9.-]`)
+/// - Deduplicates consecutive hyphens
+/// - Truncates to 63 chars, ensuring it ends with alphanumeric
+fn sanitize_volume_name(app_name: &str, mount_path: &str) -> String {
+    let sanitized: String = mount_path
+        .trim_start_matches('/')
+        .chars()
+        .map(|c| if c == '/' { '-' } else { c })
+        .collect();
+
+    // Remove non-DNS-label characters, then lowercase
+    let sanitized: String = sanitized
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic() || c.is_ascii_digit() || *c == '-' || *c == '.')
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    // Deduplicate consecutive hyphens
+    let sanitized: String = sanitized.chars().fold(String::new(), |mut acc, c| {
+        if c == '-' && acc.ends_with('-') {
+            // skip duplicate
+        } else {
+            acc.push(c);
+        }
+        acc
+    });
+
+    let name = format!("slip-{}-{sanitized}", app_name.to_ascii_lowercase());
+
+    // Truncate to 63 chars, ensuring it ends with alphanumeric
+    if name.len() <= 63 {
+        name
+    } else {
+        let mut truncated: String = name.chars().take(63).collect();
+        // Ensure last char is alphanumeric
+        while let Some(last) = truncated.chars().last() {
+            if last.is_ascii_lowercase() || last.is_ascii_digit() {
+                break;
+            }
+            truncated.pop();
+        }
+        truncated
+    }
+}
+
+/// Inject hostPath volumes and volumeMounts into the pod manifest.
+///
+/// For each volume in `ctx.volumes`:
+/// 1. Generate a sanitized volume name
+/// 2. Check for name collision with existing volumes → skip with warning
+/// 3. Check for mount path collision in any container → skip with warning
+/// 4. Append to `spec.volumes` with `hostPath.type: DirectoryOrCreate`
+/// 5. Append `volumeMounts` entry to every container (including initContainers)
+fn inject_volumes(doc: &mut Value, ctx: &RenderContext) -> Result<(), ManifestError> {
+    if ctx.volumes.is_empty() {
+        return Ok(());
+    }
+
+    // Collect existing volume names
+    let existing_volume_names: Vec<String> = doc
+        .get("spec")
+        .and_then(|s| s.get("volumes"))
+        .and_then(|v| v.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.get("name")?.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Collect existing volumeMount mount paths across all containers
+    let existing_mount_paths: Vec<String> = {
+        let mut paths = Vec::new();
+        for list_key in &["containers", "initContainers"] {
+            if let Some(containers) = doc
+                .get("spec")
+                .and_then(|s| s.get(*list_key))
+                .and_then(|c| c.as_sequence())
+            {
+                for container in containers {
+                    if let Some(mounts) =
+                        container.get("volumeMounts").and_then(|m| m.as_sequence())
+                    {
+                        for mount in mounts {
+                            if let Some(path) = mount.get("mountPath").and_then(|p| p.as_str()) {
+                                paths.push(path.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        paths
+    };
+
+    // Ensure spec.volumes exists
+    if doc.get("spec").and_then(|s| s.get("volumes")).is_none()
+        && let Some(spec) = doc.get_mut("spec").and_then(|s| s.as_mapping_mut())
+    {
+        spec.insert(
+            Value::String("volumes".to_string()),
+            Value::Sequence(vec![]),
+        );
+    }
+
+    for vol in &ctx.volumes {
+        let vol_name = sanitize_volume_name(&ctx.app_name, &vol.mount_path);
+
+        // Check name collision
+        if existing_volume_names.contains(&vol_name) {
+            tracing::warn!(
+                "volume name '{}' conflicts with existing volume in manifest; skipping",
+                vol_name
+            );
+            continue;
+        }
+
+        // Check mount path collision
+        if existing_mount_paths.contains(&vol.mount_path) {
+            tracing::warn!(
+                "mount path '{}' conflicts with existing volumeMount in manifest; skipping",
+                vol.mount_path
+            );
+            continue;
+        }
+
+        // Append to spec.volumes
+        if let Some(volumes) = doc
+            .get_mut("spec")
+            .and_then(|s| s.get_mut("volumes"))
+            .and_then(|v| v.as_sequence_mut())
+        {
+            let mut volume_entry = serde_yaml::Mapping::new();
+            volume_entry.insert(
+                Value::String("name".to_string()),
+                Value::String(vol_name.clone()),
+            );
+            let mut host_path = serde_yaml::Mapping::new();
+            host_path.insert(
+                Value::String("path".to_string()),
+                Value::String(vol.host_path.clone()),
+            );
+            host_path.insert(
+                Value::String("type".to_string()),
+                Value::String("DirectoryOrCreate".to_string()),
+            );
+            volume_entry.insert(
+                Value::String("hostPath".to_string()),
+                Value::Mapping(host_path),
+            );
+            volumes.push(Value::Mapping(volume_entry));
+        }
+
+        // Append volumeMounts to every container
+        for containers in all_container_lists_mut(doc) {
+            for container in &mut *containers {
+                // Ensure volumeMounts array exists
+                if container.get("volumeMounts").is_none()
+                    && let Some(map) = container.as_mapping_mut()
+                {
+                    map.insert(
+                        Value::String("volumeMounts".to_string()),
+                        Value::Sequence(vec![]),
+                    );
+                }
+
+                if let Some(mounts) = container
+                    .get_mut("volumeMounts")
+                    .and_then(|m| m.as_sequence_mut())
+                {
+                    let mut mount_entry = serde_yaml::Mapping::new();
+                    mount_entry.insert(
+                        Value::String("name".to_string()),
+                        Value::String(vol_name.clone()),
+                    );
+                    mount_entry.insert(
+                        Value::String("mountPath".to_string()),
+                        Value::String(vol.mount_path.clone()),
+                    );
+                    mount_entry.insert(
+                        Value::String("readOnly".to_string()),
+                        Value::Bool(vol.read_only),
+                    );
+                    mounts.push(Value::Mapping(mount_entry));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -329,6 +535,7 @@ spec:
             pod_suffix: "01abc".to_string(),
             env_vars: vec![],
             image_overrides: HashMap::new(),
+            volumes: vec![],
         }
     }
 
@@ -598,5 +805,280 @@ spec:
             .as_sequence()
             .expect("env must exist in initContainer");
         assert!(env.iter().any(|e| e["name"].as_str() == Some("INIT_VAR")));
+    }
+
+    // ── Volume injection tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn inject_volumes_adds_to_empty_manifest() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  containers:
+    - name: web
+      image: myapp:latest
+"#;
+        let mut ctx = base_ctx();
+        ctx.app_name = "myapp".to_string();
+        ctx.volumes = vec![crate::merge::MergedVolume {
+            host_path: "/data/myapp".to_string(),
+            mount_path: "/app/data".to_string(),
+            read_only: false,
+        }];
+        let result = render_manifest(yaml.as_bytes(), &ctx).unwrap();
+        let doc = parse_output(&result);
+
+        // Check volume was injected
+        let volumes = doc["spec"]["volumes"].as_sequence().unwrap();
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0]["name"].as_str().unwrap(), "slip-myapp-app-data");
+        assert_eq!(
+            volumes[0]["hostPath"]["path"].as_str().unwrap(),
+            "/data/myapp"
+        );
+        assert_eq!(
+            volumes[0]["hostPath"]["type"].as_str().unwrap(),
+            "DirectoryOrCreate"
+        );
+
+        // Check volumeMount was injected
+        let container = &doc["spec"]["containers"][0];
+        let mounts = container["volumeMounts"].as_sequence().unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0]["name"].as_str().unwrap(), "slip-myapp-app-data");
+        assert_eq!(mounts[0]["mountPath"].as_str().unwrap(), "/app/data");
+        assert!(!mounts[0]["readOnly"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn inject_volumes_appends_to_existing() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  volumes:
+    - name: user-data
+      hostPath:
+        path: /user/data
+        type: Directory
+  containers:
+    - name: web
+      image: myapp:latest
+      volumeMounts:
+        - name: user-data
+          mountPath: /user/data
+"#;
+        let mut ctx = base_ctx();
+        ctx.app_name = "myapp".to_string();
+        ctx.volumes = vec![crate::merge::MergedVolume {
+            host_path: "/data/myapp".to_string(),
+            mount_path: "/app/data".to_string(),
+            read_only: true,
+        }];
+        let result = render_manifest(yaml.as_bytes(), &ctx).unwrap();
+        let doc = parse_output(&result);
+
+        // Both volumes should exist
+        let volumes = doc["spec"]["volumes"].as_sequence().unwrap();
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(volumes[0]["name"].as_str().unwrap(), "user-data");
+        assert_eq!(volumes[1]["name"].as_str().unwrap(), "slip-myapp-app-data");
+
+        // Both volumeMounts should exist
+        let container = &doc["spec"]["containers"][0];
+        let mounts = container["volumeMounts"].as_sequence().unwrap();
+        assert_eq!(mounts.len(), 2);
+    }
+
+    #[test]
+    fn inject_volumes_skips_name_collision() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  volumes:
+    - name: slip-myapp-app-data
+      hostPath:
+        path: /user/data
+        type: Directory
+  containers:
+    - name: web
+      image: myapp:latest
+"#;
+        let mut ctx = base_ctx();
+        ctx.app_name = "myapp".to_string();
+        ctx.volumes = vec![crate::merge::MergedVolume {
+            host_path: "/data/myapp".to_string(),
+            mount_path: "/app/data".to_string(),
+            read_only: false,
+        }];
+        let result = render_manifest(yaml.as_bytes(), &ctx).unwrap();
+        let doc = parse_output(&result);
+
+        // Only the user's volume should exist (slip volume skipped due to name collision)
+        let volumes = doc["spec"]["volumes"].as_sequence().unwrap();
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0]["name"].as_str().unwrap(), "slip-myapp-app-data");
+    }
+
+    #[test]
+    fn inject_volumes_skips_mount_path_collision() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  containers:
+    - name: web
+      image: myapp:latest
+      volumeMounts:
+        - name: user-data
+          mountPath: /app/data
+"#;
+        let mut ctx = base_ctx();
+        ctx.app_name = "myapp".to_string();
+        ctx.volumes = vec![crate::merge::MergedVolume {
+            host_path: "/data/myapp".to_string(),
+            mount_path: "/app/data".to_string(),
+            read_only: false,
+        }];
+        let result = render_manifest(yaml.as_bytes(), &ctx).unwrap();
+        let doc = parse_output(&result);
+
+        // No slip volume should be injected (mount path collision)
+        let volumes = &doc["spec"]["volumes"];
+        assert!(volumes.is_null() || volumes.as_sequence().is_none_or(|v| v.is_empty()));
+    }
+
+    #[test]
+    fn inject_volumes_read_only_true() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  containers:
+    - name: web
+      image: myapp:latest
+"#;
+        let mut ctx = base_ctx();
+        ctx.app_name = "myapp".to_string();
+        ctx.volumes = vec![crate::merge::MergedVolume {
+            host_path: "/data/config".to_string(),
+            mount_path: "/app/config".to_string(),
+            read_only: true,
+        }];
+        let result = render_manifest(yaml.as_bytes(), &ctx).unwrap();
+        let doc = parse_output(&result);
+
+        let container = &doc["spec"]["containers"][0];
+        let mounts = container["volumeMounts"].as_sequence().unwrap();
+        assert!(mounts[0]["readOnly"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn inject_volumes_host_path_type() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  containers:
+    - name: web
+      image: myapp:latest
+"#;
+        let mut ctx = base_ctx();
+        ctx.app_name = "myapp".to_string();
+        ctx.volumes = vec![crate::merge::MergedVolume {
+            host_path: "/data/myapp".to_string(),
+            mount_path: "/app/data".to_string(),
+            read_only: false,
+        }];
+        let result = render_manifest(yaml.as_bytes(), &ctx).unwrap();
+        let doc = parse_output(&result);
+
+        let volumes = doc["spec"]["volumes"].as_sequence().unwrap();
+        assert_eq!(
+            volumes[0]["hostPath"]["type"].as_str().unwrap(),
+            "DirectoryOrCreate"
+        );
+    }
+
+    #[test]
+    fn inject_volumes_init_containers() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  initContainers:
+    - name: init-setup
+      image: busybox:latest
+  containers:
+    - name: web
+      image: myapp:latest
+"#;
+        let mut ctx = base_ctx();
+        ctx.app_name = "myapp".to_string();
+        ctx.volumes = vec![crate::merge::MergedVolume {
+            host_path: "/data/myapp".to_string(),
+            mount_path: "/app/data".to_string(),
+            read_only: false,
+        }];
+        let result = render_manifest(yaml.as_bytes(), &ctx).unwrap();
+        let doc = parse_output(&result);
+
+        // Check initContainers also get volumeMounts
+        let init_containers = doc["spec"]["initContainers"].as_sequence().unwrap();
+        let init_mounts = init_containers[0]["volumeMounts"].as_sequence().unwrap();
+        assert_eq!(init_mounts.len(), 1);
+        assert_eq!(init_mounts[0]["mountPath"].as_str().unwrap(), "/app/data");
+
+        // Check regular containers also get volumeMounts
+        let containers = doc["spec"]["containers"].as_sequence().unwrap();
+        let mounts = containers[0]["volumeMounts"].as_sequence().unwrap();
+        assert_eq!(mounts.len(), 1);
+    }
+
+    #[test]
+    fn sanitize_volume_name_formats_correctly() {
+        assert_eq!(
+            sanitize_volume_name("myapp", "/app/data"),
+            "slip-myapp-app-data"
+        );
+        assert_eq!(
+            sanitize_volume_name("stat-stream", "/data/uploads"),
+            "slip-stat-stream-data-uploads"
+        );
+        // Uppercase input is lowercased, not dropped
+        assert_eq!(
+            sanitize_volume_name("MyApp", "/App/Data"),
+            "slip-myapp-app-data"
+        );
+        // All-uppercase app name
+        assert_eq!(
+            sanitize_volume_name("API", "/data/config"),
+            "slip-api-data-config"
+        );
+        // Long path truncation
+        let long_path = format!("/{}", "a".repeat(100));
+        let name = sanitize_volume_name("myapp", &long_path);
+        assert!(name.len() <= 63);
+        // Should end with alphanumeric
+        assert!(
+            name.chars().last().unwrap().is_ascii_lowercase()
+                || name.chars().last().unwrap().is_ascii_digit()
+        );
     }
 }

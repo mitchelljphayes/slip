@@ -46,6 +46,11 @@ pub enum ConfigError {
         strategy: String,
         valid: Vec<&'static str>,
     },
+
+    #[error(
+        "volume '{mount_path}' declared in repo config has no matching host_path in server config"
+    )]
+    VolumeMissingHostPath { mount_path: String },
 }
 
 /// Errors that can occur during container health checking.

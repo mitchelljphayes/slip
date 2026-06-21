@@ -7,6 +7,7 @@ use std::path::Path;
 
 use crate::config::ResourceConfig;
 use crate::error::RuntimeError;
+use crate::merge::MergedVolume;
 
 /// Abstraction over container runtimes (Docker, Podman).
 ///
@@ -43,6 +44,7 @@ pub trait RuntimeBackend: Send + Sync {
         env_vars: Vec<String>,
         network: &'a str,
         resources: &'a ResourceConfig,
+        volumes: &'a [MergedVolume],
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(String, u16), RuntimeError>> + Send + 'a>,
     >;

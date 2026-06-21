@@ -22,7 +22,8 @@ pub use caddy::{CaddyClient, ReverseProxy, RouteInfo};
 pub use config::{
     AppConfig, AppInfo, AppPreviewConfig, CaddyConfig, CaddyTlsConfig, DeployConfig, EnvFileConfig,
     HealthConfig, NetworkConfig, RegistryConfig, ResourceConfig, RoutingConfig, RuntimeConfig,
-    ServerConfig, ServerPreviewConfig, SlipConfig, StorageConfig, load_config, resolve_env_vars,
+    ServerConfig, ServerPreviewConfig, SlipConfig, StorageConfig, VolumeConfig, load_config,
+    resolve_env_vars,
 };
 pub use deploy::{
     AppRuntimeState, AppStatus, DeployContext, DeployStatus, TriggerSource, execute_deploy,
@@ -32,10 +33,10 @@ pub use docker::{DockerClient, parse_cpu_limit, parse_memory_limit};
 pub use error::{CaddyError, ConfigError, HealthError, RuntimeError};
 pub use health::{HealthCheck, HealthChecker};
 pub use manifest::{ManifestError, RenderContext, render_manifest};
-pub use merge::{MergedConfig, merge_config};
+pub use merge::{MergedConfig, MergedVolume, merge_config};
 pub use podman::PodmanBackend;
 pub use preview::{PersistedPreviewState, PreviewState};
-pub use repo_config::{PreviewConfig, RepoConfig, parse_repo_config};
+pub use repo_config::{PreviewConfig, RepoConfig, RepoVolume, parse_repo_config};
 pub use runtime::{PodInfo, RegistryCredentials, RuntimeBackend};
 pub use secrets::SecretsStore;
 pub use state::{
@@ -45,5 +46,5 @@ pub use state::{
 };
 pub use validate::{
     ValidationError, ValidationResult, parse_and_validate, validate_image_refs,
-    validate_pod_manifest, validate_repo_config,
+    validate_merged_volumes, validate_pod_manifest, validate_repo_config, validate_volumes,
 };
