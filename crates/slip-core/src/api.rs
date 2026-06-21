@@ -569,6 +569,7 @@ async fn handle_create_app(
         routing: crate::config::RoutingConfig {
             domain: Some(req.domain),
             port: Some(req.port),
+            routes: vec![],
         },
         health: req.health.unwrap_or_default(),
         deploy: req.deploy.unwrap_or_default(),
@@ -724,9 +725,16 @@ async fn handle_delete_app(
         }
     }
 
-    // Remove Caddy route
-    if let Err(e) = state.caddy.remove_route(&name).await {
-        warn!(app = %name, error = %e, "failed to remove Caddy route during app deletion");
+    // Remove Caddy routes
+    let route_count = state
+        .app_states
+        .read()
+        .await
+        .get(&name)
+        .map(|s| s.current_routes.len())
+        .unwrap_or(1);
+    if let Err(e) = state.caddy.remove_routes(&name, route_count).await {
+        warn!(app = %name, error = %e, "failed to remove Caddy routes during app deletion");
     }
 
     // Remove deploy lock
@@ -1539,6 +1547,7 @@ mod tests {
             routing: RoutingConfig {
                 domain: Some("testapp.example.com".to_string()),
                 port: Some(3000),
+                routes: vec![],
             },
             health: HealthConfig::default(),
             deploy: DeployConfig::default(),

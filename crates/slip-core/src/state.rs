@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::caddy::{CaddyClient, RouteInfo};
 use crate::config::AppConfig;
-use crate::deploy::{AppRuntimeState, AppStatus};
+use crate::deploy::{AppRuntimeState, AppStatus, RouteState};
 use crate::error::CaddyError;
 use crate::preview::{PersistedPreviewState, PreviewState};
 use crate::runtime::RuntimeBackend;
@@ -26,6 +26,9 @@ pub struct PersistedAppState {
     pub previous_tag: Option<String>,
     pub current_container_id: Option<String>,
     pub current_port: Option<u16>,
+    /// All current routes for this app (multi-route support).
+    #[serde(default)]
+    pub current_routes: Vec<PersistedRouteState>,
     pub deployed_at: Option<DateTime<Utc>>,
     /// Pod name for pod-mode apps (persisted for teardown on next deploy).
     #[serde(default)]
@@ -38,6 +41,13 @@ pub struct PersistedAppState {
     pub kind: Option<String>,
 }
 
+/// Persisted route state for a single route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedRouteState {
+    pub hostname: String,
+    pub port: u16,
+}
+
 impl From<&AppRuntimeState> for PersistedAppState {
     fn from(s: &AppRuntimeState) -> Self {
         Self {
@@ -45,6 +55,14 @@ impl From<&AppRuntimeState> for PersistedAppState {
             previous_tag: s.previous_tag.clone(),
             current_container_id: s.current_container_id.clone(),
             current_port: s.current_port,
+            current_routes: s
+                .current_routes
+                .iter()
+                .map(|r| PersistedRouteState {
+                    hostname: r.hostname.clone(),
+                    port: r.port,
+                })
+                .collect(),
             deployed_at: s.deployed_at,
             current_pod_name: s.current_pod_name.clone(),
             current_manifest_path: s.current_manifest_path.clone(),
@@ -68,6 +86,14 @@ impl From<PersistedAppState> for AppRuntimeState {
             current_container_id: p.current_container_id,
             previous_container_id: None,
             current_port: p.current_port,
+            current_routes: p
+                .current_routes
+                .into_iter()
+                .map(|r| RouteState {
+                    hostname: r.hostname,
+                    port: r.port,
+                })
+                .collect(),
             deployed_at: p.deployed_at,
             deploy_id: None,
             current_pod_name: p.current_pod_name,
@@ -227,20 +253,36 @@ pub async fn reconcile_routes(
             if state.status != AppStatus::Running {
                 return None;
             }
-            let port = state.current_port?; // Workers have current_port = None, so they're implicitly skipped
-            let config = match app_configs.get(app_name) {
-                Some(c) => c,
-                None => {
-                    tracing::warn!(app = %app_name, "no config found for running app, skipping route reconciliation");
-                    return None;
-                }
+            // Use current_routes if available, otherwise fall back to single port
+            let route_infos: Vec<RouteInfo> = if !state.current_routes.is_empty() {
+                state
+                    .current_routes
+                    .iter()
+                    .map(|r| RouteInfo {
+                        app_name: app_name.clone(),
+                        domain: r.hostname.clone(),
+                        port: r.port,
+                    })
+                    .collect()
+            } else if let Some(port) = state.current_port {
+                let config = match app_configs.get(app_name) {
+                    Some(c) => c,
+                    None => {
+                        tracing::warn!(app = %app_name, "no config found for running app, skipping route reconciliation");
+                        return None;
+                    }
+                };
+                vec![RouteInfo {
+                    app_name: app_name.clone(),
+                    domain: config.routing.domain.clone().unwrap_or_default(),
+                    port,
+                }]
+            } else {
+                return None;
             };
-            Some(RouteInfo {
-                app_name: app_name.clone(),
-                domain: config.routing.domain.clone().unwrap_or_default(),
-                port,
-            })
+            Some(route_infos)
         })
+        .flatten()
         .collect();
 
     if routes.is_empty() {
@@ -463,6 +505,7 @@ mod tests {
             current_container_id: Some("abc123def456".to_string()),
             previous_container_id: Some("oldcontainer".to_string()),
             current_port: Some(54321),
+            current_routes: vec![],
             deployed_at: Some(Utc::now()),
             deploy_id: Some("dep_01abc".to_string()),
             current_pod_name: None,
@@ -676,6 +719,7 @@ mod tests {
                 routing: crate::config::RoutingConfig {
                     domain: Some("app1.example.com".to_string()),
                     port: Some(80),
+                    routes: vec![],
                 },
                 health: crate::config::HealthConfig::default(),
                 deploy: crate::config::DeployConfig::default(),
@@ -688,7 +732,6 @@ mod tests {
             },
         );
 
-        // Create states with mixed statuses
         let mut states = HashMap::new();
         states.insert(
             "app1".to_string(),
@@ -725,13 +768,13 @@ mod tests {
 
         // Verify only app1 route was created
         let map = state.lock().await;
-        assert!(map.contains_key("slip-app1"), "app1 route should exist");
+        assert!(map.contains_key("slip-app1-0"), "app1 route should exist");
         assert!(
-            !map.contains_key("slip-app2"),
+            !map.contains_key("slip-app2-0"),
             "app2 (Failed) should not have route"
         );
         assert!(
-            !map.contains_key("slip-app3"),
+            !map.contains_key("slip-app3-0"),
             "app3 (Deploying) should not have route"
         );
     }
@@ -757,6 +800,7 @@ mod tests {
                 routing: crate::config::RoutingConfig {
                     domain: Some("app1.example.com".to_string()),
                     port: Some(80),
+                    routes: vec![],
                 },
                 health: crate::config::HealthConfig::default(),
                 deploy: crate::config::DeployConfig::default(),
@@ -797,9 +841,9 @@ mod tests {
 
         // Verify only app1 route was created
         let map = state.lock().await;
-        assert!(map.contains_key("slip-app1"), "app1 route should exist");
+        assert!(map.contains_key("slip-app1-0"), "app1 route should exist");
         assert!(
-            !map.contains_key("slip-app2"),
+            !map.contains_key("slip-app2-0"),
             "app2 (no config) should not have route"
         );
     }
@@ -967,11 +1011,11 @@ mod tests {
 
         let map = caddy_state.lock().await;
         assert!(
-            map.contains_key("slip-myapp-preview-pr-1"),
+            map.contains_key("slip-myapp-preview-pr-1-0"),
             "route for pr-1 should be reconciled"
         );
         assert!(
-            map.contains_key("slip-myapp-preview-pr-2"),
+            map.contains_key("slip-myapp-preview-pr-2-0"),
             "route for pr-2 should be reconciled"
         );
     }
@@ -1018,11 +1062,11 @@ mod tests {
 
         let map = caddy_state.lock().await;
         assert!(
-            map.contains_key("slip-myapp-preview-pr-1"),
+            map.contains_key("slip-myapp-preview-pr-1-0"),
             "running preview route should be reconciled"
         );
         assert!(
-            !map.contains_key("slip-myapp-preview-pr-2"),
+            !map.contains_key("slip-myapp-preview-pr-2-0"),
             "failed preview route should NOT be reconciled"
         );
     }

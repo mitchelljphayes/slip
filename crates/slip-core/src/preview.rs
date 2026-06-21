@@ -12,7 +12,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::caddy::ReverseProxy;
+use crate::caddy::{ReverseProxy, Route};
 use crate::config::{AppConfig, AppPreviewConfig, ResourceConfig, ServerPreviewConfig, SlipConfig};
 use crate::deploy::{AppStatus, DeployStatus};
 use crate::docker::parse_memory_limit;
@@ -825,7 +825,7 @@ pub(crate) async fn execute_preview_deploy_inner(
                 "failed to teardown existing preview pod (non-fatal)"
             );
         }
-        if let Err(e) = caddy.remove_route(&preview_app_name).await {
+        if let Err(e) = caddy.remove_routes(&preview_app_name, 1).await {
             tracing::warn!(
                 app = %app_name,
                 preview_id = %preview_id,
@@ -1126,7 +1126,15 @@ pub(crate) async fn execute_preview_deploy_inner(
     // Workers have no domain — skip Caddy route creation.
     if !is_worker
         && let Some(ref domain) = resolved_domain
-        && let Err(e) = caddy.set_route(&preview_app_name, domain, host_port).await
+        && let Err(e) = caddy
+            .set_routes(
+                &preview_app_name,
+                &[Route {
+                    hostname: domain.clone(),
+                    port: host_port,
+                }],
+            )
+            .await
     {
         tracing::error!(
             app = %app_name,
@@ -1251,7 +1259,7 @@ pub async fn teardown_preview(
     // Remove Caddy route (workers have no route to remove).
     if !is_worker {
         tracing::info!(app = %app_name, preview_id = %preview_id, "removing preview Caddy route");
-        if let Err(e) = caddy.remove_route(&preview_app_name).await {
+        if let Err(e) = caddy.remove_routes(&preview_app_name, 1).await {
             tracing::warn!(
                 app = %app_name,
                 preview_id = %preview_id,
@@ -1357,7 +1365,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::caddy::ReverseProxy;
+    use crate::caddy::{ReverseProxy, Route};
     use crate::config::{
         AppConfig, AppInfo, AppPreviewConfig, AuthConfig, CaddyConfig, DeployConfig, HealthConfig,
         RegistryConfig, ResourceConfig, RoutingConfig, RuntimeConfig, ServerConfig,
@@ -1744,6 +1752,33 @@ mod tests {
             self.remove_route_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
+
+        fn set_routes<'a>(
+            &'a self,
+            _app_name: &'a str,
+            _routes: &'a [Route],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>
+        {
+            self.set_route_count.fetch_add(1, Ordering::SeqCst);
+            let result = if self.ok {
+                Ok(())
+            } else {
+                Err(CaddyError::RouteUpdateFailed(
+                    "mock caddy failure".to_string(),
+                ))
+            };
+            Box::pin(async move { result })
+        }
+
+        fn remove_routes<'a>(
+            &'a self,
+            _app_name: &'a str,
+            _route_count: usize,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>
+        {
+            self.remove_route_count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
     }
 
     // ── Mock: HealthCheck ─────────────────────────────────────────────────────
@@ -1815,6 +1850,7 @@ mod tests {
             routing: RoutingConfig {
                 domain: Some("testapp.example.com".to_string()),
                 port: Some(3000),
+                routes: vec![],
             },
             health: HealthConfig {
                 path: None,

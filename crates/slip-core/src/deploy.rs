@@ -144,6 +144,13 @@ impl DeployContext {
 
 // ─── App runtime state ────────────────────────────────────────────────────────
 
+/// Runtime state for a single route of a deployed app.
+#[derive(Debug, Clone)]
+pub struct RouteState {
+    pub hostname: String,
+    pub port: u16,
+}
+
 /// Runtime state for a single deployed app (current/previous container, port, etc.).
 #[derive(Debug, Clone, Default)]
 pub struct AppRuntimeState {
@@ -153,6 +160,8 @@ pub struct AppRuntimeState {
     pub current_container_id: Option<String>,
     pub previous_container_id: Option<String>,
     pub current_port: Option<u16>,
+    /// All current routes for this app (multi-route support).
+    pub current_routes: Vec<RouteState>,
     pub deployed_at: Option<DateTime<Utc>>,
     pub deploy_id: Option<String>,
     /// Current pod name (for pod-mode deploys).
@@ -507,10 +516,16 @@ pub(crate) async fn execute_deploy_inner(
 
         if !is_worker
             && let Err(e) = caddy
-                .set_route(
+                .set_routes(
                     &app_name,
-                    effective_config.routing.domain.as_deref().unwrap_or(""),
-                    host_port,
+                    &merged_cfg
+                        .routes
+                        .iter()
+                        .map(|r| crate::caddy::Route {
+                            hostname: r.hostname.clone(),
+                            port: host_port,
+                        })
+                        .collect::<Vec<_>>(),
                 )
                 .await
         {
@@ -533,6 +548,14 @@ pub(crate) async fn execute_deploy_inner(
             app_state.current_pod_name = Some(pod_name.clone());
             app_state.current_manifest_path = Some(manifest_path.clone());
             app_state.current_port = if is_worker { None } else { Some(host_port) };
+            app_state.current_routes = merged_cfg
+                .routes
+                .iter()
+                .map(|r| RouteState {
+                    hostname: r.hostname.clone(),
+                    port: host_port,
+                })
+                .collect();
             app_state.deployed_at = Some(Utc::now());
             app_state.deploy_id = Some(ctx.id.clone());
             app_state.status = AppStatus::Running;
@@ -683,10 +706,29 @@ pub(crate) async fn execute_deploy_inner(
 
         if !is_worker
             && let Err(e) = caddy
-                .set_route(
+                .set_routes(
                     &app_name,
-                    effective_config.routing.domain.as_deref().unwrap_or(""),
-                    new_port,
+                    &merged
+                        .as_ref()
+                        .map(|m| {
+                            m.routes
+                                .iter()
+                                .map(|r| crate::caddy::Route {
+                                    hostname: r.hostname.clone(),
+                                    port: new_port,
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|| {
+                            vec![crate::caddy::Route {
+                                hostname: effective_config
+                                    .routing
+                                    .domain
+                                    .clone()
+                                    .unwrap_or_default(),
+                                port: new_port,
+                            }]
+                        }),
                 )
                 .await
         {
@@ -709,6 +751,18 @@ pub(crate) async fn execute_deploy_inner(
             app_state.current_tag = Some(ctx.tag.clone());
             app_state.current_container_id = ctx.new_container_id.clone();
             app_state.current_port = if is_worker { None } else { ctx.new_port };
+            app_state.current_routes = merged
+                .as_ref()
+                .map(|m| {
+                    m.routes
+                        .iter()
+                        .map(|r| RouteState {
+                            hostname: r.hostname.clone(),
+                            port: new_port,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             app_state.deployed_at = Some(Utc::now());
             app_state.deploy_id = Some(ctx.id.clone());
             app_state.status = AppStatus::Running;
@@ -865,7 +919,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::*;
-    use crate::caddy::ReverseProxy;
+    use crate::caddy::{ReverseProxy, Route};
     use crate::config::{
         AppConfig, AppInfo, AuthConfig, CaddyConfig, DeployConfig, HealthConfig, RegistryConfig,
         ResourceConfig, RoutingConfig, ServerConfig, SlipConfig, StorageConfig,
@@ -1279,6 +1333,31 @@ mod tests {
         {
             Box::pin(async { Ok(()) })
         }
+
+        fn set_routes<'a>(
+            &'a self,
+            _app_name: &'a str,
+            _routes: &'a [Route],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>
+        {
+            let result = if self.ok {
+                Ok(())
+            } else {
+                Err(CaddyError::RouteUpdateFailed(
+                    "mock caddy failure".to_string(),
+                ))
+            };
+            Box::pin(async move { result })
+        }
+
+        fn remove_routes<'a>(
+            &'a self,
+            _app_name: &'a str,
+            _route_count: usize,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     // ── Mock: HealthCheck ─────────────────────────────────────────────────────
@@ -1342,6 +1421,7 @@ mod tests {
             routing: RoutingConfig {
                 domain: Some("testapp.example.com".to_string()),
                 port: Some(3000),
+                routes: vec![],
             },
             health: HealthConfig {
                 // No health path — check always passes without any HTTP call.
@@ -2354,6 +2434,7 @@ container = "web"
             routing: RoutingConfig {
                 domain: Some("testapp.example.com".to_string()),
                 port: Some(3000),
+                routes: vec![],
             },
             health: HealthConfig::default(),
             deploy: DeployConfig::default(),
@@ -2392,6 +2473,7 @@ container = "web"
             routing: RoutingConfig {
                 domain: Some("testapp.example.com".to_string()),
                 port: Some(3000),
+                routes: vec![],
             },
             health: HealthConfig::default(),
             deploy: DeployConfig::default(),
@@ -2426,6 +2508,7 @@ container = "web"
             routing: RoutingConfig {
                 domain: Some("testapp.example.com".to_string()),
                 port: Some(3000),
+                routes: vec![],
             },
             health: HealthConfig::default(),
             deploy: DeployConfig::default(),
@@ -2455,6 +2538,7 @@ container = "web"
             routing: RoutingConfig {
                 domain: Some("testapp.example.com".to_string()),
                 port: Some(3000),
+                routes: vec![],
             },
             health: HealthConfig::default(),
             deploy: DeployConfig::default(),

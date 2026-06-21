@@ -19,6 +19,21 @@ use crate::config::AppConfig;
 use crate::error::ConfigError;
 use crate::repo_config::{PreviewConfig, RepoConfig};
 
+/// A fully-resolved route after merging repo + server config.
+///
+/// The server provides the `hostname`, the repo provides the `port` and
+/// `container` (pod mode). If the repo doesn't specify a port, the server's
+/// port is used.
+#[derive(Debug, Clone)]
+pub struct MergedRoute {
+    /// Hostname/domain for this route (from server config).
+    pub hostname: String,
+    /// Port to route to (from repo config, falling back to server config).
+    pub port: u16,
+    /// Which container to route to (pod mode only, from repo config).
+    pub container: Option<String>,
+}
+
 /// A fully-resolved volume after merging repo + server config.
 ///
 /// Contains the `host_path` from the server config and the `mount_path` /
@@ -113,12 +128,60 @@ pub fn merge_config(server: &AppConfig, repo: &RepoConfig) -> Result<MergedConfi
         }
     }
 
+    // ── Routes: merge server hostnames with repo ports/containers ────────────
+    let server_routes = server.routing.effective_routes();
+    let repo_routes = repo.routing.effective_routes();
+
+    let merged_routes = if server_routes.is_empty() && repo_routes.is_empty() {
+        // Worker app — no routes.
+        vec![]
+    } else if !server_routes.is_empty() && repo_routes.is_empty() {
+        // Only server has routes (single-route backward compat).
+        // Use server hostname + server port.
+        server_routes
+            .iter()
+            .map(|sr| MergedRoute {
+                hostname: sr.hostname.clone(),
+                port: sr.port.unwrap_or(0),
+                container: None,
+            })
+            .collect()
+    } else if server_routes.is_empty() && !repo_routes.is_empty() {
+        // Only repo has routes — error: repo declares routes but server provides no hostnames.
+        return Err(ConfigError::Merge(format!(
+            "repo declares {} route(s) but server config has no hostnames",
+            repo_routes.len()
+        )));
+    } else {
+        // Both have routes — pair by index.
+        if server_routes.len() != repo_routes.len() {
+            return Err(ConfigError::Merge(format!(
+                "route count mismatch: server has {} route(s), repo has {} route(s)",
+                server_routes.len(),
+                repo_routes.len()
+            )));
+        }
+        server_routes
+            .iter()
+            .zip(repo_routes.iter())
+            .map(|(sr, rr)| {
+                let port = rr.port.or(sr.port).unwrap_or(0);
+                MergedRoute {
+                    hostname: sr.hostname.clone(),
+                    port,
+                    container: rr.container.clone(),
+                }
+            })
+            .collect()
+    };
+
     Ok(MergedConfig {
         app: merged,
         kind: repo.app.kind.clone(),
         manifest: repo.app.manifest.clone(),
         health_container: repo.health.container.clone(),
         routing_container: repo.routing.container.clone(),
+        routes: merged_routes,
         preview: repo.preview.clone(),
         volumes: merged_volumes,
     })
@@ -141,6 +204,8 @@ pub struct MergedConfig {
     pub health_container: Option<String>,
     /// Which container to route to (pod mode only).
     pub routing_container: Option<String>,
+    /// Merged routes (server hostname + repo port/container).
+    pub routes: Vec<MergedRoute>,
     /// Preview environment configuration from the repo.
     pub preview: Option<PreviewConfig>,
     /// Fully-resolved volume mounts (merged from repo + server config).
@@ -161,7 +226,7 @@ mod tests {
     };
     use crate::repo_config::{
         RepoAppInfo, RepoConfig, RepoDefaults, RepoHealthConfig, RepoResourceConfig,
-        RepoRoutingConfig,
+        RepoRouteEntry, RepoRoutingConfig,
     };
 
     fn base_server_config() -> AppConfig {
@@ -174,6 +239,7 @@ mod tests {
             routing: RoutingConfig {
                 domain: Some("testapp.example.com".to_string()),
                 port: Some(3000),
+                routes: vec![],
             },
             health: HealthConfig {
                 path: None,
@@ -497,5 +563,138 @@ mod tests {
         assert_eq!(merged.volumes[1].mount_path, "/mnt/two");
         assert_eq!(merged.volumes[1].host_path, "/data/two");
         assert!(merged.volumes[1].read_only); // server wins
+    }
+
+    // ── Multi-route merge tests ──────────────────────────────────────────────
+
+    #[test]
+    fn merge_multi_route_single_route_backward_compat() {
+        // Single-route backward compat: server has domain/port, repo has port/container
+        let server = base_server_config();
+        let mut repo = minimal_repo_config("testapp");
+        repo.routing.port = Some(8080);
+        repo.routing.container = Some("web".to_string());
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        assert_eq!(merged.routes.len(), 1);
+        assert_eq!(merged.routes[0].hostname, "testapp.example.com");
+        assert_eq!(merged.routes[0].port, 8080);
+        assert_eq!(merged.routes[0].container.as_deref(), Some("web"));
+    }
+
+    #[test]
+    fn merge_multi_route_server_port_fallback() {
+        // When repo doesn't specify port, fall back to server port
+        let server = base_server_config();
+        let mut repo = minimal_repo_config("testapp");
+        repo.routing.port = None; // repo has no port
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        assert_eq!(merged.routes.len(), 1);
+        assert_eq!(merged.routes[0].hostname, "testapp.example.com");
+        assert_eq!(merged.routes[0].port, 3000); // falls back to server port
+        assert!(merged.routes[0].container.is_none());
+    }
+
+    #[test]
+    fn merge_multi_route_full_multi_route() {
+        let mut server = base_server_config();
+        server.routing.routes = vec![
+            crate::config::RouteEntry {
+                hostname: "api.example.com".to_string(),
+                port: None,
+            },
+            crate::config::RouteEntry {
+                hostname: "admin.example.com".to_string(),
+                port: None,
+            },
+        ];
+
+        let mut repo = minimal_repo_config("testapp");
+        repo.routing.routes = vec![
+            RepoRouteEntry {
+                port: Some(3000),
+                container: Some("web".to_string()),
+            },
+            RepoRouteEntry {
+                port: Some(3001),
+                container: Some("admin".to_string()),
+            },
+        ];
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        assert_eq!(merged.routes.len(), 2);
+        assert_eq!(merged.routes[0].hostname, "api.example.com");
+        assert_eq!(merged.routes[0].port, 3000);
+        assert_eq!(merged.routes[0].container.as_deref(), Some("web"));
+        assert_eq!(merged.routes[1].hostname, "admin.example.com");
+        assert_eq!(merged.routes[1].port, 3001);
+        assert_eq!(merged.routes[1].container.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn merge_multi_route_length_mismatch_error() {
+        let mut server = base_server_config();
+        server.routing.routes = vec![crate::config::RouteEntry {
+            hostname: "api.example.com".to_string(),
+            port: None,
+        }];
+
+        let mut repo = minimal_repo_config("testapp");
+        repo.routing.routes = vec![
+            RepoRouteEntry {
+                port: Some(3000),
+                container: None,
+            },
+            RepoRouteEntry {
+                port: Some(3001),
+                container: None,
+            },
+        ];
+
+        let err = merge_config(&server, &repo).unwrap_err();
+        match err {
+            ConfigError::Merge(msg) => {
+                assert!(msg.contains("route count mismatch"));
+            }
+            _ => panic!("expected Merge error, got: {err}"),
+        }
+    }
+
+    #[test]
+    fn merge_multi_route_repo_only_error() {
+        // Server has no routes at all (worker-like), but repo declares routes
+        let mut server = base_server_config();
+        server.routing.domain = None;
+        server.routing.port = None;
+        let mut repo = minimal_repo_config("testapp");
+        repo.routing.routes = vec![RepoRouteEntry {
+            port: Some(3000),
+            container: None,
+        }];
+
+        let err = merge_config(&server, &repo).unwrap_err();
+        match err {
+            ConfigError::Merge(msg) => {
+                assert!(msg.contains("repo declares"));
+            }
+            _ => panic!("expected Merge error, got: {err}"),
+        }
+    }
+
+    #[test]
+    fn merge_multi_route_worker_no_routes() {
+        // Worker app: no routes in either config
+        let mut server = base_server_config();
+        server.routing.domain = None;
+        server.routing.port = None;
+
+        let repo = minimal_repo_config("testapp");
+
+        let merged = merge_config(&server, &repo).unwrap();
+        assert!(merged.routes.is_empty());
     }
 }
