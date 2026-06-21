@@ -26,6 +26,8 @@ dashmap = { workspace = true }
 futures-util = { workspace = true }
 regex = { workspace = true }
 tar = { workspace = true }
+rusqlite = { workspace = true }
+rusqlite_migration = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

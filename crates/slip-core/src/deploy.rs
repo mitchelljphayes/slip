@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::api::AppState;
@@ -18,7 +18,7 @@ use crate::state;
 
 // ─── Status types ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeployStatus {
     Accepted,
@@ -32,7 +32,7 @@ pub enum DeployStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerSource {
     Webhook,
@@ -618,19 +618,12 @@ pub(crate) async fn execute_deploy_inner(
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
 
-/// Record (insert/update) a deploy context, evicting an entry if the map exceeds 100.
+/// Record (insert/update) a deploy context in the in-memory cache.
 ///
-/// Note: Current eviction uses `DashMap::iter().next()` which returns an arbitrary
-/// (not oldest) entry. For proper FIFO eviction, we'd need to track insertion order
-/// with a separate VecDeque. This is acceptable for Phase 1 but should be improved
-/// in Phase 2.
+/// The cache is keyed by app name and stores only the latest deploy per app.
+/// Persistence to SQLite is handled by `AppState::record_deploy`.
 pub fn record_deploy(deploys: &DashMap<String, DeployContext>, ctx: &DeployContext) {
-    deploys.insert(ctx.id.clone(), ctx.clone());
-    if deploys.len() > 100
-        && let Some(oldest) = deploys.iter().next().map(|e| e.key().clone())
-    {
-        deploys.remove(&oldest);
-    }
+    deploys.insert(ctx.app.clone(), ctx.clone());
 }
 
 /// Set the app status to Failed in the shared state.
@@ -1182,7 +1175,6 @@ mod tests {
         let caddy = MockCaddy::success();
         let health = MockHealth::passing();
         let ctx = test_deploy_ctx();
-        let deploy_id = ctx.id.clone();
 
         execute_deploy_inner(
             make_shared(&config, &apps, &app_states, &deploys),
@@ -1194,7 +1186,7 @@ mod tests {
         .await;
 
         // Deploy should be recorded as Completed.
-        let recorded = deploys.get(&deploy_id).unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Completed);
         assert!(recorded.finished_at.is_some());
         assert!(recorded.error.is_none());
@@ -1241,7 +1233,7 @@ mod tests {
         assert_eq!(stop_count.load(Ordering::SeqCst), 0);
 
         // Status should be Completed.
-        let recorded = deploys.get("dep_test001").unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Completed);
     }
 
@@ -1334,7 +1326,7 @@ mod tests {
         );
 
         // Deploy should be Failed.
-        let recorded = deploys.get("dep_test001").unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Failed);
         assert!(
             recorded
@@ -1385,7 +1377,7 @@ mod tests {
         );
 
         // Deploy should be Failed with a pull error.
-        let recorded = deploys.get("dep_test001").unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Failed);
         assert!(
             recorded
@@ -1447,7 +1439,7 @@ mod tests {
         );
 
         // Deploy should be Failed with a caddy error.
-        let recorded = deploys.get("dep_test001").unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Failed);
         assert!(
             recorded
@@ -1502,7 +1494,6 @@ memory = "256m"
         let caddy = MockCaddy::success();
         let health = MockHealth::passing();
         let ctx = test_deploy_ctx();
-        let deploy_id = ctx.id.clone();
 
         execute_deploy_inner(
             make_shared(&config, &apps, &app_states, &deploys),
@@ -1514,7 +1505,7 @@ memory = "256m"
         .await;
 
         // Deploy should succeed even with a repo config present
-        let recorded = deploys.get(&deploy_id).unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Completed);
         assert!(recorded.error.is_none());
     }
@@ -1535,7 +1526,6 @@ memory = "256m"
         let caddy = MockCaddy::success();
         let health = MockHealth::passing();
         let ctx = test_deploy_ctx();
-        let deploy_id = ctx.id.clone();
 
         execute_deploy_inner(
             make_shared(&config, &apps, &app_states, &deploys),
@@ -1547,7 +1537,7 @@ memory = "256m"
         .await;
 
         // Deploy should succeed using server config only
-        let recorded = deploys.get(&deploy_id).unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Completed);
         assert!(recorded.error.is_none());
     }
@@ -1577,7 +1567,7 @@ memory = "256m"
         )
         .await;
 
-        let recorded = deploys.get("dep_test001").unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Failed);
         assert!(
             recorded
@@ -1605,7 +1595,6 @@ memory = "256m"
         let caddy = MockCaddy::success();
         let health = MockHealth::passing();
         let ctx = test_deploy_ctx();
-        let deploy_id = ctx.id.clone();
 
         execute_deploy_inner(
             make_shared(&config, &apps, &app_states, &deploys),
@@ -1617,7 +1606,7 @@ memory = "256m"
         .await;
 
         // Should complete successfully using server config
-        let recorded = deploys.get(&deploy_id).unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Completed);
         assert!(recorded.error.is_none());
     }
@@ -1649,7 +1638,7 @@ memory = "256m"
         )
         .await;
 
-        let recorded = deploys.get("dep_test001").unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Failed);
         assert!(
             recorded
@@ -1685,7 +1674,7 @@ memory = "256m"
         )
         .await;
 
-        let recorded = deploys.get("dep_test001").unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Failed);
         assert!(
             recorded
@@ -1767,7 +1756,6 @@ path = "/health"
         let caddy = MockCaddy::success();
         let health = MockHealth::passing();
         let ctx = pod_deploy_ctx();
-        let deploy_id = ctx.id.clone();
 
         execute_deploy_inner(
             make_shared(&config, &apps, &app_states, &deploys),
@@ -1779,7 +1767,7 @@ path = "/health"
         .await;
 
         // Deploy should be Completed.
-        let recorded = deploys.get(&deploy_id).unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Completed);
         assert!(recorded.error.is_none());
         assert!(recorded.new_pod_name.is_some(), "pod name should be set");
@@ -1837,7 +1825,7 @@ path = "/health"
         .await;
 
         // Deploy should be Failed.
-        let recorded = deploys.get("dep_pod001").unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Failed);
         assert!(
             recorded
@@ -1901,7 +1889,7 @@ container = "web"
         )
         .await;
 
-        let recorded = deploys.get("dep_pod001").unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Failed);
         assert!(
             recorded.error.as_deref().unwrap_or("").contains("manifest"),
@@ -1940,7 +1928,7 @@ container = "web"
         )
         .await;
 
-        let recorded = deploys.get("dep_pod001").unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Completed);
         // teardown_pod should NOT have been called (no old pod).
         assert_eq!(
@@ -1997,7 +1985,7 @@ container = "web"
         )
         .await;
 
-        let recorded = deploys.get("dep_pod001").unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Completed);
 
         // teardown_pod should have been called exactly once (old pod).
@@ -2045,7 +2033,6 @@ container = "web"
             "v1.0.0".to_string(),
             TriggerSource::Rollback,
         );
-        let deploy_id = ctx.id.clone();
 
         execute_deploy_inner(
             make_shared(&config, &apps, &app_states, &deploys),
@@ -2057,7 +2044,7 @@ container = "web"
         .await;
 
         // Deploy should complete successfully.
-        let recorded = deploys.get(&deploy_id).unwrap();
+        let recorded = deploys.get("testapp").unwrap();
         assert_eq!(recorded.status, DeployStatus::Completed);
         assert!(recorded.error.is_none());
         // Verify trigger source is Rollback.

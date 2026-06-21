@@ -2,6 +2,7 @@ pub mod api;
 pub mod auth;
 pub mod caddy;
 pub mod config;
+pub mod db;
 pub mod deploy;
 pub mod docker;
 pub mod error;
@@ -24,6 +25,7 @@ pub use config::{
     HealthConfig, NetworkConfig, RegistryConfig, ResourceConfig, RoutingConfig, RuntimeConfig,
     ServerConfig, ServerPreviewConfig, SlipConfig, StorageConfig, load_config, resolve_env_vars,
 };
+pub use db::Db;
 pub use deploy::{
     AppRuntimeState, AppStatus, DeployContext, DeployStatus, TriggerSource, execute_deploy,
     record_deploy,
