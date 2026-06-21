@@ -47,6 +47,10 @@ pub enum ConfigError {
         "volume mount '{mount_path}' declared in repo config has no corresponding host_path in server config"
     )]
     VolumeMissingHostPath { mount_path: String },
+
+    /// A merge error occurred (e.g., route count mismatch).
+    #[error("merge error: {0}")]
+    Merge(String),
 }
 
 /// Errors that can occur during container health checking.

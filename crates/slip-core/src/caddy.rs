@@ -4,6 +4,15 @@ use crate::config::CaddyTlsConfig;
 use crate::error::CaddyError;
 use serde_json::json;
 
+// ─── Types ─────────────────────────────────────────────────────────────────────
+
+/// A single route to be registered with the reverse proxy.
+#[derive(Debug, Clone)]
+pub struct Route {
+    pub hostname: String,
+    pub port: u16,
+}
+
 // ─── Trait ────────────────────────────────────────────────────────────────────
 
 /// Abstraction over reverse-proxy route management used by the deploy
@@ -24,6 +33,25 @@ pub trait ReverseProxy: Send + Sync {
         &'a self,
         app_name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>;
+
+    /// Create or update multiple routes for an app.
+    ///
+    /// Each route gets a unique `@id = "slip-{app_name}-{index}"`.
+    fn set_routes<'a>(
+        &'a self,
+        app_name: &'a str,
+        routes: &'a [Route],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>;
+
+    /// Remove all routes for an app.
+    ///
+    /// `route_count` specifies how many `@id`s to delete (0..route_count).
+    /// A 404 for any individual route is treated as success (idempotent).
+    fn remove_routes<'a>(
+        &'a self,
+        app_name: &'a str,
+        route_count: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>;
 }
 
 impl ReverseProxy for CaddyClient {
@@ -34,12 +62,15 @@ impl ReverseProxy for CaddyClient {
         upstream_port: u16,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>
     {
-        Box::pin(CaddyClient::set_route(
-            self,
-            app_name,
-            domain,
-            upstream_port,
-        ))
+        let app_name = app_name.to_string();
+        let domain = domain.to_string();
+        Box::pin(async move {
+            let routes = vec![Route {
+                hostname: domain,
+                port: upstream_port,
+            }];
+            CaddyClient::set_routes(self, &app_name, &routes).await
+        })
     }
 
     fn remove_route<'a>(
@@ -47,7 +78,29 @@ impl ReverseProxy for CaddyClient {
         app_name: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>
     {
-        Box::pin(CaddyClient::remove_route(self, app_name))
+        let app_name = app_name.to_string();
+        Box::pin(async move { CaddyClient::remove_routes(self, &app_name, 1).await })
+    }
+
+    fn set_routes<'a>(
+        &'a self,
+        app_name: &'a str,
+        routes: &'a [Route],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>
+    {
+        let app_name = app_name.to_string();
+        let routes = routes.to_vec();
+        Box::pin(async move { CaddyClient::set_routes(self, &app_name, &routes).await })
+    }
+
+    fn remove_routes<'a>(
+        &'a self,
+        app_name: &'a str,
+        route_count: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CaddyError>> + Send + 'a>>
+    {
+        let app_name = app_name.to_string();
+        Box::pin(async move { CaddyClient::remove_routes(self, &app_name, route_count).await })
     }
 }
 
@@ -125,69 +178,104 @@ impl CaddyClient {
         domain: &str,
         upstream_port: u16,
     ) -> Result<(), CaddyError> {
-        let route_id = format!("slip-{app_name}");
-        let route = json!({
-            "@id": route_id,
-            "match": [{"host": [domain]}],
-            "handle": [{
-                "handler": "subroute",
-                "routes": [{
-                    "handle": [{
-                        "handler": "reverse_proxy",
-                        "upstreams": [{"dial": format!("localhost:{upstream_port}")}]
+        let routes = vec![Route {
+            hostname: domain.to_string(),
+            port: upstream_port,
+        }];
+        self.set_routes(app_name, &routes).await
+    }
+
+    /// Create or update multiple routes for an app.
+    ///
+    /// Each route gets a unique `@id = "slip-{app_name}-{index}"`.
+    pub async fn set_routes(&self, app_name: &str, routes: &[Route]) -> Result<(), CaddyError> {
+        for (i, route) in routes.iter().enumerate() {
+            let route_id = format!("slip-{app_name}-{i}");
+            let route_body = json!({
+                "@id": route_id,
+                "match": [{"host": [route.hostname]}],
+                "handle": [{
+                    "handler": "subroute",
+                    "routes": [{
+                        "handle": [{
+                            "handler": "reverse_proxy",
+                            "upstreams": [{"dial": format!("localhost:{}", route.port)}]
+                        }]
                     }]
-                }]
-            }],
-            "terminal": true
-        });
+                }],
+                "terminal": true
+            });
 
-        // Try to update an existing route via @id.
-        let patch_url = format!("{}/id/{route_id}", self.base_url);
-        let patch_resp = self.client.patch(&patch_url).json(&route).send().await?;
-        if patch_resp.status().is_success() {
-            return Ok(());
-        }
+            // Try to update an existing route via @id.
+            let patch_url = format!("{}/id/{route_id}", self.base_url);
+            let patch_resp = self
+                .client
+                .patch(&patch_url)
+                .json(&route_body)
+                .send()
+                .await?;
+            if patch_resp.status().is_success() {
+                continue;
+            }
 
-        // Route didn't exist — append it.
-        let post_url = format!("{}/config/apps/http/servers/slip/routes", self.base_url);
-        let post_resp = self.client.post(&post_url).json(&route).send().await?;
-        if post_resp.status().is_success() {
-            Ok(())
-        } else {
+            // Route didn't exist — append it.
+            let post_url = format!("{}/config/apps/http/servers/slip/routes", self.base_url);
+            let post_resp = self.client.post(&post_url).json(&route_body).send().await?;
+            if post_resp.status().is_success() {
+                continue;
+            }
             let status = post_resp.status();
             let text = post_resp.text().await.unwrap_or_default();
-            Err(CaddyError::RouteUpdateFailed(format!(
+            return Err(CaddyError::RouteUpdateFailed(format!(
                 "POST {post_url} returned {status}: {text}"
-            )))
+            )));
         }
+        Ok(())
     }
 
     /// Remove the reverse-proxy route for an app.
     ///
     /// A 404 response is treated as success (route already gone).
     pub async fn remove_route(&self, app_name: &str) -> Result<(), CaddyError> {
-        let route_id = format!("slip-{app_name}");
-        let url = format!("{}/id/{route_id}", self.base_url);
-        let resp = self.client.delete(&url).send().await?;
+        self.remove_routes(app_name, 1).await
+    }
 
-        if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
-            Ok(())
-        } else {
+    /// Remove all routes for an app.
+    ///
+    /// Iterates from `0..route_count` and DELETE `/id/slip-{app_name}-{index}`.
+    /// A 404 for any individual route is treated as success (idempotent).
+    pub async fn remove_routes(
+        &self,
+        app_name: &str,
+        route_count: usize,
+    ) -> Result<(), CaddyError> {
+        for i in 0..route_count {
+            let route_id = format!("slip-{app_name}-{i}");
+            let url = format!("{}/id/{route_id}", self.base_url);
+            let resp = self.client.delete(&url).send().await?;
+
+            if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
+                continue;
+            }
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            Err(CaddyError::RouteUpdateFailed(format!(
+            return Err(CaddyError::RouteUpdateFailed(format!(
                 "DELETE {url} returned {status}: {text}"
-            )))
+            )));
         }
+        Ok(())
     }
 
     /// Reconcile all routes from a slice of `RouteInfo`.
     ///
-    /// Calls `set_route` for every entry. Returns the first error encountered.
+    /// Calls `set_routes` for every entry. Returns the first error encountered.
     pub async fn reconcile(&self, routes: &[RouteInfo]) -> Result<(), CaddyError> {
         for route in routes {
-            self.set_route(&route.app_name, &route.domain, route.port)
-                .await?;
+            let r = vec![Route {
+                hostname: route.domain.clone(),
+                port: route.port,
+            }];
+            self.set_routes(&route.app_name, &r).await?;
         }
         Ok(())
     }
@@ -549,11 +637,11 @@ mod tests {
 
         let map = state.lock().await;
         assert!(
-            map.contains_key("slip-walden-api"),
+            map.contains_key("slip-walden-api-0"),
             "route should have been stored"
         );
         assert_eq!(
-            map["slip-walden-api"]["@id"], "slip-walden-api",
+            map["slip-walden-api-0"]["@id"], "slip-walden-api-0",
             "@id field should match"
         );
     }
@@ -565,8 +653,8 @@ mod tests {
 
         // Pre-populate a route so PATCH will succeed.
         state.lock().await.insert(
-            "slip-myapp".to_string(),
-            json!({"@id": "slip-myapp", "port": 9000}),
+            "slip-myapp-0".to_string(),
+            json!({"@id": "slip-myapp-0", "port": 9000}),
         );
 
         client
@@ -576,7 +664,7 @@ mod tests {
 
         let map = state.lock().await;
         // The route should now reflect the new upstream port.
-        let route = &map["slip-myapp"];
+        let route = &map["slip-myapp-0"];
         let dial = route["handle"][0]["routes"][0]["handle"][0]["upstreams"][0]["dial"]
             .as_str()
             .unwrap_or("");
@@ -588,10 +676,10 @@ mod tests {
         let (port, state) = start_mock_caddy().await;
         let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
 
-        state
-            .lock()
-            .await
-            .insert("slip-todelete".to_string(), json!({"@id": "slip-todelete"}));
+        state.lock().await.insert(
+            "slip-todelete-0".to_string(),
+            json!({"@id": "slip-todelete-0"}),
+        );
 
         client
             .remove_route("todelete")
@@ -599,7 +687,7 @@ mod tests {
             .expect("remove_route should succeed");
 
         assert!(
-            !state.lock().await.contains_key("slip-todelete"),
+            !state.lock().await.contains_key("slip-todelete-0"),
             "route should have been removed"
         );
     }
@@ -646,16 +734,193 @@ mod tests {
 
         let map = state.lock().await;
         assert!(
-            map.contains_key("slip-app-one"),
+            map.contains_key("slip-app-one-0"),
             "app-one should be registered"
         );
         assert!(
-            map.contains_key("slip-app-two"),
+            map.contains_key("slip-app-two-0"),
             "app-two should be registered"
         );
         assert!(
-            map.contains_key("slip-app-three"),
+            map.contains_key("slip-app-three-0"),
             "app-three should be registered"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-route tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_set_routes_creates_multiple_routes() {
+        let (port, state) = start_mock_caddy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+
+        let routes = vec![
+            Route {
+                hostname: "api.example.com".to_string(),
+                port: 3000,
+            },
+            Route {
+                hostname: "admin.example.com".to_string(),
+                port: 3001,
+            },
+        ];
+
+        client
+            .set_routes("myapp", &routes)
+            .await
+            .expect("set_routes should succeed");
+
+        let map = state.lock().await;
+        assert!(map.contains_key("slip-myapp-0"), "route 0 should exist");
+        assert!(map.contains_key("slip-myapp-1"), "route 1 should exist");
+        assert_eq!(
+            map["slip-myapp-0"]["@id"], "slip-myapp-0",
+            "route 0 @id should match"
+        );
+        assert_eq!(
+            map["slip-myapp-1"]["@id"], "slip-myapp-1",
+            "route 1 @id should match"
+        );
+        let dial0 =
+            map["slip-myapp-0"]["handle"][0]["routes"][0]["handle"][0]["upstreams"][0]["dial"]
+                .as_str()
+                .unwrap_or("");
+        assert_eq!(dial0, "localhost:3000", "route 0 dial should be correct");
+        let dial1 =
+            map["slip-myapp-1"]["handle"][0]["routes"][0]["handle"][0]["upstreams"][0]["dial"]
+                .as_str()
+                .unwrap_or("");
+        assert_eq!(dial1, "localhost:3001", "route 1 dial should be correct");
+    }
+
+    #[tokio::test]
+    async fn test_set_routes_updates_existing_routes() {
+        let (port, state) = start_mock_caddy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+
+        // Pre-populate routes so PATCH will succeed.
+        state.lock().await.insert(
+            "slip-myapp-0".to_string(),
+            json!({"@id": "slip-myapp-0", "port": 9000}),
+        );
+        state.lock().await.insert(
+            "slip-myapp-1".to_string(),
+            json!({"@id": "slip-myapp-1", "port": 9001}),
+        );
+
+        let routes = vec![
+            Route {
+                hostname: "api.example.com".to_string(),
+                port: 3000,
+            },
+            Route {
+                hostname: "admin.example.com".to_string(),
+                port: 3001,
+            },
+        ];
+
+        client
+            .set_routes("myapp", &routes)
+            .await
+            .expect("set_routes should succeed");
+
+        let map = state.lock().await;
+        let dial0 =
+            map["slip-myapp-0"]["handle"][0]["routes"][0]["handle"][0]["upstreams"][0]["dial"]
+                .as_str()
+                .unwrap_or("");
+        assert_eq!(dial0, "localhost:3000", "route 0 dial should be updated");
+        let dial1 =
+            map["slip-myapp-1"]["handle"][0]["routes"][0]["handle"][0]["upstreams"][0]["dial"]
+                .as_str()
+                .unwrap_or("");
+        assert_eq!(dial1, "localhost:3001", "route 1 dial should be updated");
+    }
+
+    #[tokio::test]
+    async fn test_remove_routes_removes_all() {
+        let (port, state) = start_mock_caddy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+
+        state
+            .lock()
+            .await
+            .insert("slip-myapp-0".to_string(), json!({"@id": "slip-myapp-0"}));
+        state
+            .lock()
+            .await
+            .insert("slip-myapp-1".to_string(), json!({"@id": "slip-myapp-1"}));
+        state
+            .lock()
+            .await
+            .insert("slip-myapp-2".to_string(), json!({"@id": "slip-myapp-2"}));
+
+        client
+            .remove_routes("myapp", 3)
+            .await
+            .expect("remove_routes should succeed");
+
+        let map = state.lock().await;
+        assert!(
+            !map.contains_key("slip-myapp-0"),
+            "route 0 should be removed"
+        );
+        assert!(
+            !map.contains_key("slip-myapp-1"),
+            "route 1 should be removed"
+        );
+        assert!(
+            !map.contains_key("slip-myapp-2"),
+            "route 2 should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_routes_ignores_not_found() {
+        let (port, _state) = start_mock_caddy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+
+        // No routes exist — should be OK.
+        client
+            .remove_routes("nonexistent", 3)
+            .await
+            .expect("remove_routes on nonexistent routes should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_with_multi_route_apps() {
+        let (port, state) = start_mock_caddy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+
+        // RouteInfo uses one entry per app. Each app gets routes starting at index 0.
+        let routes = vec![
+            RouteInfo {
+                app_name: "app-one".to_string(),
+                domain: "one.example.com".to_string(),
+                port: 8001,
+            },
+            RouteInfo {
+                app_name: "app-two".to_string(),
+                domain: "two.example.com".to_string(),
+                port: 8002,
+            },
+        ];
+
+        client
+            .reconcile(&routes)
+            .await
+            .expect("reconcile should succeed");
+
+        let map = state.lock().await;
+        assert!(
+            map.contains_key("slip-app-one-0"),
+            "app-one route should exist"
+        );
+        assert!(
+            map.contains_key("slip-app-two-0"),
+            "app-two route should exist"
         );
     }
 

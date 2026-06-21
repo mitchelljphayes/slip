@@ -165,6 +165,9 @@ pub fn validate_repo_config(config: &RepoConfig, base_dir: &Path) -> ValidationR
         }
     }
 
+    // Validate routing configuration
+    validate_routing_config(&config.routing, &mut result);
+
     // Validate preview configuration
     if let Some(ref preview) = config.preview {
         validate_preview_config(preview, &config.routing, &mut result);
@@ -227,6 +230,36 @@ fn validate_app_name(name: &str, result: &mut ValidationResult) {
         result.add_error(ValidationError::InvalidAppName {
             message: format!("'{name}' exceeds 63 character limit"),
         });
+    }
+}
+
+/// Validate repo-side routing configuration.
+///
+/// Checks:
+/// - If `routes` is non-empty, each entry should have `port` or `container` (at least one).
+/// - If both `routes` and flat `port`/`container` are set, warn about ambiguity.
+fn validate_routing_config(
+    routing: &crate::repo_config::RepoRoutingConfig,
+    result: &mut ValidationResult,
+) {
+    if !routing.routes.is_empty() {
+        // Multi-route mode
+        if routing.port.is_some() || routing.container.is_some() {
+            result.add_warning(
+                "both 'routing.routes' and flat 'routing.port'/'routing.container' are set; \
+                 'routing.routes' takes precedence"
+                    .to_string(),
+            );
+        }
+        for (i, route) in routing.routes.iter().enumerate() {
+            if route.port.is_none() && route.container.is_none() {
+                result.add_warning(format!(
+                    "routing.routes[{}] has neither port nor container; \
+                         route may not be functional",
+                    i
+                ));
+            }
+        }
     }
 }
 
@@ -1240,6 +1273,79 @@ kind = "unknown_kind"
                 |e| matches!(e, ValidationError::InvalidKind { kind } if kind == "unknown_kind")
             ),
             "should error on unknown kind"
+        );
+    }
+
+    // ── Multi-route validation tests ──────────────────────────────────────────
+
+    #[test]
+    fn multi_route_valid() {
+        let temp = TempDir::new().unwrap();
+        let toml = r#"
+[app]
+name = "multiapp"
+
+[[routing.routes]]
+port = 3000
+container = "web"
+
+[[routing.routes]]
+port = 3001
+container = "admin"
+"#;
+        let (config, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(
+            result.is_valid(),
+            "multi-route config should be valid, errors: {:?}",
+            result.errors
+        );
+        let cfg = config.unwrap();
+        assert_eq!(cfg.routing.routes.len(), 2);
+    }
+
+    #[test]
+    fn multi_route_with_flat_routing_warns() {
+        let temp = TempDir::new().unwrap();
+        let toml = r#"
+[app]
+name = "multiapp"
+
+[routing]
+port = 8080
+container = "old"
+
+[[routing.routes]]
+port = 3000
+container = "new"
+"#;
+        let (_, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(result.is_valid());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("both 'routing.routes' and flat")),
+            "should warn about both routes and flat routing being set"
+        );
+    }
+
+    #[test]
+    fn multi_route_empty_entry_warns() {
+        let temp = TempDir::new().unwrap();
+        let toml = r#"
+[app]
+name = "multiapp"
+
+[[routing.routes]]
+"#;
+        let (_, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(result.is_valid());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("has neither port nor container")),
+            "should warn about empty route entry"
         );
     }
 }

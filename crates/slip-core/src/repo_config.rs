@@ -69,12 +69,51 @@ pub struct RepoHealthConfig {
     pub start_period: Option<Duration>,
 }
 
+/// A single route entry in the repo-side routing config.
+///
+/// The repo declares which `port` and/or `container` to route to.
+/// The server provides the `hostname` (domain).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RepoRouteEntry {
+    /// Port to route to.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Which container to route to (pod mode only).
+    #[serde(default)]
+    pub container: Option<String>,
+}
+
 /// Routing configuration from the repo config.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RepoRoutingConfig {
     pub port: Option<u16>,
     /// Which container to route to (pod mode only).
     pub container: Option<String>,
+    /// Multiple routes for this app. Each entry has a port and optional container.
+    /// When non-empty, takes precedence over `port`/`container`.
+    #[serde(default)]
+    pub routes: Vec<RepoRouteEntry>,
+}
+
+impl RepoRoutingConfig {
+    /// Returns the effective routes for this config.
+    ///
+    /// If `routes` is non-empty, returns it directly.
+    /// Otherwise, if `port` is set, returns a single `RepoRouteEntry` from `port`/`container`.
+    /// Otherwise returns an empty vec.
+    pub fn effective_routes(&self) -> Vec<RepoRouteEntry> {
+        if !self.routes.is_empty() {
+            return self.routes.clone();
+        }
+        if self.port.is_some() {
+            vec![RepoRouteEntry {
+                port: self.port,
+                container: self.container.clone(),
+            }]
+        } else {
+            vec![]
+        }
+    }
 }
 
 /// Default resource configuration from the repo config.
@@ -450,5 +489,93 @@ name = "myapp"
 "#;
         let cfg = parse_repo_config(toml.as_bytes()).unwrap();
         assert!(cfg.volumes.is_empty());
+    }
+
+    // ── Multi-route repo config ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_repo_config_multi_route() {
+        let toml = r#"
+[app]
+name = "multiapp"
+
+[[routing.routes]]
+port = 3000
+container = "web"
+
+[[routing.routes]]
+port = 3001
+container = "admin"
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        assert_eq!(cfg.routing.routes.len(), 2);
+        assert_eq!(cfg.routing.routes[0].port, Some(3000));
+        assert_eq!(cfg.routing.routes[0].container.as_deref(), Some("web"));
+        assert_eq!(cfg.routing.routes[1].port, Some(3001));
+        assert_eq!(cfg.routing.routes[1].container.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn parse_repo_config_multi_route_takes_precedence() {
+        let toml = r#"
+[app]
+name = "multiapp"
+
+[routing]
+port = 8080
+container = "old"
+
+[[routing.routes]]
+port = 3000
+container = "new"
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        let effective = cfg.routing.effective_routes();
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].port, Some(3000));
+        assert_eq!(effective[0].container.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn parse_repo_config_effective_routes_single() {
+        let toml = r#"
+[app]
+name = "webapp"
+
+[routing]
+port = 8080
+container = "web"
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        let effective = cfg.routing.effective_routes();
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].port, Some(8080));
+        assert_eq!(effective[0].container.as_deref(), Some("web"));
+    }
+
+    #[test]
+    fn parse_repo_config_effective_routes_empty() {
+        let toml = r#"
+[app]
+name = "workerapp"
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        let effective = cfg.routing.effective_routes();
+        assert!(effective.is_empty());
+    }
+
+    #[test]
+    fn parse_repo_config_route_entry_defaults() {
+        let toml = r#"
+[app]
+name = "multiapp"
+
+[[routing.routes]]
+port = 3000
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        assert_eq!(cfg.routing.routes.len(), 1);
+        assert_eq!(cfg.routing.routes[0].port, Some(3000));
+        assert!(cfg.routing.routes[0].container.is_none());
     }
 }

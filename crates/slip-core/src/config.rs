@@ -344,16 +344,57 @@ pub struct AppInfo {
     pub secret: Option<String>,
 }
 
+/// A single route entry in the server-side routing config.
+///
+/// The server provides the `hostname` (domain). The `port` is optional
+/// because the repo config may provide it instead.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RouteEntry {
+    /// Hostname/domain for this route (e.g. "api.example.com").
+    pub hostname: String,
+    /// Port to route to. If `None`, the port comes from the repo config.
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
 /// HTTP routing configuration.
 ///
-/// For HTTP apps (kind = "container" or "pod"), both `domain` and `port`
-/// must be `Some`. For worker apps (kind = "worker"), both are `None`.
+/// For HTTP apps (kind = "container" or "pod"), either `domain`/`port` (single
+/// route, backward compat) or `routes` (multi-route) must be configured.
+/// For worker apps (kind = "worker"), all fields are absent.
+///
+/// When `routes` is non-empty, it takes precedence over `domain`/`port`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RoutingConfig {
     #[serde(default)]
     pub domain: Option<String>,
     #[serde(default)]
     pub port: Option<u16>,
+    /// Multiple routes for this app. Each entry has a hostname and optional port.
+    /// When non-empty, takes precedence over `domain`/`port`.
+    #[serde(default)]
+    pub routes: Vec<RouteEntry>,
+}
+
+impl RoutingConfig {
+    /// Returns the effective routes for this config.
+    ///
+    /// If `routes` is non-empty, returns it directly.
+    /// Otherwise, if `domain` is set, returns a single `RouteEntry` from `domain`/`port`.
+    /// Otherwise returns an empty vec (worker app).
+    pub fn effective_routes(&self) -> Vec<RouteEntry> {
+        if !self.routes.is_empty() {
+            return self.routes.clone();
+        }
+        if let Some(ref domain) = self.domain {
+            vec![RouteEntry {
+                hostname: domain.clone(),
+                port: self.port,
+            }]
+        } else {
+            vec![]
+        }
+    }
 }
 
 /// Container health-check configuration.
@@ -1157,5 +1198,121 @@ port = 3000
         let cfg: AppConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.routing.domain.as_deref(), Some("webapp.example.com"));
         assert_eq!(cfg.routing.port, Some(3000));
+    }
+
+    // ── Multi-route deserialization ──────────────────────────────────────────
+
+    #[test]
+    fn routing_config_with_multi_route() {
+        let toml = r#"
+[app]
+name = "multiapp"
+image = "web:latest"
+
+[[routing.routes]]
+hostname = "api.example.com"
+port = 3000
+
+[[routing.routes]]
+hostname = "admin.example.com"
+port = 3001
+
+[health]
+
+[deploy]
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.routing.routes.len(), 2);
+        assert_eq!(cfg.routing.routes[0].hostname, "api.example.com");
+        assert_eq!(cfg.routing.routes[0].port, Some(3000));
+        assert_eq!(cfg.routing.routes[1].hostname, "admin.example.com");
+        assert_eq!(cfg.routing.routes[1].port, Some(3001));
+    }
+
+    #[test]
+    fn routing_config_multi_route_takes_precedence() {
+        // When routes is non-empty, effective_routes returns routes, not domain/port
+        let toml = r#"
+[app]
+name = "multiapp"
+image = "web:latest"
+
+[routing]
+domain = "old.example.com"
+port = 8080
+
+[[routing.routes]]
+hostname = "new.example.com"
+port = 3000
+
+[health]
+
+[deploy]
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        let effective = cfg.routing.effective_routes();
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].hostname, "new.example.com");
+        assert_eq!(effective[0].port, Some(3000));
+    }
+
+    #[test]
+    fn routing_config_effective_routes_single() {
+        let toml = r#"
+[app]
+name = "webapp"
+image = "web:latest"
+
+[routing]
+domain = "myapp.example.com"
+port = 3000
+
+[health]
+
+[deploy]
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        let effective = cfg.routing.effective_routes();
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].hostname, "myapp.example.com");
+        assert_eq!(effective[0].port, Some(3000));
+    }
+
+    #[test]
+    fn routing_config_effective_routes_worker() {
+        let toml = r#"
+[app]
+name = "workerapp"
+image = "worker:latest"
+
+[routing]
+
+[health]
+
+[deploy]
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        let effective = cfg.routing.effective_routes();
+        assert!(effective.is_empty());
+    }
+
+    #[test]
+    fn routing_config_route_entry_port_defaults_to_none() {
+        let toml = r#"
+[app]
+name = "multiapp"
+image = "web:latest"
+
+[[routing.routes]]
+hostname = "api.example.com"
+
+[health]
+
+[deploy]
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.routing.routes.len(), 1);
+        assert_eq!(cfg.routing.routes[0].hostname, "api.example.com");
+        assert!(cfg.routing.routes[0].port.is_none());
     }
 }
