@@ -18,7 +18,7 @@ use crate::state;
 
 // ─── Status types ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeployStatus {
     Accepted,
@@ -28,8 +28,38 @@ pub enum DeployStatus {
     Starting,
     HealthChecking,
     Switching,
+    /// Recreate: stopping old container (downtime begins).
+    StoppingOld,
+    /// Recreate: removing Caddy route during downtime.
+    RemovingRoute,
+    /// Recreate: rollback — restarting old container.
+    RestartingOld,
     Completed,
     Failed,
+}
+
+impl<'de> serde::Deserialize<'de> for DeployStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "accepted" => Ok(Self::Accepted),
+            "pulling" => Ok(Self::Pulling),
+            "configuring" => Ok(Self::Configuring),
+            "starting" => Ok(Self::Starting),
+            "health_checking" => Ok(Self::HealthChecking),
+            "switching" => Ok(Self::Switching),
+            "stopping_old" => Ok(Self::StoppingOld),
+            "removing_route" => Ok(Self::RemovingRoute),
+            "restarting_old" => Ok(Self::RestartingOld),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            // Unknown variants from older persisted state map to Failed
+            _ => Ok(Self::Failed),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,6 +92,10 @@ pub struct DeployContext {
     /// Path to the rendered manifest written during pod deploys.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_manifest_path: Option<PathBuf>,
+    /// Set to true when rollback fails catastrophically (old container cannot be
+    /// restarted and fallback from previous_tag also fails).
+    #[serde(default)]
+    pub rollback_failed: bool,
 }
 
 impl DeployContext {
@@ -86,6 +120,7 @@ impl DeployContext {
             new_port: None,
             new_pod_name: None,
             new_manifest_path: None,
+            rollback_failed: false,
         }
     }
 
@@ -727,6 +762,16 @@ mod tests {
         container_port: u16,
         /// Tracks how many times `stop_and_remove` was called.
         stop_count: Arc<AtomicU32>,
+        /// Tracks how many times `stop_container` (stop only) was called.
+        stop_only_count: Arc<AtomicU32>,
+        /// Tracks how many times `start_container` was called.
+        start_count: Arc<AtomicU32>,
+        /// Whether `start_container` should succeed (for rollback failure tests).
+        start_ok: bool,
+        /// Whether `stop_container` should succeed.
+        stop_ok: bool,
+        /// Port returned by `inspect_container_port` / after restart.
+        restart_port: Option<u16>,
         /// Result returned by `extract_file` for `/slip/slip.toml`:
         /// - `Ok(Some(bytes))` → file found with content
         /// - `Ok(None)` → file not found
@@ -750,6 +795,11 @@ mod tests {
                 container_id: "mock-container-id".to_string(),
                 container_port: 54321,
                 stop_count: Arc::new(AtomicU32::new(0)),
+                stop_only_count: Arc::new(AtomicU32::new(0)),
+                start_count: Arc::new(AtomicU32::new(0)),
+                start_ok: true,
+                stop_ok: true,
+                restart_port: None,
                 // Default: extract_file returns Unsupported (same as the trait default)
                 extract_result: Err(RuntimeError::Unsupported(
                     "mock does not implement extract_file".to_string(),
@@ -808,6 +858,16 @@ mod tests {
 
         fn stop_count(&self) -> Arc<AtomicU32> {
             self.stop_count.clone()
+        }
+
+        #[allow(dead_code)]
+        fn stop_only_count(&self) -> Arc<AtomicU32> {
+            self.stop_only_count.clone()
+        }
+
+        #[allow(dead_code)]
+        fn start_count(&self) -> Arc<AtomicU32> {
+            self.start_count.clone()
         }
 
         fn teardown_count(&self) -> Arc<AtomicU32> {
@@ -892,6 +952,55 @@ mod tests {
         > {
             self.stop_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
+        }
+
+        fn stop_container<'a>(
+            &'a self,
+            _container_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
+        > {
+            self.stop_only_count.fetch_add(1, Ordering::SeqCst);
+            let ok = self.stop_ok;
+            Box::pin(async move {
+                if ok {
+                    Ok(())
+                } else {
+                    Err(RuntimeError::ContainerError(
+                        "mock stop_container failure".to_string(),
+                    ))
+                }
+            })
+        }
+
+        fn start_container<'a>(
+            &'a self,
+            _container_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
+        > {
+            self.start_count.fetch_add(1, Ordering::SeqCst);
+            let ok = self.start_ok;
+            Box::pin(async move {
+                if ok {
+                    Ok(())
+                } else {
+                    Err(RuntimeError::ContainerError(
+                        "mock start_container failure".to_string(),
+                    ))
+                }
+            })
+        }
+
+        fn inspect_container_port<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _container_port: u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<u16, RuntimeError>> + Send + 'a>,
+        > {
+            let port = self.restart_port.unwrap_or(self.container_port);
+            Box::pin(async move { Ok(port) })
         }
 
         fn container_is_running<'a>(

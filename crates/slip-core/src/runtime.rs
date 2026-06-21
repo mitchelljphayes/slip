@@ -47,6 +47,34 @@ pub trait RuntimeBackend: Send + Sync {
         Box<dyn std::future::Future<Output = Result<(String, u16), RuntimeError>> + Send + 'a>,
     >;
 
+    /// Stop a container by ID (without removing it).
+    ///
+    /// Used by the recreate strategy to stop the old container while keeping it
+    /// available for fast rollback. Returns `Ok(())` if already stopped (304).
+    fn stop_container<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>>;
+
+    /// Start a stopped container by ID.
+    ///
+    /// Used by the recreate strategy to restart the old container during rollback.
+    /// Returns an error if the container doesn't exist or is already running.
+    fn start_container<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>>;
+
+    /// Inspect a container and return its host port for the given container port.
+    ///
+    /// Used after restarting a container during rollback to discover the new
+    /// ephemeral port (which may have changed after restart).
+    fn inspect_container_port<'a>(
+        &'a self,
+        container_id: &'a str,
+        container_port: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u16, RuntimeError>> + Send + 'a>>;
+
     /// Stop and remove a container by ID.
     fn stop_and_remove<'a>(
         &'a self,

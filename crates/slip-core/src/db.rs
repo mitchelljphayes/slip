@@ -186,6 +186,9 @@ fn deploy_status_to_string(status: &DeployStatus) -> &'static str {
         DeployStatus::Starting => "starting",
         DeployStatus::HealthChecking => "health_checking",
         DeployStatus::Switching => "switching",
+        DeployStatus::StoppingOld => "stopping_old",
+        DeployStatus::RemovingRoute => "removing_route",
+        DeployStatus::RestartingOld => "restarting_old",
         DeployStatus::Completed => "completed",
         DeployStatus::Failed => "failed",
     }
@@ -200,6 +203,9 @@ fn string_to_deploy_status(s: &str) -> DeployStatus {
         "starting" => DeployStatus::Starting,
         "health_checking" => DeployStatus::HealthChecking,
         "switching" => DeployStatus::Switching,
+        "stopping_old" => DeployStatus::StoppingOld,
+        "removing_route" => DeployStatus::RemovingRoute,
+        "restarting_old" => DeployStatus::RestartingOld,
         "completed" => DeployStatus::Completed,
         "failed" => DeployStatus::Failed,
         _ => DeployStatus::Failed,
@@ -250,6 +256,7 @@ fn row_to_deploy(row: &rusqlite::Row) -> rusqlite::Result<DeployContext> {
         new_port: row.get("new_port")?,
         new_pod_name: row.get("new_pod_name")?,
         new_manifest_path: manifest_path_str.map(PathBuf::from),
+        rollback_failed: false,
     })
 }
 
@@ -283,6 +290,7 @@ mod tests {
             new_port: None,
             new_pod_name: None,
             new_manifest_path: None,
+            rollback_failed: false,
         }
     }
 
@@ -407,6 +415,7 @@ mod tests {
             new_port: Some(8080),
             new_pod_name: Some("pod-xyz".to_string()),
             new_manifest_path: Some(PathBuf::from("/tmp/manifest.yaml")),
+            rollback_failed: false,
         };
         db.insert_deploy(&ctx).unwrap();
 
