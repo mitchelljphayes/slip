@@ -445,7 +445,10 @@ fn update_preview_deploy_status(
         | DeployStatus::Configuring
         | DeployStatus::Starting
         | DeployStatus::HealthChecking
-        | DeployStatus::Switching => AppStatus::Deploying,
+        | DeployStatus::Switching
+        | DeployStatus::StoppingOld
+        | DeployStatus::RemovingRoute
+        | DeployStatus::RestartingOld => AppStatus::Deploying,
     };
     update_preview_status(preview_states, key, app_status);
 }
@@ -1425,6 +1428,34 @@ mod tests {
         > {
             self.stop_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
+        }
+
+        fn stop_container<'a>(
+            &'a self,
+            _container_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn start_container<'a>(
+            &'a self,
+            _container_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn inspect_container_port<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _container_port: u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<u16, RuntimeError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(self.container_port) })
         }
 
         fn container_is_running<'a>(

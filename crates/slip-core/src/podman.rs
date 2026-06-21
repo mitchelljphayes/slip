@@ -278,6 +278,64 @@ impl RuntimeBackend for PodmanBackend {
         })
     }
 
+    fn stop_container<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            info!(container_id, "stopping container (podman, stop only)");
+
+            match self
+                .client
+                .stop_container(container_id, Some(StopContainerOptions { t: 10 }))
+                .await
+            {
+                Ok(()) => {}
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 304, ..
+                }) => {
+                    warn!(container_id, "container was already stopped (podman)");
+                }
+                Err(e) => return Err(RuntimeError::ContainerError(e.to_string())),
+            }
+
+            info!(container_id, "container stopped (podman)");
+            Ok(())
+        })
+    }
+
+    fn start_container<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            info!(container_id, "starting container (podman)");
+
+            self.client
+                .start_container(container_id, None::<StartContainerOptions<String>>)
+                .await
+                .map_err(|e| RuntimeError::ContainerError(e.to_string()))?;
+
+            info!(container_id, "container started (podman)");
+            Ok(())
+        })
+    }
+
+    fn inspect_container_port<'a>(
+        &'a self,
+        container_id: &'a str,
+        container_port: u16,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<u16, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            let info = self
+                .client
+                .inspect_container(container_id, None)
+                .await
+                .map_err(|e| RuntimeError::ContainerError(e.to_string()))?;
+            extract_host_port(&info, container_port).map_err(|_| RuntimeError::NoPortAssigned)
+        })
+    }
+
     fn stop_and_remove<'a>(
         &'a self,
         container_id: &'a str,

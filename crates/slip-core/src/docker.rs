@@ -186,6 +186,53 @@ impl DockerClient {
         Ok((container_id, host_port))
     }
 
+    /// Stop a container by ID (without removing it).
+    ///
+    /// Uses a 10-second timeout. Returns `Ok(())` if already stopped (304).
+    pub async fn stop_container(&self, container_id: &str) -> Result<(), DockerError> {
+        info!(container_id, "stopping container (stop only)");
+
+        match self
+            .docker
+            .stop_container(container_id, Some(StopContainerOptions { t: 10 }))
+            .await
+        {
+            Ok(()) => {}
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 304, ..
+            }) => {
+                // 304 Not Modified = already stopped, that's fine
+                warn!(container_id, "container was already stopped");
+            }
+            Err(e) => return Err(DockerError::Api(e)),
+        }
+
+        info!(container_id, "container stopped");
+        Ok(())
+    }
+
+    /// Start a stopped container by ID.
+    pub async fn start_container(&self, container_id: &str) -> Result<(), DockerError> {
+        info!(container_id, "starting container");
+
+        self.docker
+            .start_container(container_id, None::<StartContainerOptions<String>>)
+            .await?;
+
+        info!(container_id, "container started");
+        Ok(())
+    }
+
+    /// Inspect a container and return its host port for the given container port.
+    pub async fn inspect_container_port(
+        &self,
+        container_id: &str,
+        container_port: u16,
+    ) -> Result<u16, DockerError> {
+        let info = self.docker.inspect_container(container_id, None).await?;
+        extract_host_port(&info, container_port)
+    }
+
     /// Stop (with a 10-second timeout) and remove a container by ID.
     pub async fn stop_and_remove(&self, container_id: &str) -> Result<(), DockerError> {
         info!(container_id, "stopping container");
@@ -475,6 +522,40 @@ impl RuntimeBackend for DockerClient {
             )
             .await
             .map_err(RuntimeError::from)
+        })
+    }
+
+    fn stop_container<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            DockerClient::stop_container(self, container_id)
+                .await
+                .map_err(RuntimeError::from)
+        })
+    }
+
+    fn start_container<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            DockerClient::start_container(self, container_id)
+                .await
+                .map_err(RuntimeError::from)
+        })
+    }
+
+    fn inspect_container_port<'a>(
+        &'a self,
+        container_id: &'a str,
+        container_port: u16,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<u16, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            DockerClient::inspect_container_port(self, container_id, container_port)
+                .await
+                .map_err(RuntimeError::from)
         })
     }
 

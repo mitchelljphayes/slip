@@ -1271,6 +1271,9 @@ async fn handle_deploy_status(
         crate::deploy::DeployStatus::Starting => "starting",
         crate::deploy::DeployStatus::HealthChecking => "health_checking",
         crate::deploy::DeployStatus::Switching => "switching",
+        crate::deploy::DeployStatus::StoppingOld => "stopping_old",
+        crate::deploy::DeployStatus::RemovingRoute => "removing_route",
+        crate::deploy::DeployStatus::RestartingOld => "restarting_old",
         crate::deploy::DeployStatus::Completed => "completed",
         crate::deploy::DeployStatus::Failed => "failed",
     };
@@ -2004,8 +2007,11 @@ mod tests {
             new_port: Some(8080),
             new_pod_name: None,
             new_manifest_path: None,
+            rollback_failed: false,
         };
-        state.deploys.insert(ctx.app.clone(), ctx);
+
+        // Insert into the cache (keyed by app name for latest-deploy lookups)
+        state.deploys.insert(ctx.app.clone(), ctx.clone());
 
         let app = build_router(state);
 
@@ -2050,6 +2056,7 @@ mod tests {
             new_port: Some(9000),
             new_pod_name: None,
             new_manifest_path: None,
+            rollback_failed: false,
         };
         // Insert into SQLite (the handler reads from SQLite in Phase 4).
         state.db.insert_deploy(&ctx).unwrap();
@@ -3018,6 +3025,7 @@ mod tests {
             new_port: Some(8080),
             new_pod_name: None,
             new_manifest_path: None,
+            rollback_failed: false,
         };
         state.db.insert_deploy(&previous_ctx).unwrap();
 
