@@ -91,6 +91,9 @@ pub struct AppStatusResponse {
     pub deployed_at: Option<DateTime<Utc>>,
     pub container_id: Option<String>,
     pub port: Option<u16>,
+    /// App kind: "container", "pod", or "worker".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     /// Latest deploy ID for this app (from the deploy history cache).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deploy_id: Option<String>,
@@ -119,7 +122,7 @@ pub struct PreviewStatusResponse {
     pub sha: String,
     pub status: String,
     pub tag: Option<String>,
-    pub domain: String,
+    pub domain: Option<String>,
     pub port: Option<u16>,
     pub deployed_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
@@ -237,8 +240,8 @@ impl From<&AppConfig> for AppResponse {
         Self {
             name: cfg.app.name.clone(),
             image: cfg.app.image.clone(),
-            domain: cfg.routing.domain.clone(),
-            port: cfg.routing.port,
+            domain: cfg.routing.domain.clone().unwrap_or_default(),
+            port: cfg.routing.port.unwrap_or(0),
             // Don't expose the secret in responses
             secret: None,
             env: cfg.env.clone(),
@@ -557,8 +560,8 @@ async fn handle_create_app(
             secret: req.secret,
         },
         routing: crate::config::RoutingConfig {
-            domain: req.domain,
-            port: req.port,
+            domain: Some(req.domain),
+            port: Some(req.port),
         },
         health: req.health.unwrap_or_default(),
         deploy: req.deploy.unwrap_or_default(),
@@ -638,10 +641,10 @@ async fn handle_update_app(
             updated.app.image = image;
         }
         if let Some(domain) = req.domain {
-            updated.routing.domain = domain;
+            updated.routing.domain = Some(domain);
         }
         if let Some(port) = req.port {
-            updated.routing.port = port;
+            updated.routing.port = Some(port);
         }
         if let Some(secret) = req.secret {
             updated.app.secret = Some(secret);
@@ -1194,6 +1197,7 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                     deployed_at: None,
                     container_id: None,
                     port: None,
+                    kind: None,
                     deploy_id: None,
                     triggered_by: None,
                 },
@@ -1210,6 +1214,7 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                         deployed_at: runtime.deployed_at,
                         container_id: runtime.current_container_id.clone(),
                         port: runtime.current_port,
+                        kind: runtime.kind.clone(),
                         deploy_id: None,
                         triggered_by: None,
                     }
@@ -1511,8 +1516,8 @@ mod tests {
                 secret: secret.map(|s| s.to_string()),
             },
             routing: RoutingConfig {
-                domain: "testapp.example.com".to_string(),
-                port: 3000,
+                domain: Some("testapp.example.com".to_string()),
+                port: Some(3000),
             },
             health: HealthConfig::default(),
             deploy: DeployConfig::default(),
@@ -1936,11 +1941,12 @@ mod tests {
                 APP_NAME.to_string(),
                 AppRuntimeState {
                     status: AppStatus::Running,
-                    current_tag: Some("v1.2.3".to_string()),
+                    current_tag: Some("v1.0.0".to_string()),
                     current_container_id: Some("abc123".to_string()),
-                    current_port: Some(8080),
+                    current_port: Some(54321),
                     deployed_at: Some(Utc::now()),
-                    deploy_id: Some("dep_test".to_string()),
+                    deploy_id: Some("dep_001".to_string()),
+                    kind: Some("container".to_string()),
                     ..Default::default()
                 },
             );
@@ -1964,9 +1970,9 @@ mod tests {
 
         let testapp = &payload["apps"][APP_NAME];
         assert_eq!(testapp["status"], "running");
-        assert_eq!(testapp["tag"], "v1.2.3");
+        assert_eq!(testapp["tag"], "v1.0.0");
         assert_eq!(testapp["container_id"], "abc123");
-        assert_eq!(testapp["port"], 8080);
+        assert_eq!(testapp["port"], 54321);
     }
 
     // ── GET /v1/status — includes deploy_id/triggered_by from cache ────────────
@@ -1982,11 +1988,12 @@ mod tests {
                 APP_NAME.to_string(),
                 AppRuntimeState {
                     status: AppStatus::Running,
-                    current_tag: Some("v1.2.3".to_string()),
+                    current_tag: Some("v1.0.0".to_string()),
                     current_container_id: Some("abc123".to_string()),
-                    current_port: Some(8080),
+                    current_port: Some(54321),
                     deployed_at: Some(Utc::now()),
-                    deploy_id: Some("dep_test".to_string()),
+                    deploy_id: Some("dep_001".to_string()),
+                    kind: Some("container".to_string()),
                     ..Default::default()
                 },
             );
@@ -2031,7 +2038,7 @@ mod tests {
 
         let testapp = &payload["apps"][APP_NAME];
         assert_eq!(testapp["status"], "running");
-        assert_eq!(testapp["tag"], "v1.2.3");
+        assert_eq!(testapp["tag"], "v1.0.0");
         assert_eq!(testapp["deploy_id"], "dep_meta001");
         assert_eq!(testapp["triggered_by"], "webhook");
     }
@@ -2274,7 +2281,7 @@ mod tests {
                 tag: Some("v1".to_string()),
                 deployed_at: Utc::now(),
                 expires_at: None,
-                domain: "pr-1.preview.example.com".to_string(),
+                domain: Some("pr-1.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
             },
@@ -2292,7 +2299,7 @@ mod tests {
                 tag: Some("v2".to_string()),
                 deployed_at: Utc::now(),
                 expires_at: None,
-                domain: "pr-2.preview.example.com".to_string(),
+                domain: Some("pr-2.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
             },
@@ -2311,7 +2318,7 @@ mod tests {
                 tag: Some("v1".to_string()),
                 deployed_at: Utc::now(),
                 expires_at: None,
-                domain: "pr-1.other.example.com".to_string(),
+                domain: Some("pr-1.other.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
             },
@@ -2365,7 +2372,7 @@ mod tests {
                 tag: Some("sha-abc999".to_string()),
                 deployed_at: Utc::now(),
                 expires_at: None,
-                domain: "pr-99.preview.example.com".to_string(),
+                domain: Some("pr-99.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
             },
@@ -2915,7 +2922,7 @@ mod tests {
         // Verify port was updated
         let apps = state.apps.read().await;
         let app_config = apps.get(APP_NAME).unwrap();
-        assert_eq!(app_config.routing.port, 9000);
+        assert_eq!(app_config.routing.port, Some(9000));
     }
 
     #[tokio::test]
@@ -3558,7 +3565,7 @@ mod tests {
                 tag: Some("v1".to_string()),
                 deployed_at: Utc::now(),
                 expires_at: None,
-                domain: "pr-bearer.preview.example.com".to_string(),
+                domain: Some("pr-bearer.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
             },
@@ -3651,7 +3658,7 @@ mod tests {
                 tag: Some("v1".to_string()),
                 deployed_at: Utc::now(),
                 expires_at: None,
-                domain: "pr-a1.preview.example.com".to_string(),
+                domain: Some("pr-a1.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
             },
@@ -3669,7 +3676,7 @@ mod tests {
                 tag: Some("v2".to_string()),
                 deployed_at: Utc::now(),
                 expires_at: None,
-                domain: "pr-a2.preview.example.com".to_string(),
+                domain: Some("pr-a2.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
             },
