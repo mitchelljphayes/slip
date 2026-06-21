@@ -345,10 +345,15 @@ pub struct AppInfo {
 }
 
 /// HTTP routing configuration.
+///
+/// For HTTP apps (kind = "container" or "pod"), both `domain` and `port`
+/// must be `Some`. For worker apps (kind = "worker"), both are `None`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RoutingConfig {
-    pub domain: String,
-    pub port: u16,
+    #[serde(default)]
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 /// Container health-check configuration.
@@ -793,8 +798,8 @@ name = "slip"
         let cfg: AppConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.app.name, "myapp");
         assert_eq!(cfg.app.image, "ghcr.io/org/myapp:latest");
-        assert_eq!(cfg.routing.domain, "myapp.example.com");
-        assert_eq!(cfg.routing.port, 3000);
+        assert_eq!(cfg.routing.domain.as_deref(), Some("myapp.example.com"));
+        assert_eq!(cfg.routing.port, Some(3000));
         assert_eq!(cfg.health.path.as_deref(), Some("/healthz"));
         assert_eq!(cfg.health.interval, Duration::from_secs(2));
         assert_eq!(cfg.health.timeout, Duration::from_secs(5));
@@ -1039,7 +1044,7 @@ LOG_LEVEL = "info"
         let (_cfg, apps) = load_config(dir.path()).unwrap();
         assert!(apps.contains_key("webapp"));
         let app = &apps["webapp"];
-        assert_eq!(app.routing.port, 3000);
+        assert_eq!(app.routing.port, Some(3000));
         assert_eq!(app.env["LOG_LEVEL"], "info");
     }
 
@@ -1104,5 +1109,53 @@ secret = "${SLIP_TEST_SECRET_TOKEN}"
 
         let (cfg, _) = load_config(dir.path()).unwrap();
         assert_eq!(cfg.auth.secret, "resolved-secret");
+    }
+
+    // ── RoutingConfig optional field deserialization ──────────────────────────
+
+    #[test]
+    fn routing_config_optional_fields_deserialize() {
+        // RoutingConfig with no domain or port should deserialize to None
+        let toml = r#"
+[app]
+name = "workerapp"
+image = "worker:latest"
+
+[routing]
+
+[health]
+
+[deploy]
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert!(
+            cfg.routing.domain.is_none(),
+            "domain should be None when omitted"
+        );
+        assert!(
+            cfg.routing.port.is_none(),
+            "port should be None when omitted"
+        );
+    }
+
+    #[test]
+    fn routing_config_with_fields_deserialize() {
+        // RoutingConfig with domain and port should still work
+        let toml = r#"
+[app]
+name = "webapp"
+image = "web:latest"
+
+[routing]
+domain = "webapp.example.com"
+port = 3000
+
+[health]
+
+[deploy]
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.routing.domain.as_deref(), Some("webapp.example.com"));
+        assert_eq!(cfg.routing.port, Some(3000));
     }
 }

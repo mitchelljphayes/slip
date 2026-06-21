@@ -66,6 +66,10 @@ pub enum ValidationError {
     /// Volume validation error.
     #[error("volume error: {message}")]
     VolumeValidationError { message: String },
+
+    /// Unknown app kind.
+    #[error("unknown app kind '{kind}'; expected 'container', 'pod', or 'worker'")]
+    InvalidKind { kind: String },
 }
 
 // ─── Validation Result ────────────────────────────────────────────────────────
@@ -143,8 +147,21 @@ pub fn validate_repo_config(config: &RepoConfig, base_dir: &Path) -> ValidationR
         "container" if config.app.manifest.is_some() => {
             result.add_warning("manifest is ignored for container kind".to_string());
         }
+        "container" => {
+            // No additional validation needed for container kind without manifest.
+        }
+        "worker" => {
+            if config.app.manifest.is_some() {
+                result.add_warning("manifest is ignored for worker kind".to_string());
+            }
+            if config.routing.port.is_some() {
+                result.add_warning("routing.port is ignored for worker kind".to_string());
+            }
+        }
         _ => {
-            // Unknown kind - could warn, but for now just pass
+            result.add_error(ValidationError::InvalidKind {
+                kind: config.app.kind.clone(),
+            });
         }
     }
 
@@ -1144,5 +1161,85 @@ name = "myapp"
         let vols: Vec<crate::merge::MergedVolume> = vec![];
         let result = validate_merged_volumes(&vols);
         assert!(result.is_valid());
+    }
+
+    // ── Worker kind validation tests ──────────────────────────────────────────
+
+    #[test]
+    fn worker_kind_valid() {
+        let temp = TempDir::new().unwrap();
+        let toml = r#"
+[app]
+name = "workerapp"
+kind = "worker"
+"#;
+        let (config, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(
+            result.is_valid(),
+            "worker kind should be valid, errors: {:?}",
+            result.errors
+        );
+        assert!(config.is_some());
+        assert_eq!(config.unwrap().app.kind, "worker");
+    }
+
+    #[test]
+    fn worker_kind_with_manifest_warns() {
+        let temp = TempDir::new().unwrap();
+        let toml = r#"
+[app]
+name = "workerapp"
+kind = "worker"
+manifest = "pod.yaml"
+"#;
+        let (_, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(result.is_valid());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("manifest is ignored for worker kind")),
+            "should warn that manifest is ignored for workers"
+        );
+    }
+
+    #[test]
+    fn worker_kind_with_routing_port_warns() {
+        let temp = TempDir::new().unwrap();
+        let toml = r#"
+[app]
+name = "workerapp"
+kind = "worker"
+
+[routing]
+port = 8080
+"#;
+        let (_, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(result.is_valid());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("routing.port is ignored for worker kind")),
+            "should warn that routing.port is ignored for workers"
+        );
+    }
+
+    #[test]
+    fn unknown_kind_errors() {
+        let temp = TempDir::new().unwrap();
+        let toml = r#"
+[app]
+name = "myapp"
+kind = "unknown_kind"
+"#;
+        let (_, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(!result.is_valid());
+        assert!(
+            result.errors.iter().any(
+                |e| matches!(e, ValidationError::InvalidKind { kind } if kind == "unknown_kind")
+            ),
+            "should error on unknown kind"
+        );
     }
 }

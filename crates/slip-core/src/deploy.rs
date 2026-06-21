@@ -155,6 +155,8 @@ pub struct AppRuntimeState {
     pub current_pod_name: Option<String>,
     /// Path to the rendered manifest for the current pod (for pod-mode deploys).
     pub current_manifest_path: Option<PathBuf>,
+    /// App kind: "container", "pod", or "worker".
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -325,6 +327,7 @@ pub(crate) async fn execute_deploy_inner(
 
     // Determine if this is a pod or container deploy.
     let is_pod = merged.as_ref().map(|m| m.kind == "pod").unwrap_or(false);
+    let is_worker = merged.as_ref().map(|m| m.kind == "worker").unwrap_or(false);
 
     if is_pod {
         // ── POD DEPLOY FLOW ───────────────────────────────────────────────
@@ -419,33 +422,41 @@ pub(crate) async fn execute_deploy_inner(
         ctx.new_manifest_path = Some(manifest_path.clone());
 
         // Discover the host port for the routing container.
-        let routing_container = merged_cfg.routing_container.as_deref().unwrap_or("web");
-        let routing_port = effective_config.routing.port;
+        // Workers skip port discovery — they have no routing port.
+        let host_port = if is_worker {
+            0
+        } else {
+            let routing_container = merged_cfg.routing_container.as_deref().unwrap_or("web");
+            let routing_port = effective_config.routing.port.unwrap_or(0);
 
-        let host_port = match runtime
-            .pod_container_port(&pod_name, routing_container, routing_port)
-            .await
-        {
-            Ok(port) => port,
-            Err(e) => {
-                ctx.fail(&format!("failed to get pod container port: {e}"));
-                record_deploy(shared.deploys, &ctx);
-                set_app_failed(shared.app_states, &app_name);
-                // Tear down the new pod on failure.
-                if let Err(te) = runtime.teardown_pod(&manifest_path).await {
-                    tracing::warn!(app = %app_name, error = %te, "failed to teardown pod after port lookup failure (non-fatal)");
+            match runtime
+                .pod_container_port(&pod_name, routing_container, routing_port)
+                .await
+            {
+                Ok(port) => port,
+                Err(e) => {
+                    ctx.fail(&format!("failed to get pod container port: {e}"));
+                    record_deploy(shared.deploys, &ctx);
+                    set_app_failed(shared.app_states, &app_name);
+                    // Tear down the new pod on failure.
+                    if let Err(te) = runtime.teardown_pod(&manifest_path).await {
+                        tracing::warn!(app = %app_name, error = %te, "failed to teardown pod after port lookup failure (non-fatal)");
+                    }
+                    return;
                 }
-                return;
             }
         };
 
-        ctx.new_port = Some(host_port);
+        ctx.new_port = if is_worker { None } else { Some(host_port) };
 
         // ── HEALTH CHECK (pod) ────────────────────────────────────────────
         ctx.status = DeployStatus::HealthChecking;
         record_deploy(shared.deploys, &ctx);
 
-        if let Err(e) = health.check(host_port, &effective_config.health).await {
+        if is_worker {
+            // Workers: skip HTTP health check, pod was already verified as deployed
+            tracing::info!(app = %app_name, "worker pod deployed, skipping HTTP health check");
+        } else if let Err(e) = health.check(host_port, &effective_config.health).await {
             tracing::error!(app = %app_name, error = %e, "health check failed");
             if let Err(te) = runtime.teardown_pod(&manifest_path).await {
                 tracing::warn!(app = %app_name, error = %te, "failed to teardown pod after health check failure (non-fatal)");
@@ -467,9 +478,14 @@ pub(crate) async fn execute_deploy_inner(
                 .and_then(|s| s.current_manifest_path.clone())
         };
 
-        if let Err(e) = caddy
-            .set_route(&app_name, &effective_config.routing.domain, host_port)
-            .await
+        if !is_worker
+            && let Err(e) = caddy
+                .set_route(
+                    &app_name,
+                    effective_config.routing.domain.as_deref().unwrap_or(""),
+                    host_port,
+                )
+                .await
         {
             tracing::error!(app = %app_name, error = %e, "caddy route update failed");
             if let Err(te) = runtime.teardown_pod(&manifest_path).await {
@@ -489,10 +505,11 @@ pub(crate) async fn execute_deploy_inner(
             app_state.current_tag = Some(ctx.tag.clone());
             app_state.current_pod_name = Some(pod_name.clone());
             app_state.current_manifest_path = Some(manifest_path.clone());
-            app_state.current_port = Some(host_port);
+            app_state.current_port = if is_worker { None } else { Some(host_port) };
             app_state.deployed_at = Some(Utc::now());
             app_state.deploy_id = Some(ctx.id.clone());
             app_state.status = AppStatus::Running;
+            app_state.kind = merged.as_ref().map(|m| m.kind.clone());
             app_state.clone()
         };
 
@@ -527,7 +544,11 @@ pub(crate) async fn execute_deploy_inner(
                 &app_name,
                 &ctx.image,
                 &ctx.tag,
-                effective_config.routing.port,
+                if is_worker {
+                    0
+                } else {
+                    effective_config.routing.port.unwrap_or(0)
+                },
                 env_vars,
                 &effective_config.network.name,
                 &effective_config.resources,
@@ -537,7 +558,10 @@ pub(crate) async fn execute_deploy_inner(
         {
             Ok((container_id, port)) => {
                 ctx.new_container_id = Some(container_id);
-                ctx.new_port = Some(port);
+                if !is_worker {
+                    ctx.new_port = Some(port);
+                }
+                // Workers: current_port stays None
             }
             Err(e) => {
                 ctx.fail(&format!("container start failed: {e}"));
@@ -551,45 +575,70 @@ pub(crate) async fn execute_deploy_inner(
         ctx.status = DeployStatus::HealthChecking;
         record_deploy(shared.deploys, &ctx);
 
-        let new_port = match ctx.new_port {
-            Some(port) => port,
-            None => {
-                ctx.fail("internal error: port not set after container start");
-                record_deploy(shared.deploys, &ctx);
-                set_app_failed(shared.app_states, &app_name);
-                return;
-            }
-        };
-
-        if let Err(e) = health.check(new_port, &effective_config.health).await {
-            tracing::error!(app = %app_name, error = %e, "health check failed");
+        let new_port: u16;
+        if is_worker {
+            // Workers: use container_is_running() instead of HTTP health check
+            new_port = 0;
             if let Some(ref id) = ctx.new_container_id {
-                let _ = runtime.stop_and_remove(id).await;
+                match runtime.container_is_running(id).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::error!(app = %app_name, container_id = %id, "worker container not running after start");
+                        ctx.fail("worker container exited during start");
+                        record_deploy(shared.deploys, &ctx);
+                        set_app_failed(shared.app_states, &app_name);
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!(app = %app_name, error = %e, "failed to verify worker container state");
+                        ctx.fail(&format!("worker container state check failed: {e}"));
+                        record_deploy(shared.deploys, &ctx);
+                        set_app_failed(shared.app_states, &app_name);
+                        return;
+                    }
+                }
             }
-            ctx.fail(&format!("health check failed: {e}"));
-            record_deploy(shared.deploys, &ctx);
-            set_app_failed(shared.app_states, &app_name);
-            return;
-        }
-
-        // Verify container is still running after health check wait
-        // (container could have crashed during start_period wait)
-        if let Some(ref id) = ctx.new_container_id {
-            match runtime.container_is_running(id).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::error!(app = %app_name, container_id = %id, "container not running after health check");
-                    ctx.fail("container exited during health check");
+        } else {
+            new_port = match ctx.new_port {
+                Some(port) => port,
+                None => {
+                    ctx.fail("internal error: port not set after container start");
                     record_deploy(shared.deploys, &ctx);
                     set_app_failed(shared.app_states, &app_name);
                     return;
                 }
-                Err(e) => {
-                    tracing::error!(app = %app_name, error = %e, "failed to verify container state");
-                    ctx.fail(&format!("container state check failed: {e}"));
-                    record_deploy(shared.deploys, &ctx);
-                    set_app_failed(shared.app_states, &app_name);
-                    return;
+            };
+
+            if let Err(e) = health.check(new_port, &effective_config.health).await {
+                tracing::error!(app = %app_name, error = %e, "health check failed");
+                if let Some(ref id) = ctx.new_container_id {
+                    let _ = runtime.stop_and_remove(id).await;
+                }
+                ctx.fail(&format!("health check failed: {e}"));
+                record_deploy(shared.deploys, &ctx);
+                set_app_failed(shared.app_states, &app_name);
+                return;
+            }
+
+            // Verify container is still running after health check wait
+            // (container could have crashed during start_period wait)
+            if let Some(ref id) = ctx.new_container_id {
+                match runtime.container_is_running(id).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::error!(app = %app_name, container_id = %id, "container not running after health check");
+                        ctx.fail("container exited during health check");
+                        record_deploy(shared.deploys, &ctx);
+                        set_app_failed(shared.app_states, &app_name);
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!(app = %app_name, error = %e, "failed to verify container state");
+                        ctx.fail(&format!("container state check failed: {e}"));
+                        record_deploy(shared.deploys, &ctx);
+                        set_app_failed(shared.app_states, &app_name);
+                        return;
+                    }
                 }
             }
         }
@@ -605,9 +654,14 @@ pub(crate) async fn execute_deploy_inner(
                 .and_then(|s| s.current_container_id.clone())
         };
 
-        if let Err(e) = caddy
-            .set_route(&app_name, &effective_config.routing.domain, new_port)
-            .await
+        if !is_worker
+            && let Err(e) = caddy
+                .set_route(
+                    &app_name,
+                    effective_config.routing.domain.as_deref().unwrap_or(""),
+                    new_port,
+                )
+                .await
         {
             tracing::error!(app = %app_name, error = %e, "caddy route update failed");
             if let Some(ref id) = ctx.new_container_id {
@@ -627,10 +681,11 @@ pub(crate) async fn execute_deploy_inner(
             app_state.previous_container_id = app_state.current_container_id.take();
             app_state.current_tag = Some(ctx.tag.clone());
             app_state.current_container_id = ctx.new_container_id.clone();
-            app_state.current_port = ctx.new_port;
+            app_state.current_port = if is_worker { None } else { ctx.new_port };
             app_state.deployed_at = Some(Utc::now());
             app_state.deploy_id = Some(ctx.id.clone());
             app_state.status = AppStatus::Running;
+            app_state.kind = merged.as_ref().map(|m| m.kind.clone());
             app_state.clone()
         };
 
@@ -1232,8 +1287,8 @@ mod tests {
                 secret: None,
             },
             routing: RoutingConfig {
-                domain: "testapp.example.com".to_string(),
-                port: 3000,
+                domain: Some("testapp.example.com".to_string()),
+                port: Some(3000),
             },
             health: HealthConfig {
                 // No health path — check always passes without any HTTP call.
@@ -2244,8 +2299,8 @@ container = "web"
                 secret: None,
             },
             routing: RoutingConfig {
-                domain: "testapp.example.com".to_string(),
-                port: 3000,
+                domain: Some("testapp.example.com".to_string()),
+                port: Some(3000),
             },
             health: HealthConfig::default(),
             deploy: DeployConfig::default(),
@@ -2282,8 +2337,8 @@ container = "web"
                 secret: None,
             },
             routing: RoutingConfig {
-                domain: "testapp.example.com".to_string(),
-                port: 3000,
+                domain: Some("testapp.example.com".to_string()),
+                port: Some(3000),
             },
             health: HealthConfig::default(),
             deploy: DeployConfig::default(),
@@ -2316,8 +2371,8 @@ container = "web"
                 secret: None,
             },
             routing: RoutingConfig {
-                domain: "testapp.example.com".to_string(),
-                port: 3000,
+                domain: Some("testapp.example.com".to_string()),
+                port: Some(3000),
             },
             health: HealthConfig::default(),
             deploy: DeployConfig::default(),
@@ -2345,8 +2400,8 @@ container = "web"
                 secret: None,
             },
             routing: RoutingConfig {
-                domain: "testapp.example.com".to_string(),
-                port: 3000,
+                domain: Some("testapp.example.com".to_string()),
+                port: Some(3000),
             },
             health: HealthConfig::default(),
             deploy: DeployConfig::default(),

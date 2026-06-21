@@ -33,6 +33,9 @@ pub struct PersistedAppState {
     /// Path to the rendered manifest for the current pod.
     #[serde(default)]
     pub current_manifest_path: Option<PathBuf>,
+    /// App kind: "container", "pod", or "worker".
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 impl From<&AppRuntimeState> for PersistedAppState {
@@ -45,6 +48,7 @@ impl From<&AppRuntimeState> for PersistedAppState {
             deployed_at: s.deployed_at,
             current_pod_name: s.current_pod_name.clone(),
             current_manifest_path: s.current_manifest_path.clone(),
+            kind: s.kind.clone(),
         }
     }
 }
@@ -68,6 +72,7 @@ impl From<PersistedAppState> for AppRuntimeState {
             deploy_id: None,
             current_pod_name: p.current_pod_name,
             current_manifest_path: p.current_manifest_path,
+            kind: p.kind,
         }
     }
 }
@@ -222,7 +227,7 @@ pub async fn reconcile_routes(
             if state.status != AppStatus::Running {
                 return None;
             }
-            let port = state.current_port?;
+            let port = state.current_port?; // Workers have current_port = None, so they're implicitly skipped
             let config = match app_configs.get(app_name) {
                 Some(c) => c,
                 None => {
@@ -232,7 +237,7 @@ pub async fn reconcile_routes(
             };
             Some(RouteInfo {
                 app_name: app_name.clone(),
-                domain: config.routing.domain.clone(),
+                domain: config.routing.domain.clone().unwrap_or_default(),
                 port,
             })
         })
@@ -265,15 +270,16 @@ pub async fn reconcile_preview_routes(
             if state.status != AppStatus::Running {
                 return None;
             }
-            let port = state.port?;
-            if state.domain.is_empty() {
-                return None;
-            }
+            let port = state.port?; // Workers have port = None, so they're implicitly skipped
+            let domain = match state.domain.as_ref() {
+                Some(d) => d.clone(),
+                None => return None,
+            };
             // The Caddy route app_name for previews is "{app}-preview-{preview_id}".
             let preview_app_name = format!("{}-preview-{}", state.app, state.preview_id);
             Some(RouteInfo {
                 app_name: preview_app_name,
-                domain: state.domain.clone(),
+                domain,
                 port,
             })
         })
@@ -461,6 +467,7 @@ mod tests {
             deploy_id: Some("dep_01abc".to_string()),
             current_pod_name: None,
             current_manifest_path: None,
+            kind: Some("container".to_string()),
         }
     }
 
@@ -667,8 +674,8 @@ mod tests {
                     secret: None,
                 },
                 routing: crate::config::RoutingConfig {
-                    domain: "app1.example.com".to_string(),
-                    port: 80,
+                    domain: Some("app1.example.com".to_string()),
+                    port: Some(80),
                 },
                 health: crate::config::HealthConfig::default(),
                 deploy: crate::config::DeployConfig::default(),
@@ -748,8 +755,8 @@ mod tests {
                     secret: None,
                 },
                 routing: crate::config::RoutingConfig {
-                    domain: "app1.example.com".to_string(),
-                    port: 80,
+                    domain: Some("app1.example.com".to_string()),
+                    port: Some(80),
                 },
                 health: crate::config::HealthConfig::default(),
                 deploy: crate::config::DeployConfig::default(),
@@ -813,7 +820,7 @@ mod tests {
             tag: Some("sha-deadbeef".to_string()),
             deployed_at: Utc::now(),
             expires_at: None,
-            domain: "pr-99.preview.example.com".to_string(),
+            domain: Some("pr-99.preview.example.com".to_string()),
             manifest_path: None,
             deploy_id: Some("dep_transient_xyz".to_string()),
         }
@@ -930,7 +937,7 @@ mod tests {
             tag: Some("v1".to_string()),
             deployed_at: Utc::now(),
             expires_at: None,
-            domain: domain.to_string(),
+            domain: Some(domain.to_string()),
             manifest_path: None,
             deploy_id: None,
         }
@@ -999,7 +1006,7 @@ mod tests {
                 tag: None,
                 deployed_at: Utc::now(),
                 expires_at: None,
-                domain: "pr-2.preview.example.com".to_string(),
+                domain: Some("pr-2.preview.example.com".to_string()),
                 manifest_path: None,
                 deploy_id: None,
             },

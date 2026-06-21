@@ -121,15 +121,22 @@ impl DockerClient {
         info!(container_name, image, tag, "creating container");
 
         // Port bindings: container_port/tcp → 127.0.0.1 with ephemeral host port
-        let port_key = format!("{container_port}/tcp");
-        let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
-        port_bindings.insert(
-            port_key.clone(),
-            Some(vec![PortBinding {
-                host_ip: Some("127.0.0.1".to_string()),
-                host_port: None, // Docker assigns an ephemeral port
-            }]),
-        );
+        // When container_port is 0 (worker apps), skip port binding entirely.
+        let port_bindings: Option<HashMap<String, Option<Vec<PortBinding>>>> =
+            if container_port == 0 {
+                None
+            } else {
+                let port_key = format!("{container_port}/tcp");
+                let mut bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
+                bindings.insert(
+                    port_key.clone(),
+                    Some(vec![PortBinding {
+                        host_ip: Some("127.0.0.1".to_string()),
+                        host_port: None, // Docker assigns an ephemeral port
+                    }]),
+                );
+                Some(bindings)
+            };
 
         // Labels
         let mut labels: HashMap<String, String> = HashMap::new();
@@ -164,7 +171,7 @@ impl DockerClient {
         };
 
         let host_config = HostConfig {
-            port_bindings: Some(port_bindings),
+            port_bindings,
             network_mode: Some(network.to_string()),
             memory,
             nano_cpus,
@@ -207,7 +214,11 @@ impl DockerClient {
             return Err(DockerError::ContainerNotRunning(container_id));
         }
 
-        let host_port = extract_host_port(&info, container_port)?;
+        let host_port = if container_port == 0 {
+            0
+        } else {
+            extract_host_port(&info, container_port)?
+        };
         info!(container_id, host_port, "container started and running");
 
         Ok((container_id, host_port))

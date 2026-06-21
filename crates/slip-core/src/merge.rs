@@ -172,8 +172,8 @@ mod tests {
                 secret: None,
             },
             routing: RoutingConfig {
-                domain: "testapp.example.com".to_string(),
-                port: 3000,
+                domain: Some("testapp.example.com".to_string()),
+                port: Some(3000),
             },
             health: HealthConfig {
                 path: None,
@@ -220,8 +220,11 @@ mod tests {
         let merged = merge_config(&server, &repo).unwrap();
 
         // App config should be unchanged
-        assert_eq!(merged.app.routing.domain, "testapp.example.com");
-        assert_eq!(merged.app.routing.port, 3000);
+        assert_eq!(
+            merged.app.routing.domain.as_deref(),
+            Some("testapp.example.com")
+        );
+        assert_eq!(merged.app.routing.port, Some(3000));
         assert!(merged.app.health.path.is_none());
         assert!(merged.app.resources.memory.is_none());
         assert!(merged.app.resources.cpus.is_none());
