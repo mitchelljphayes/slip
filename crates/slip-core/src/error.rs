@@ -40,6 +40,12 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+
+    #[error("invalid deploy strategy '{strategy}': valid values are {valid:?}")]
+    InvalidStrategy {
+        strategy: String,
+        valid: Vec<&'static str>,
+    },
 }
 
 /// Errors that can occur during container health checking.

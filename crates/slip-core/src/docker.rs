@@ -219,6 +219,45 @@ impl DockerClient {
         Ok(())
     }
 
+    /// Stop a container without removing it.
+    ///
+    /// Returns `Ok(())` if the container is already stopped (304).
+    pub async fn stop_container(&self, container_id: &str) -> Result<(), DockerError> {
+        info!(container_id, "stopping container (no remove)");
+
+        match self
+            .docker
+            .stop_container(container_id, Some(StopContainerOptions { t: 10 }))
+            .await
+        {
+            Ok(()) => {}
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 304, ..
+            }) => {
+                // 304 Not Modified = already stopped, that's fine
+                warn!(container_id, "container was already stopped");
+            }
+            Err(e) => return Err(DockerError::Api(e)),
+        }
+
+        info!(container_id, "container stopped");
+        Ok(())
+    }
+
+    /// Start a stopped container.
+    ///
+    /// Returns an error if the container doesn't exist or is already running.
+    pub async fn start_container(&self, container_id: &str) -> Result<(), DockerError> {
+        info!(container_id, "starting container");
+
+        self.docker
+            .start_container(container_id, None::<StartContainerOptions<String>>)
+            .await?;
+
+        info!(container_id, "container started");
+        Ok(())
+    }
+
     /// Check whether a container exists (regardless of running state).
     ///
     /// Returns `Ok(true)` if the container exists.
@@ -243,6 +282,18 @@ impl DockerClient {
         let info = self.docker.inspect_container(container_id, None).await?;
         let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
         Ok(running)
+    }
+
+    /// Inspect a container and return the host port mapped to `container_port`.
+    ///
+    /// Returns `NoPortAssigned` if the port mapping is not found.
+    pub async fn inspect_container_port(
+        &self,
+        container_id: &str,
+        container_port: u16,
+    ) -> Result<u16, DockerError> {
+        let info = self.docker.inspect_container(container_id, None).await?;
+        extract_host_port(&info, container_port)
     }
 
     /// Extract a file from an image without starting a container.
@@ -489,6 +540,28 @@ impl RuntimeBackend for DockerClient {
         })
     }
 
+    fn stop_container<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            DockerClient::stop_container(self, container_id)
+                .await
+                .map_err(RuntimeError::from)
+        })
+    }
+
+    fn start_container<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            DockerClient::start_container(self, container_id)
+                .await
+                .map_err(RuntimeError::from)
+        })
+    }
+
     fn container_is_running<'a>(
         &'a self,
         container_id: &'a str,
@@ -506,6 +579,18 @@ impl RuntimeBackend for DockerClient {
     ) -> Pin<Box<dyn std::future::Future<Output = Result<bool, RuntimeError>> + Send + 'a>> {
         Box::pin(async move {
             DockerClient::container_exists(self, container_id)
+                .await
+                .map_err(RuntimeError::from)
+        })
+    }
+
+    fn inspect_container_port<'a>(
+        &'a self,
+        container_id: &'a str,
+        container_port: u16,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<u16, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            DockerClient::inspect_container_port(self, container_id, container_port)
                 .await
                 .map_err(RuntimeError::from)
         })

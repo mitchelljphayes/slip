@@ -19,6 +19,8 @@ pub struct RepoConfig {
     #[serde(default)]
     pub defaults: RepoDefaults,
     pub preview: Option<PreviewConfig>,
+    #[serde(default)]
+    pub deploy: RepoDeployConfig,
 }
 
 /// Basic application identity from the repo config.
@@ -65,6 +67,14 @@ pub struct RepoRoutingConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RepoDefaults {
     pub resources: Option<RepoResourceConfig>,
+}
+
+/// Deploy configuration from the repo config.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RepoDeployConfig {
+    /// Deploy strategy: "blue-green" (default) or "recreate".
+    #[serde(default)]
+    pub strategy: String,
 }
 
 /// Resource limits from the repo config.

@@ -130,6 +130,7 @@ mod tests {
             routing: RepoRoutingConfig::default(),
             defaults: RepoDefaults::default(),
             preview: None,
+            deploy: crate::repo_config::RepoDeployConfig::default(),
         }
     }
 

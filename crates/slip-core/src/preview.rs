@@ -445,7 +445,10 @@ fn update_preview_deploy_status(
         | DeployStatus::Configuring
         | DeployStatus::Starting
         | DeployStatus::HealthChecking
-        | DeployStatus::Switching => AppStatus::Deploying,
+        | DeployStatus::Switching
+        | DeployStatus::StoppingOld
+        | DeployStatus::RemovingRoute
+        | DeployStatus::RestartingOld => AppStatus::Deploying,
     };
     update_preview_status(preview_states, key, app_status);
 }
@@ -1268,6 +1271,8 @@ mod tests {
         container_id: String,
         container_port: u16,
         stop_count: Arc<AtomicU32>,
+        stop_only_count: Arc<AtomicU32>,
+        start_count: Arc<AtomicU32>,
         extract_result: Result<Option<Vec<u8>>, RuntimeError>,
         manifest_extract_result: Option<Result<Option<Vec<u8>>, RuntimeError>>,
         pod_port: Option<u16>,
@@ -1287,6 +1292,8 @@ mod tests {
                 container_id: "preview-container-id".to_string(),
                 container_port: 54321,
                 stop_count: Arc::new(AtomicU32::new(0)),
+                stop_only_count: Arc::new(AtomicU32::new(0)),
+                start_count: Arc::new(AtomicU32::new(0)),
                 extract_result: Err(RuntimeError::Unsupported("mock".to_string())),
                 manifest_extract_result: None,
                 pod_port: None,
@@ -1424,6 +1431,26 @@ mod tests {
             Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
         > {
             self.stop_count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn stop_container<'a>(
+            &'a self,
+            _container_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
+        > {
+            self.stop_only_count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn start_container<'a>(
+            &'a self,
+            _container_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
+        > {
+            self.start_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
 

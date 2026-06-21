@@ -375,6 +375,34 @@ impl Default for DeployConfig {
     }
 }
 
+/// Validate that the deploy strategy is a known value.
+///
+/// Returns `Err(ConfigError::InvalidStrategy)` for unknown strategies.
+/// Logs a warning if `drain_timeout` is non-zero with `"recreate"` strategy.
+pub fn validate_deploy_strategy(
+    strategy: &str,
+    drain_timeout: Duration,
+) -> Result<(), ConfigError> {
+    match strategy {
+        "blue-green" | "recreate" => {}
+        other => {
+            return Err(ConfigError::InvalidStrategy {
+                strategy: other.to_string(),
+                valid: vec!["blue-green", "recreate"],
+            });
+        }
+    }
+
+    if strategy == "recreate" && drain_timeout > Duration::ZERO {
+        tracing::warn!(
+            "drain_timeout is set but has no effect with recreate strategy; \
+             old connections are terminated when the container stops"
+        );
+    }
+
+    Ok(())
+}
+
 /// Optional `.env`-style file to load.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EnvFileConfig {
@@ -524,6 +552,9 @@ pub fn load_config(path: &Path) -> Result<(SlipConfig, HashMap<String, AppConfig
             if let Some(secret) = app_cfg.app.secret.take() {
                 app_cfg.app.secret = Some(resolve_env_vars(&secret)?);
             }
+
+            // Validate deploy strategy
+            validate_deploy_strategy(&app_cfg.deploy.strategy, app_cfg.deploy.drain_timeout)?;
 
             apps.insert(app_cfg.app.name.clone(), app_cfg);
         }

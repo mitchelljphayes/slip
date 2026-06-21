@@ -53,11 +53,45 @@ pub trait RuntimeBackend: Send + Sync {
         container_id: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>>;
 
+    /// Stop a container without removing it.
+    ///
+    /// Returns `Ok(())` if the container is already stopped (304).
+    fn stop_container<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>>;
+
+    /// Start a stopped container.
+    ///
+    /// Returns an error if the container doesn't exist or is already running.
+    fn start_container<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>>;
+
     /// Check if a container is currently running.
     fn container_is_running<'a>(
         &'a self,
         container_id: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, RuntimeError>> + Send + 'a>>;
+
+    /// Inspect a container and return its host port.
+    ///
+    /// Returns the host port mapped to the given container port.
+    /// Returns `Unsupported` by default — must be overridden by runtimes
+    /// that support container inspection (Docker, Podman).
+    fn inspect_container_port<'a>(
+        &'a self,
+        _container_id: &'a str,
+        _container_port: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u16, RuntimeError>> + Send + 'a>>
+    {
+        Box::pin(async {
+            Err(RuntimeError::Unsupported(
+                "inspect_container_port not implemented for this runtime".to_string(),
+            ))
+        })
+    }
 
     /// Check if a container exists (regardless of state).
     fn container_exists<'a>(

@@ -149,7 +149,22 @@ pub fn validate_repo_config(config: &RepoConfig, base_dir: &Path) -> ValidationR
         validate_preview_config(preview, &config.routing, &mut result);
     }
 
+    // Validate deploy strategy
+    validate_deploy_strategy(&config.deploy.strategy, &mut result);
+
     result
+}
+
+/// Validate deploy strategy field.
+fn validate_deploy_strategy(strategy: &str, result: &mut ValidationResult) {
+    match strategy {
+        "" | "blue-green" | "recreate" => {}
+        other => {
+            result.add_warning(format!(
+                "unknown deploy strategy '{other}': valid values are 'blue-green' and 'recreate'"
+            ));
+        }
+    }
 }
 
 /// Validate app name is a valid DNS label.
