@@ -893,6 +893,7 @@ pub(crate) async fn execute_preview_deploy_inner(
             env_vars: env_vars.clone(),
             image_overrides: ctx.images.clone(),
             volumes: preview_volumes.clone(),
+            has_workers: false,
         };
 
         let rendered_yaml = match crate::manifest::render_manifest(&manifest_bytes, &render_ctx) {

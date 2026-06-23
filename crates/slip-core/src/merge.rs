@@ -32,6 +32,8 @@ pub struct MergedRoute {
     pub port: u16,
     /// Which container to route to (pod mode only, from repo config).
     pub container: Option<String>,
+    /// Container kind: "http" (default) or "worker".
+    pub kind: String,
 }
 
 /// A fully-resolved volume after merging repo + server config.
@@ -144,6 +146,7 @@ pub fn merge_config(server: &AppConfig, repo: &RepoConfig) -> Result<MergedConfi
                 hostname: sr.hostname.clone(),
                 port: sr.port.unwrap_or(0),
                 container: None,
+                kind: "http".to_string(),
             })
             .collect()
     } else if server_routes.is_empty() && !repo_routes.is_empty() {
@@ -170,6 +173,7 @@ pub fn merge_config(server: &AppConfig, repo: &RepoConfig) -> Result<MergedConfi
                     hostname: sr.hostname.clone(),
                     port,
                     container: rr.container.clone(),
+                    kind: rr.kind.clone(),
                 }
             })
             .collect()
@@ -581,6 +585,7 @@ mod tests {
         assert_eq!(merged.routes[0].hostname, "testapp.example.com");
         assert_eq!(merged.routes[0].port, 8080);
         assert_eq!(merged.routes[0].container.as_deref(), Some("web"));
+        assert_eq!(merged.routes[0].kind, "http");
     }
 
     #[test]
@@ -596,6 +601,7 @@ mod tests {
         assert_eq!(merged.routes[0].hostname, "testapp.example.com");
         assert_eq!(merged.routes[0].port, 3000); // falls back to server port
         assert!(merged.routes[0].container.is_none());
+        assert_eq!(merged.routes[0].kind, "http");
     }
 
     #[test]
@@ -617,10 +623,12 @@ mod tests {
             RepoRouteEntry {
                 port: Some(3000),
                 container: Some("web".to_string()),
+                kind: "http".to_string(),
             },
             RepoRouteEntry {
                 port: Some(3001),
                 container: Some("admin".to_string()),
+                kind: "http".to_string(),
             },
         ];
 
@@ -630,9 +638,11 @@ mod tests {
         assert_eq!(merged.routes[0].hostname, "api.example.com");
         assert_eq!(merged.routes[0].port, 3000);
         assert_eq!(merged.routes[0].container.as_deref(), Some("web"));
+        assert_eq!(merged.routes[0].kind, "http");
         assert_eq!(merged.routes[1].hostname, "admin.example.com");
         assert_eq!(merged.routes[1].port, 3001);
         assert_eq!(merged.routes[1].container.as_deref(), Some("admin"));
+        assert_eq!(merged.routes[1].kind, "http");
     }
 
     #[test]
@@ -648,10 +658,12 @@ mod tests {
             RepoRouteEntry {
                 port: Some(3000),
                 container: None,
+                kind: "http".to_string(),
             },
             RepoRouteEntry {
                 port: Some(3001),
                 container: None,
+                kind: "http".to_string(),
             },
         ];
 
@@ -674,6 +686,7 @@ mod tests {
         repo.routing.routes = vec![RepoRouteEntry {
             port: Some(3000),
             container: None,
+            kind: "http".to_string(),
         }];
 
         let err = merge_config(&server, &repo).unwrap_err();
@@ -696,5 +709,56 @@ mod tests {
 
         let merged = merge_config(&server, &repo).unwrap();
         assert!(merged.routes.is_empty());
+    }
+
+    #[test]
+    fn merge_multi_route_kind_propagation() {
+        // Verify kind is propagated from repo route to merged route
+        let mut server = base_server_config();
+        server.routing.routes = vec![
+            crate::config::RouteEntry {
+                hostname: "api.example.com".to_string(),
+                port: None,
+            },
+            crate::config::RouteEntry {
+                hostname: "worker.example.com".to_string(),
+                port: None,
+            },
+        ];
+
+        let mut repo = minimal_repo_config("testapp");
+        repo.routing.routes = vec![
+            RepoRouteEntry {
+                port: Some(3000),
+                container: Some("web".to_string()),
+                kind: "http".to_string(),
+            },
+            RepoRouteEntry {
+                port: Some(0),
+                container: Some("worker".to_string()),
+                kind: "worker".to_string(),
+            },
+        ];
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        assert_eq!(merged.routes.len(), 2);
+        assert_eq!(merged.routes[0].kind, "http");
+        assert_eq!(merged.routes[0].container.as_deref(), Some("web"));
+        assert_eq!(merged.routes[1].kind, "worker");
+        assert_eq!(merged.routes[1].container.as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn merge_multi_route_single_route_kind_default() {
+        // Single-route backward compat: kind defaults to "http"
+        let server = base_server_config();
+        let mut repo = minimal_repo_config("testapp");
+        repo.routing.port = Some(8080);
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        assert_eq!(merged.routes.len(), 1);
+        assert_eq!(merged.routes[0].kind, "http");
     }
 }

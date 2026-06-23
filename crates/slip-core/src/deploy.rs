@@ -409,6 +409,7 @@ pub(crate) async fn execute_deploy_inner(
         let pod_name = format!("{app_name}-{pod_suffix}");
 
         // Render the manifest with deploy-time transformations.
+        let has_workers = merged_cfg.routes.iter().any(|r| r.kind == "worker");
         let render_ctx = crate::manifest::RenderContext {
             app_name: app_name.clone(),
             tag: ctx.tag.clone(),
@@ -417,6 +418,7 @@ pub(crate) async fn execute_deploy_inner(
             env_vars: env_vars.clone(),
             image_overrides: ctx.images.clone(),
             volumes: merged_cfg.volumes.clone(),
+            has_workers,
         };
 
         let rendered_yaml = match crate::manifest::render_manifest(&manifest_bytes, &render_ctx) {
@@ -457,128 +459,226 @@ pub(crate) async fn execute_deploy_inner(
         ctx.new_pod_name = Some(pod_name.clone());
         ctx.new_manifest_path = Some(manifest_path.clone());
 
-        // Discover the host port for the routing container.
-        // Workers skip port discovery — they have no routing port.
-        let host_port = if is_worker {
-            0
-        } else {
-            let routing_container = merged_cfg.routing_container.as_deref().unwrap_or("web");
-            let routing_port = effective_config.routing.port.unwrap_or(0);
-
-            match runtime
-                .pod_container_port(&pod_name, routing_container, routing_port)
-                .await
-            {
-                Ok(port) => port,
-                Err(e) => {
-                    ctx.fail(&format!("failed to get pod container port: {e}"));
-                    record_deploy(shared.deploys, &ctx);
-                    set_app_failed(shared.app_states, &app_name);
-                    // Tear down the new pod on failure.
-                    if let Err(te) = runtime.teardown_pod(&manifest_path).await {
-                        tracing::warn!(app = %app_name, error = %te, "failed to teardown pod after port lookup failure (non-fatal)");
-                    }
-                    return;
-                }
-            }
-        };
-
-        ctx.new_port = if is_worker { None } else { Some(host_port) };
-
-        // ── HEALTH CHECK (pod) ────────────────────────────────────────────
+        // ── PER-CONTAINER HEALTH CHECK (pod) ──────────────────────────────
         ctx.status = DeployStatus::HealthChecking;
         record_deploy(shared.deploys, &ctx);
 
         if is_worker {
-            // Workers: skip HTTP health check, pod was already verified as deployed
+            // App-level worker: skip all health checks, pod was already verified as deployed
             tracing::info!(app = %app_name, "worker pod deployed, skipping HTTP health check");
-        } else if let Err(e) = health.check(host_port, &effective_config.health).await {
-            tracing::error!(app = %app_name, error = %e, "health check failed");
-            if let Err(te) = runtime.teardown_pod(&manifest_path).await {
-                tracing::warn!(app = %app_name, error = %te, "failed to teardown pod after health check failure (non-fatal)");
+
+            // Update app runtime state for worker pod.
+            let state_snapshot = {
+                let mut states = shared.app_states.write().await;
+                let app_state = states.entry(app_name.clone()).or_default();
+                app_state.previous_tag = app_state.current_tag.take();
+                app_state.current_tag = Some(ctx.tag.clone());
+                app_state.current_pod_name = Some(pod_name.clone());
+                app_state.current_manifest_path = Some(manifest_path.clone());
+                app_state.current_port = None;
+                app_state.current_routes = vec![];
+                app_state.deployed_at = Some(Utc::now());
+                app_state.deploy_id = Some(ctx.id.clone());
+                app_state.status = AppStatus::Running;
+                app_state.kind = merged.as_ref().map(|m| m.kind.clone());
+                app_state.clone()
+            };
+
+            // Persist state to disk (non-fatal).
+            let state_dir = shared.config.storage.path.join("state");
+            if let Err(e) = state::save_app_state(&state_dir, &app_name, &state_snapshot) {
+                tracing::warn!(app = %app_name, error = %e, "failed to persist app state (non-fatal)");
             }
-            ctx.fail(&format!("health check failed: {e}"));
-            record_deploy(shared.deploys, &ctx);
-            set_app_failed(shared.app_states, &app_name);
-            return;
-        }
 
-        // ── SWITCH (pod) ──────────────────────────────────────────────────
-        ctx.status = DeployStatus::Switching;
-        record_deploy(shared.deploys, &ctx);
-
-        let old_pod_manifest = {
-            let states = shared.app_states.read().await;
-            states
-                .get(&app_name)
-                .and_then(|s| s.current_manifest_path.clone())
-        };
-
-        if !is_worker
-            && let Err(e) = caddy
-                .set_routes(
-                    &app_name,
-                    &merged_cfg
-                        .routes
-                        .iter()
-                        .map(|r| crate::caddy::Route {
-                            hostname: r.hostname.clone(),
-                            port: host_port,
-                        })
-                        .collect::<Vec<_>>(),
-                )
-                .await
-        {
-            tracing::error!(app = %app_name, error = %e, "caddy route update failed");
-            if let Err(te) = runtime.teardown_pod(&manifest_path).await {
-                tracing::warn!(app = %app_name, error = %te, "failed to teardown pod after caddy failure (non-fatal)");
+            // ── DRAIN + TEARDOWN OLD POD ──────────────────────────────────
+            let old_pod_manifest = {
+                let states = shared.app_states.read().await;
+                states
+                    .get(&app_name)
+                    .and_then(|s| s.current_manifest_path.clone())
+            };
+            if let Some(old_manifest) = old_pod_manifest {
+                tracing::info!(app = %app_name, "draining old pod");
+                tokio::time::sleep(effective_config.deploy.drain_timeout).await;
+                if let Err(e) = runtime.teardown_pod(&old_manifest).await {
+                    tracing::warn!(
+                        app = %app_name,
+                        error = %e,
+                        "failed to teardown old pod (non-fatal)"
+                    );
+                }
             }
-            ctx.fail(&format!("caddy route update failed: {e}"));
+        } else {
+            // Iterate over routes and check per-container health.
+            let mut http_route_ports: Vec<(String, u16)> = Vec::new();
+            let mut any_http_failure = false;
+
+            for route in &merged_cfg.routes {
+                let container = route.container.as_deref().unwrap_or("web");
+                let container_port = route.port;
+
+                if route.kind == "worker" {
+                    // Worker containers: check container_is_running, warn on failure
+                    let container_name = format!("{pod_name}-{container}");
+                    tracing::info!(
+                        app = %app_name,
+                        container = %container,
+                        container_name = %container_name,
+                        "checking worker container"
+                    );
+                    match runtime.container_is_running(&container_name).await {
+                        Ok(true) => {
+                            tracing::info!(
+                                app = %app_name,
+                                container = %container,
+                                "worker container is running"
+                            );
+                        }
+                        Ok(false) => {
+                            tracing::warn!(
+                                app = %app_name,
+                                container = %container,
+                                "worker container is not running (will be restarted by restartPolicy)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                app = %app_name,
+                                container = %container,
+                                error = %e,
+                                "failed to check worker container state (non-fatal)"
+                            );
+                        }
+                    }
+                } else {
+                    // HTTP containers: discover port and health check
+                    match runtime
+                        .pod_container_port(&pod_name, container, container_port)
+                        .await
+                    {
+                        Ok(host_port) => {
+                            tracing::info!(
+                                app = %app_name,
+                                container = %container,
+                                host_port = host_port,
+                                "checking HTTP container health"
+                            );
+                            if let Err(e) = health.check(host_port, &effective_config.health).await
+                            {
+                                tracing::error!(
+                                    app = %app_name,
+                                    container = %container,
+                                    error = %e,
+                                    "HTTP health check failed"
+                                );
+                                any_http_failure = true;
+                            } else {
+                                http_route_ports.push((route.hostname.clone(), host_port));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                app = %app_name,
+                                container = %container,
+                                error = %e,
+                                "failed to get container port"
+                            );
+                            any_http_failure = true;
+                        }
+                    }
+                }
+            }
+
+            // If any HTTP container failed, tear down and fail the deploy.
+            if any_http_failure {
+                if let Err(te) = runtime.teardown_pod(&manifest_path).await {
+                    tracing::warn!(app = %app_name, error = %te, "failed to teardown pod after health check failure (non-fatal)");
+                }
+                ctx.fail("health check failed for one or more HTTP containers");
+                record_deploy(shared.deploys, &ctx);
+                set_app_failed(shared.app_states, &app_name);
+                return;
+            }
+
+            // Record the first HTTP route port for backward compat.
+            ctx.new_port = http_route_ports.first().map(|(_, p)| *p);
+
+            // ── SWITCH (pod) ──────────────────────────────────────────────
+            ctx.status = DeployStatus::Switching;
             record_deploy(shared.deploys, &ctx);
-            set_app_failed(shared.app_states, &app_name);
-            return;
-        }
 
-        // Update app runtime state for pod.
-        let state_snapshot = {
-            let mut states = shared.app_states.write().await;
-            let app_state = states.entry(app_name.clone()).or_default();
-            app_state.previous_tag = app_state.current_tag.take();
-            app_state.current_tag = Some(ctx.tag.clone());
-            app_state.current_pod_name = Some(pod_name.clone());
-            app_state.current_manifest_path = Some(manifest_path.clone());
-            app_state.current_port = if is_worker { None } else { Some(host_port) };
-            app_state.current_routes = merged_cfg
-                .routes
-                .iter()
-                .map(|r| RouteState {
-                    hostname: r.hostname.clone(),
-                    port: host_port,
-                })
-                .collect();
-            app_state.deployed_at = Some(Utc::now());
-            app_state.deploy_id = Some(ctx.id.clone());
-            app_state.status = AppStatus::Running;
-            app_state.kind = merged.as_ref().map(|m| m.kind.clone());
-            app_state.clone()
-        };
+            let old_pod_manifest = {
+                let states = shared.app_states.read().await;
+                states
+                    .get(&app_name)
+                    .and_then(|s| s.current_manifest_path.clone())
+            };
 
-        // Persist state to disk (non-fatal).
-        let state_dir = shared.config.storage.path.join("state");
-        if let Err(e) = state::save_app_state(&state_dir, &app_name, &state_snapshot) {
-            tracing::warn!(app = %app_name, error = %e, "failed to persist app state (non-fatal)");
-        }
+            // Set Caddy routes only for HTTP routes.
+            if !http_route_ports.is_empty()
+                && let Err(e) = caddy
+                    .set_routes(
+                        &app_name,
+                        &http_route_ports
+                            .iter()
+                            .map(|(hostname, port)| crate::caddy::Route {
+                                hostname: hostname.clone(),
+                                port: *port,
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .await
+            {
+                tracing::error!(app = %app_name, error = %e, "caddy route update failed");
+                if let Err(te) = runtime.teardown_pod(&manifest_path).await {
+                    tracing::warn!(app = %app_name, error = %te, "failed to teardown pod after caddy failure (non-fatal)");
+                }
+                ctx.fail(&format!("caddy route update failed: {e}"));
+                record_deploy(shared.deploys, &ctx);
+                set_app_failed(shared.app_states, &app_name);
+                return;
+            }
 
-        // ── DRAIN + TEARDOWN OLD POD ──────────────────────────────────────
-        if let Some(old_manifest) = old_pod_manifest {
-            tracing::info!(app = %app_name, "draining old pod");
-            tokio::time::sleep(effective_config.deploy.drain_timeout).await;
-            if let Err(e) = runtime.teardown_pod(&old_manifest).await {
-                tracing::warn!(
-                    app = %app_name,
-                    error = %e,
-                    "failed to teardown old pod (non-fatal)"
-                );
+            // Update app runtime state for pod with per-route ports.
+            let state_snapshot = {
+                let mut states = shared.app_states.write().await;
+                let app_state = states.entry(app_name.clone()).or_default();
+                app_state.previous_tag = app_state.current_tag.take();
+                app_state.current_tag = Some(ctx.tag.clone());
+                app_state.current_pod_name = Some(pod_name.clone());
+                app_state.current_manifest_path = Some(manifest_path.clone());
+                app_state.current_port = http_route_ports.first().map(|(_, p)| *p);
+                app_state.current_routes = http_route_ports
+                    .iter()
+                    .map(|(hostname, port)| RouteState {
+                        hostname: hostname.clone(),
+                        port: *port,
+                    })
+                    .collect();
+                app_state.deployed_at = Some(Utc::now());
+                app_state.deploy_id = Some(ctx.id.clone());
+                app_state.status = AppStatus::Running;
+                app_state.kind = merged.as_ref().map(|m| m.kind.clone());
+                app_state.clone()
+            };
+
+            // Persist state to disk (non-fatal).
+            let state_dir = shared.config.storage.path.join("state");
+            if let Err(e) = state::save_app_state(&state_dir, &app_name, &state_snapshot) {
+                tracing::warn!(app = %app_name, error = %e, "failed to persist app state (non-fatal)");
+            }
+
+            // ── DRAIN + TEARDOWN OLD POD ──────────────────────────────────
+            if let Some(old_manifest) = old_pod_manifest {
+                tracing::info!(app = %app_name, "draining old pod");
+                tokio::time::sleep(effective_config.deploy.drain_timeout).await;
+                if let Err(e) = runtime.teardown_pod(&old_manifest).await {
+                    tracing::warn!(
+                        app = %app_name,
+                        error = %e,
+                        "failed to teardown old pod (non-fatal)"
+                    );
+                }
             }
         }
     } else {

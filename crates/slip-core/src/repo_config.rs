@@ -73,7 +73,7 @@ pub struct RepoHealthConfig {
 ///
 /// The repo declares which `port` and/or `container` to route to.
 /// The server provides the `hostname` (domain).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RepoRouteEntry {
     /// Port to route to.
     #[serde(default)]
@@ -81,18 +81,49 @@ pub struct RepoRouteEntry {
     /// Which container to route to (pod mode only).
     #[serde(default)]
     pub container: Option<String>,
+    /// Container kind: "http" (default) or "worker".
+    #[serde(default = "default_route_kind")]
+    pub kind: String,
+}
+
+impl Default for RepoRouteEntry {
+    fn default() -> Self {
+        Self {
+            port: None,
+            container: None,
+            kind: default_route_kind(),
+        }
+    }
+}
+
+fn default_route_kind() -> String {
+    "http".to_string()
 }
 
 /// Routing configuration from the repo config.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RepoRoutingConfig {
     pub port: Option<u16>,
     /// Which container to route to (pod mode only).
     pub container: Option<String>,
+    /// Container kind for single-route shorthand: "http" (default) or "worker".
+    #[serde(default = "default_route_kind")]
+    pub kind: String,
     /// Multiple routes for this app. Each entry has a port and optional container.
     /// When non-empty, takes precedence over `port`/`container`.
     #[serde(default)]
     pub routes: Vec<RepoRouteEntry>,
+}
+
+impl Default for RepoRoutingConfig {
+    fn default() -> Self {
+        Self {
+            port: None,
+            container: None,
+            kind: default_route_kind(),
+            routes: Vec::new(),
+        }
+    }
 }
 
 impl RepoRoutingConfig {
@@ -109,6 +140,7 @@ impl RepoRoutingConfig {
             vec![RepoRouteEntry {
                 port: self.port,
                 container: self.container.clone(),
+                kind: self.kind.clone(),
             }]
         } else {
             vec![]
@@ -577,5 +609,56 @@ port = 3000
         assert_eq!(cfg.routing.routes.len(), 1);
         assert_eq!(cfg.routing.routes[0].port, Some(3000));
         assert!(cfg.routing.routes[0].container.is_none());
+        assert_eq!(cfg.routing.routes[0].kind, "http");
+    }
+
+    #[test]
+    fn parse_repo_config_route_entry_kind_worker() {
+        let toml = r#"
+[app]
+name = "stat-stream"
+
+[[routing.routes]]
+hostname = "stat-stream.example.com"
+port = 8000
+container = "web"
+kind = "http"
+
+[[routing.routes]]
+port = 0
+container = "worker"
+kind = "worker"
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        assert_eq!(cfg.routing.routes.len(), 2);
+        assert_eq!(cfg.routing.routes[0].kind, "http");
+        assert_eq!(cfg.routing.routes[1].kind, "worker");
+    }
+
+    #[test]
+    fn parse_repo_config_single_route_kind_worker() {
+        let toml = r#"
+[app]
+name = "workerapp"
+
+[routing]
+kind = "worker"
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        assert_eq!(cfg.routing.kind, "worker");
+    }
+
+    #[test]
+    fn parse_repo_config_route_entry_kind_defaults_to_http() {
+        let toml = r#"
+[app]
+name = "multiapp"
+
+[[routing.routes]]
+port = 3000
+container = "web"
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        assert_eq!(cfg.routing.routes[0].kind, "http");
     }
 }

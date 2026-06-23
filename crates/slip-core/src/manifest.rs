@@ -1,6 +1,6 @@
 //! Pod manifest rendering for `podman kube play`.
 //!
-//! Transforms a raw Kubernetes Pod YAML at deploy-time by applying seven
+//! Transforms a raw Kubernetes Pod YAML at deploy-time by applying eight
 //! mutations in order:
 //!
 //! 1. Set a versioned pod name (append `{pod_suffix}`).
@@ -10,6 +10,7 @@
 //! 5. Set `hostPort: 0` on every container port (ephemeral port assignment).
 //! 6. Inject env vars (no-clobber; creates `env` array if absent).
 //! 7. Inject host-path volumes (no-clobber; skips on name/mount-path collision).
+//! 8. Set `spec.restartPolicy: OnFailure` when worker containers are present.
 
 use std::collections::HashMap;
 
@@ -33,6 +34,8 @@ pub struct RenderContext {
     pub image_overrides: HashMap<String, String>,
     /// Host-path volumes to inject into the pod manifest.
     pub volumes: Vec<MergedVolume>,
+    /// Whether the pod contains worker containers (triggers restartPolicy: OnFailure).
+    pub has_workers: bool,
 }
 
 /// Errors that can occur during manifest rendering.
@@ -72,6 +75,7 @@ pub fn render_manifest(raw_yaml: &[u8], ctx: &RenderContext) -> Result<String, M
     set_host_ports_zero(&mut doc);
     inject_env_vars(&mut doc, &ctx.env_vars);
     inject_volumes(&mut doc, ctx);
+    set_restart_policy(&mut doc, ctx.has_workers);
 
     serde_yaml::to_string(&doc).map_err(|e| ManifestError::InvalidYaml(e.to_string()))
 }
@@ -440,6 +444,27 @@ fn inject_volumes(doc: &mut Value, ctx: &RenderContext) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Transformation 8 — set restartPolicy: OnFailure when workers present
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Set `spec.restartPolicy: OnFailure` when the pod contains worker containers.
+///
+/// This ensures worker containers are automatically restarted by Podman/Kubernetes
+/// when they exit with a non-zero status.
+fn set_restart_policy(doc: &mut Value, has_workers: bool) {
+    if !has_workers {
+        return;
+    }
+
+    if let Some(spec) = doc.get_mut("spec").and_then(|s| s.as_mapping_mut()) {
+        spec.insert(
+            Value::String("restartPolicy".to_string()),
+            Value::String("OnFailure".to_string()),
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -541,6 +566,7 @@ spec:
             env_vars: vec![],
             image_overrides: HashMap::new(),
             volumes: Vec::new(),
+            has_workers: false,
         }
     }
 
@@ -846,6 +872,7 @@ spec:
                 mount_path: "/app/data".to_string(),
                 read_only: false,
             }],
+            has_workers: false,
         };
         inject_volumes(&mut doc, &ctx);
 
@@ -904,10 +931,11 @@ spec:
             env_vars: vec![],
             image_overrides: HashMap::new(),
             volumes: vec![MergedVolume {
-                host_path: "/data/new".to_string(),
-                mount_path: "/data/new".to_string(),
-                read_only: true,
+                host_path: "/data/myapp".to_string(),
+                mount_path: "/app/data".to_string(),
+                read_only: false,
             }],
+            has_workers: false,
         };
         inject_volumes(&mut doc, &ctx);
 
@@ -917,7 +945,7 @@ spec:
             .expect("volumes should exist");
         assert_eq!(volumes.len(), 2);
         assert_eq!(volumes[0]["name"].as_str().unwrap(), "existing-vol");
-        assert_eq!(volumes[1]["name"].as_str().unwrap(), "slip-myapp-data-new");
+        assert_eq!(volumes[1]["name"].as_str().unwrap(), "slip-myapp-app-data");
 
         // Container should have 2 volumeMounts
         let container = &doc["spec"]["containers"][0];
@@ -960,6 +988,7 @@ spec:
                 mount_path: "/app/data".to_string(),
                 read_only: false,
             }],
+            has_workers: false,
         };
         inject_volumes(&mut doc, &ctx);
 
@@ -1007,6 +1036,7 @@ spec:
                 mount_path: "/app/data".to_string(), // same mount path
                 read_only: false,
             }],
+            has_workers: false,
         };
         inject_volumes(&mut doc, &ctx);
 
@@ -1038,10 +1068,11 @@ spec:
             env_vars: vec![],
             image_overrides: HashMap::new(),
             volumes: vec![MergedVolume {
-                host_path: "/data/config".to_string(),
-                mount_path: "/app/config".to_string(),
+                host_path: "/data/new".to_string(),
+                mount_path: "/data/new".to_string(),
                 read_only: true,
             }],
+            has_workers: false,
         };
         inject_volumes(&mut doc, &ctx);
 
@@ -1075,6 +1106,7 @@ spec:
                 mount_path: "/app/data".to_string(),
                 read_only: false,
             }],
+            has_workers: false,
         };
         inject_volumes(&mut doc, &ctx);
 
@@ -1113,6 +1145,7 @@ spec:
                 mount_path: "/app/data".to_string(),
                 read_only: false,
             }],
+            has_workers: false,
         };
         inject_volumes(&mut doc, &ctx);
 
@@ -1302,6 +1335,7 @@ spec:
             env_vars: vec![],
             image_overrides: HashMap::new(),
             volumes: Vec::new(),
+            has_workers: false,
         };
         let result = render_manifest(yaml.as_bytes(), &ctx).unwrap();
         let doc = parse_output(&result);
@@ -1317,5 +1351,98 @@ spec:
         // Sidecar: ${tag} resolved (no override, so stays as resolved)
         let redis = &doc["spec"]["containers"][1];
         assert_eq!(redis["image"].as_str().unwrap(), "redis:v2.0.0");
+    }
+
+    // ── restartPolicy tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn set_restart_policy_noop_when_no_workers() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  containers:
+    - name: web
+      image: myapp:latest
+"#;
+        let mut doc: Value = serde_yaml::from_str(yaml).unwrap();
+        set_restart_policy(&mut doc, false);
+        // restartPolicy should not be set
+        assert!(doc["spec"]["restartPolicy"].is_null());
+    }
+
+    #[test]
+    fn set_restart_policy_on_failure_when_workers() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  containers:
+    - name: web
+      image: myapp:latest
+"#;
+        let mut doc: Value = serde_yaml::from_str(yaml).unwrap();
+        set_restart_policy(&mut doc, true);
+        assert_eq!(doc["spec"]["restartPolicy"].as_str().unwrap(), "OnFailure");
+    }
+
+    #[test]
+    fn render_manifest_with_workers_sets_restart_policy() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  containers:
+    - name: web
+      image: myapp:latest
+    - name: worker
+      image: myapp:latest
+"#;
+        let ctx = RenderContext {
+            app_name: "myapp".to_string(),
+            tag: "v1.0.0".to_string(),
+            primary_image: "myapp".to_string(),
+            pod_suffix: "xyz".to_string(),
+            env_vars: vec![],
+            image_overrides: HashMap::new(),
+            volumes: Vec::new(),
+            has_workers: true,
+        };
+        let result = render_manifest(yaml.as_bytes(), &ctx).unwrap();
+        let doc = parse_output(&result);
+        assert_eq!(doc["spec"]["restartPolicy"].as_str().unwrap(), "OnFailure");
+    }
+
+    #[test]
+    fn render_manifest_without_workers_no_restart_policy() {
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  containers:
+    - name: web
+      image: myapp:latest
+"#;
+        let ctx = RenderContext {
+            app_name: "myapp".to_string(),
+            tag: "v1.0.0".to_string(),
+            primary_image: "myapp".to_string(),
+            pod_suffix: "xyz".to_string(),
+            env_vars: vec![],
+            image_overrides: HashMap::new(),
+            volumes: Vec::new(),
+            has_workers: false,
+        };
+        let result = render_manifest(yaml.as_bytes(), &ctx).unwrap();
+        let doc = parse_output(&result);
+        assert!(doc["spec"]["restartPolicy"].is_null());
     }
 }
