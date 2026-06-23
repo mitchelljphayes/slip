@@ -448,6 +448,7 @@ impl DockerClient {
                 name,
                 driver: "bridge",
                 check_duplicate: true,
+                attachable: true,
                 ..Default::default()
             })
             .await?;
