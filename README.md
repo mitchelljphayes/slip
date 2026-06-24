@@ -1,128 +1,81 @@
 # slip
 
-> A container dock for your server.
+> Zero-downtime container deploys from CI, without Kubernetes.
 
-**slip** is a lightweight deployment daemon written in Rust. It runs on your server, accepts deploy webhooks from CI, and manages zero-downtime container deployments using Caddy as the reverse proxy.
+**slip** is a lightweight deployment daemon written in Rust. It runs on your server, accepts signed webhooks from CI, and manages zero-downtime container deployments using Caddy as the reverse proxy.
 
 No SSH keys in CI. No PaaS overhead. No Kubernetes.
 
-## How it works
-
 ```
-GitHub Actions → signed webhook → slipd → pull image → start container → health check → update Caddy → stop old
+GitHub Actions → signed webhook → slipd → pull → health check → swap route → stop old
 ```
-
-1. CI builds your image and pushes to a registry
-2. CI sends a signed HTTP POST to your server
-3. `slipd` pulls the image, starts a new container, health checks it
-4. If healthy: swaps the Caddy route, drains old connections, stops the old container
-5. If unhealthy: stops the new container, keeps the old one running
 
 ## Features
 
-- **Zero-downtime deploys** — blue-green container swap with health checks
-- **HMAC-SHA256 auth** — CI gets one secret, no SSH keys
+- **Zero-downtime deploys** — blue-green (start new, swap, drain old) or recreate (stop old, start new)
+- **HMAC-SHA256 auth** — CI gets one secret per app, no SSH keys on runners
 - **Caddy integration** — automatic HTTPS, dynamic route management via admin API
-- **Per-app config** — health checks, resource limits, env vars, secrets
-- **Graceful shutdown** — in-flight deploys complete before exit
+- **Pod support** — multi-container pods via `podman kube play` (init containers, shared volumes, per-container env)
+- **Worker apps** — non-HTTP workloads (pipelines, daemons) with container-liveness health checks
+- **Multiple routes** — one app, multiple Caddy hostnames (e.g. `api.example.com` + `dagster.example.com`)
+- **Persistent volumes** — host-path bind mounts that survive redeploys
+- **Multi-image deploys** — one webhook, multiple container images (`${tag}` placeholders + per-container overrides)
+- **Preview environments** — ephemeral deploys with TTL, subdomain routing, wildcard TLS
+- **SQLite deploy history** — STRICT tables, survives restarts, queryable via API
+- **Secrets management** — per-app secret store with restrictive file permissions
+- **Per-container health** — mixed HTTP + worker containers in a single pod
 - **Structured logging** — JSON logs via `tracing`
+
+## Install
+
+```bash
+curl -sSL https://raw.githubusercontent.com/mitchelljphayes/slip/main/install.sh | bash
+```
+
+This downloads a static binary, creates a `slip` service user, sets up directories, and installs a systemd unit.
+
+**Manual install** (if you prefer to build from source):
+
+```bash
+git clone https://github.com/mitchelljphayes/slip.git
+cd slip
+cargo build --release
+sudo cp target/release/slipd target/release/slip /usr/local/bin/
+```
+
+See [docs/getting-started.md](docs/getting-started.md) for the full setup guide.
 
 ## Quick start
 
-### On the server
+### 1. Configure slipd
 
 ```bash
-# 1. Create config
-mkdir -p /etc/slip/apps
-
-cat > /etc/slip/slip.toml << 'EOF'
+sudo tee /etc/slip/slip.toml > /dev/null << 'EOF'
 [server]
-listen = "0.0.0.0:7890"
+listen = "127.0.0.1:7890"
 
-[auth]
-secret = "${SLIP_SECRET}"
-
-[caddy]
-admin_api = "http://localhost:2019"
-EOF
-
-cat > /etc/slip/apps/myapp.toml << 'EOF'
-[app]
-name = "myapp"
-image = "ghcr.io/you/myapp"
-
-[routing]
-domain = "myapp.example.com"
-port = 3000
-
-[health]
-path = "/health"
-EOF
-
-# 2. Start the daemon
-SLIP_SECRET=your-secret-here slipd --config /etc/slip/slip.toml
-```
-
-### From CI
-
-```bash
-# Deploy with a single curl
-PAYLOAD='{"app":"myapp","image":"ghcr.io/you/myapp","tag":"v1.2.3"}'
-SIG=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$SLIP_SECRET" | cut -d' ' -f2)
-
-curl -X POST https://your-server:7890/v1/deploy \
-  -H "Content-Type: application/json" \
-  -H "X-Slip-Signature: sha256=$SIG" \
-  -d "$PAYLOAD"
-```
-
-## Project structure
-
-Cargo workspace with three crates:
-
-| Crate | Description |
-|-------|-------------|
-| **`slipd`** | Deploy daemon — receives webhooks, manages containers, talks to Caddy |
-| **`slip`** | CLI — app management, secrets, status, manual deploys |
-| **`slip-core`** | Shared library — config, types, Docker/Caddy clients |
-
-## API
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v1/deploy` | POST | Trigger a deploy (signed webhook) |
-| `/v1/status` | GET | Daemon health + all app statuses |
-| `/v1/deploys/{id}` | GET | Deploy progress and status |
-
-## Configuration
-
-### Daemon config (`slip.toml`)
-
-```toml
-[server]
-listen = "0.0.0.0:7890"      # Bind address
-
-[auth]
-secret = "${SLIP_SECRET}"      # HMAC secret (env var resolved)
+[runtime]
+backend = "auto"          # auto-detects Podman or Docker
 
 [caddy]
 admin_api = "http://localhost:2019"
 
 [storage]
-path = "/var/lib/slip"         # State persistence directory
+path = "/var/lib/slip"
+EOF
 ```
 
-### App config (`apps/myapp.toml`)
+### 2. Create an app config
 
-```toml
-[app]
+```bash
+sudo tee /etc/slip/apps/myapp.toml > /dev/null << 'EOF'
+[[apps]]
 name = "myapp"
 image = "ghcr.io/you/myapp"
-# secret = "${MYAPP_SECRET}"   # Per-app secret (overrides global)
 
 [routing]
 domain = "myapp.example.com"
-port = 3000
+port = 8080
 
 [health]
 path = "/health"
@@ -138,20 +91,137 @@ drain_timeout = "30s"
 [resources]
 memory = "512m"
 cpus = "1.0"
-
-[env]
-DATABASE_URL = "${DATABASE_URL}"
-
-[network]
-name = "slip"
+EOF
 ```
+
+### 3. Set the webhook secret
+
+```bash
+sudo slip secret set myapp/SLIP_SECRET --value "your-hmac-secret"
+```
+
+### 4. Start the daemon
+
+```bash
+sudo slipd --config /etc/slip --check    # validate config
+sudo systemctl enable --now slipd       # start the service
+```
+
+### 5. Deploy from CI
+
+```bash
+PAYLOAD='{"app":"myapp","tag":"sha-abc123f"}'
+SIG=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$SLIP_SECRET" | cut -d' ' -f2)
+
+curl -X POST https://deploy.example.com/v1/deploy \
+  -H "Content-Type: application/json" \
+  -H "X-Slip-Signature: sha256=$SIG" \
+  -d "$PAYLOAD"
+```
+
+Or use the CLI:
+
+```bash
+slip deploy myapp sha-abc123f \
+  --server https://deploy.example.com \
+  --secret "$SLIP_SECRET"
+```
+
+## Comparison
+
+| Feature | slip | Dokku | CapRover | Kamal | k8s |
+|---------|------|-------|---------|-------|-----|
+| Signed webhooks (no SSH in CI) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Single binary, no runtime deps | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Blue-green + recreate strategies | ✅ | ❌ | ❌ | ✅ (blue-green) | ✅ |
+| Pod support (kube play) | ✅ | ❌ | ❌ | ❌ | ✅ |
+| Worker / non-HTTP apps | ✅ | ❌ | ❌ | ❌ | ✅ |
+| Preview deployments | ✅ | ❌ | ✅ | ❌ | ✅ |
+| Persistent volumes | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Multiple routes per deploy | ✅ | ❌ | ✅ | ❌ | ✅ |
+| Cost | Free | Free | Free | Free | $73+/mo |
+
+## App types
+
+### Single-container (blue-green)
+
+```toml
+[[apps]]
+name = "api"
+image = "ghcr.io/you/api"
+
+[routing]
+domain = "api.example.com"
+port = 8080
+
+[deploy]
+strategy = "blue-green"
+```
+
+### Worker (non-HTTP, e.g. a pipeline)
+
+The repo's `slip.toml` declares `kind = "worker"`. No domain, no port, health = container running.
+
+```toml
+[[apps]]
+name = "pipeline"
+image = "ghcr.io/you/pipeline"
+
+[[apps.volumes]]
+host_path = "/var/lib/slip/volumes/pipeline/state"
+mount_path = "/app/data"
+read_only = false
+```
+
+### Pod (multi-container)
+
+The repo declares `kind = "pod"` with a `pod.yaml` manifest. slip renders it and runs via `podman kube play`.
+
+```toml
+[[apps]]
+name = "statstream"
+image = "ghcr.io/you/statstream-api"
+
+[deploy]
+strategy = "recreate"
+
+[[apps.routes]]
+hostname = "statstream.example.com"
+container = "api"
+
+[[apps.routes]]
+hostname = "dagster.example.com"
+container = "dagster-webserver"
+
+[[apps.volumes]]
+host_path = "/var/lib/slip/volumes/statstream/dagster-home"
+mount_path = "/opt/dagster/dagster_home"
+```
+
+## Project structure
+
+Cargo workspace with three crates:
+
+| Crate | Description |
+|-------|-------------|
+| **`slipd`** | Deploy daemon — receives webhooks, manages containers, talks to Caddy |
+| **`slip`** | CLI — app management, secrets, status, manual deploys |
+| **`slip-core`** | Shared library — config, types, Docker/Podman/Caddy clients |
+
+## API
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/deploy` | POST | Trigger a deploy (signed webhook) |
+| `/v1/status` | GET | Daemon health + all app statuses |
+| `/v1/deploys/{id}` | GET | Deploy progress and status |
+| `/v1/apps/{name}` | GET/PATCH/DELETE | App config management |
+| `/v1/apps/{name}/rollback` | POST | Rollback to previous deploy |
+| `/v1/secrets/{app}/{key}` | PUT/GET/DELETE | Per-app secrets |
 
 ## Development
 
 ```bash
-# Setup git hooks
-./scripts/setup-hooks.sh
-
 # Run tests
 cargo test
 
@@ -163,12 +233,21 @@ cargo clippy --workspace --all-targets -- -D warnings
 ./scripts/smoke-test.sh
 ```
 
+## Documentation
+
+- [Getting Started Guide](docs/getting-started.md)
+- [Network Coexistence (external infra)](docs/network-coexistence.md)
+- [Design Doc (Phase 1)](docs/slip-design.md)
+- [Pod Deploys Design (Phase 2)](docs/design-v2-pod-deploys.md)
+- [PRD](docs/prd.md)
+- [Tech Spec](docs/tech-spec.md)
+
 ## Roadmap
 
 - [x] **Phase 1: Core Deploy Loop** — webhook, deploy, health check, Caddy swap
-- [ ] **Phase 2: Pods, Previews & CLI** — Podman support, pod deploys, preview environments, remote CLI
-
-See [docs/design-v2-pod-deploys.md](docs/design-v2-pod-deploys.md) for the Phase 2 design.
+- [x] **Phase 2: Pods, Previews & CLI** — Podman support, pod deploys, preview environments, CLI, volumes, workers, multi-image, multi-route
+- [ ] **Phase 3: Production Hardening** — deploy timeout, image pruning, multi-registry, systemd packaging
+- [ ] **Phase 4: CI Integration** — reusable GitHub Actions workflow, deploy status callbacks, `slip deploy --wait`
 
 ## License
 
