@@ -29,7 +29,6 @@ pub use config::{
 pub use db::Db;
 pub use deploy::{
     AppRuntimeState, AppStatus, DeployContext, DeployStatus, TriggerSource, execute_deploy,
-    record_deploy,
 };
 pub use docker::{DockerClient, parse_cpu_limit, parse_memory_limit};
 pub use error::{CaddyError, ConfigError, HealthError, RuntimeError};

@@ -145,28 +145,76 @@ impl CaddyClient {
     /// Ensure the slip HTTP server block exists in Caddy.
     ///
     /// Idempotent: if the block already exists, this is a no-op.
+    ///
+    /// Works against a freshly-started Caddy whose config contains only the
+    /// `admin` endpoint (no `apps` tree). Rather than POSTing into a path that
+    /// may not exist yet (`config/apps/http/servers`), this reads the full
+    /// config, merges the slip server block in, and atomically reloads it via
+    /// `POST /load` — preserving any existing config (e.g. `admin`).
     pub async fn bootstrap(&self) -> Result<(), CaddyError> {
-        let url = format!("{}/config/apps/http/servers/slip", self.base_url);
-        let resp = self.client.get(&url).send().await?;
-        if resp.status().is_success() {
-            // Server block already exists — nothing to do.
+        // Fetch the current full config.
+        let cfg_url = format!("{}/config/", self.base_url);
+        let resp = self.client.get(&cfg_url).send().await?;
+        let mut config: serde_json::Value = if resp.status().is_success() {
+            resp.json().await.unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        };
+
+        // If the slip server block already exists, nothing to do.
+        if config.pointer("/apps/http/servers/slip").is_some() {
             return Ok(());
         }
 
-        // Create the server block.
-        let body = json!({
-            "listen": [":443"],
-            "routes": []
-        });
-        let create_resp = self.client.post(&url).json(&body).send().await?;
+        // Ensure we have an object to build on (fresh Caddy may return `null`).
+        if !config.is_object() {
+            config = json!({});
+        }
 
-        if create_resp.status().is_success() {
+        // Walk/create the nested structure: apps.http.servers.slip
+        let root = config.as_object_mut().expect("config is an object");
+        let apps = root.entry("apps").or_insert_with(|| json!({}));
+        if !apps.is_object() {
+            *apps = json!({});
+        }
+        let http = apps
+            .as_object_mut()
+            .expect("apps is an object")
+            .entry("http")
+            .or_insert_with(|| json!({}));
+        if !http.is_object() {
+            *http = json!({});
+        }
+        let servers = http
+            .as_object_mut()
+            .expect("http is an object")
+            .entry("servers")
+            .or_insert_with(|| json!({}));
+        if !servers.is_object() {
+            *servers = json!({});
+        }
+        servers
+            .as_object_mut()
+            .expect("servers is an object")
+            .insert(
+                "slip".to_string(),
+                json!({
+                    "listen": [":443"],
+                    "routes": []
+                }),
+            );
+
+        // Atomically load the merged config.
+        let load_url = format!("{}/load", self.base_url);
+        let load_resp = self.client.post(&load_url).json(&config).send().await?;
+
+        if load_resp.status().is_success() {
             Ok(())
         } else {
-            let status = create_resp.status();
-            let text = create_resp.text().await.unwrap_or_default();
+            let status = load_resp.status();
+            let text = load_resp.text().await.unwrap_or_default();
             Err(CaddyError::BootstrapFailed(format!(
-                "POST {url} returned {status}: {text}"
+                "POST {load_url} returned {status}: {text}"
             )))
         }
     }
@@ -426,6 +474,42 @@ mod tests {
         }
     }
 
+    /// Mock `GET /config/` — returns the full config, reflecting whether the
+    /// slip server block has been created.
+    async fn mock_get_config(
+        State(state): State<MockState>,
+    ) -> (StatusCode, axum::Json<serde_json::Value>) {
+        let map = state.lock().await;
+        if let Some(server) = map.get("__server__") {
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "apps": {"http": {"servers": {"slip": server}}}
+                })),
+            )
+        } else {
+            // Fresh Caddy: only the admin endpoint is configured.
+            (
+                StatusCode::OK,
+                axum::Json(json!({"admin": {"listen": "localhost:2019"}})),
+            )
+        }
+    }
+
+    /// Mock `POST /load` — stores the slip server block from the loaded config.
+    async fn mock_load_config(
+        State(state): State<MockState>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> StatusCode {
+        if let Some(server) = body.pointer("/apps/http/servers/slip") {
+            state
+                .lock()
+                .await
+                .insert("__server__".to_string(), server.clone());
+        }
+        StatusCode::OK
+    }
+
     async fn mock_create_server(
         State(state): State<MockState>,
         axum::Json(body): axum::Json<serde_json::Value>,
@@ -529,6 +613,8 @@ mod tests {
     async fn start_mock_caddy() -> (u16, MockState) {
         let state: MockState = Arc::new(Mutex::new(HashMap::new()));
         let app = Router::new()
+            .route("/config/", get(mock_get_config))
+            .route("/load", post(mock_load_config))
             .route(
                 "/config/apps/http/servers/slip",
                 get(mock_get_server).post(mock_create_server),
@@ -557,6 +643,8 @@ mod tests {
     async fn start_mock_caddy_with_tls_failure() -> (u16, MockState) {
         let state: MockState = Arc::new(Mutex::new(HashMap::new()));
         let app = Router::new()
+            .route("/config/", get(mock_get_config))
+            .route("/load", post(mock_load_config))
             .route(
                 "/config/apps/http/servers/slip",
                 get(mock_get_server).post(mock_create_server),

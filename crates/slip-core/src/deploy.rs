@@ -12,6 +12,7 @@ use tokio::sync::RwLock;
 use crate::api::AppState;
 use crate::caddy::ReverseProxy;
 use crate::config::{AppConfig, SlipConfig};
+use crate::db::Db;
 use crate::health::HealthCheck;
 use crate::runtime::{RegistryCredentials, RuntimeBackend};
 use crate::state;
@@ -190,6 +191,8 @@ pub(crate) struct DeploySharedState<'a> {
     pub apps: &'a RwLock<HashMap<String, AppConfig>>,
     pub app_states: &'a RwLock<HashMap<String, AppRuntimeState>>,
     pub deploys: &'a DashMap<String, DeployContext>,
+    /// Persistent deploy-history database. `Db` is `Arc`-backed, so cloning is cheap.
+    pub db: Db,
     pub credentials: Option<RegistryCredentials>,
     pub secrets_store: Option<&'a crate::secrets::SecretsStore>,
 }
@@ -207,6 +210,7 @@ pub async fn execute_deploy(state: Arc<AppState>, ctx: DeployContext) {
         apps: &state.apps,
         app_states: &state.app_states,
         deploys: &state.deploys,
+        db: state.db.clone(),
         credentials: state.registry_credentials(),
         secrets_store: Some(&state.secrets_store),
     };
@@ -234,7 +238,7 @@ pub(crate) async fn execute_deploy_inner(
         Some(cfg) => cfg.clone(),
         None => {
             ctx.fail(&format!("app '{}' not found in config", app_name));
-            record_deploy(shared.deploys, &ctx);
+            record_deploy(&shared, &ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
         }
@@ -250,7 +254,7 @@ pub(crate) async fn execute_deploy_inner(
 
     // ── PULL ─────────────────────────────────────────────────────────────────
     ctx.status = DeployStatus::Pulling;
-    record_deploy(shared.deploys, &ctx);
+    record_deploy(&shared, &ctx);
     tracing::info!(
         app = %app_name,
         tag = %ctx.tag,
@@ -263,7 +267,7 @@ pub(crate) async fn execute_deploy_inner(
         .await
     {
         ctx.fail(&format!("image pull failed: {e}"));
-        record_deploy(shared.deploys, &ctx);
+        record_deploy(&shared, &ctx);
         set_app_failed(shared.app_states, &app_name);
         return;
     }
@@ -285,7 +289,7 @@ pub(crate) async fn execute_deploy_inner(
             ctx.fail(&format!(
                 "sidecar image pull failed for '{container_name}': {e}"
             ));
-            record_deploy(shared.deploys, &ctx);
+            record_deploy(&shared, &ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
         }
@@ -293,7 +297,7 @@ pub(crate) async fn execute_deploy_inner(
 
     // ── EXTRACT + MERGE CONFIG ────────────────────────────────────────────────
     ctx.status = DeployStatus::Configuring;
-    record_deploy(shared.deploys, &ctx);
+    record_deploy(&shared, &ctx);
 
     let merged = match runtime
         .extract_file(&ctx.image, &ctx.tag, "/slip/slip.toml")
@@ -308,7 +312,7 @@ pub(crate) async fn execute_deploy_inner(
                             "repo config app name '{}' does not match deploy app '{}'",
                             repo_config.app.name, app_name
                         ));
-                        record_deploy(shared.deploys, &ctx);
+                        record_deploy(&shared, &ctx);
                         set_app_failed(shared.app_states, &app_name);
                         return;
                     }
@@ -316,7 +320,7 @@ pub(crate) async fn execute_deploy_inner(
                         Ok(merged) => Some(merged),
                         Err(e) => {
                             ctx.fail(&format!("config merge failed: {e}"));
-                            record_deploy(shared.deploys, &ctx);
+                            record_deploy(&shared, &ctx);
                             set_app_failed(shared.app_states, &app_name);
                             return;
                         }
@@ -324,7 +328,7 @@ pub(crate) async fn execute_deploy_inner(
                 }
                 Err(e) => {
                     ctx.fail(&format!("failed to parse repo config: {e}"));
-                    record_deploy(shared.deploys, &ctx);
+                    record_deploy(&shared, &ctx);
                     set_app_failed(shared.app_states, &app_name);
                     return;
                 }
@@ -343,7 +347,7 @@ pub(crate) async fn execute_deploy_inner(
         }
         Err(e) => {
             ctx.fail(&format!("failed to extract config from image: {e}"));
-            record_deploy(shared.deploys, &ctx);
+            record_deploy(&shared, &ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
         }
@@ -357,7 +361,7 @@ pub(crate) async fn execute_deploy_inner(
 
     // ── START NEW ────────────────────────────────────────────────────────────
     ctx.status = DeployStatus::Starting;
-    record_deploy(shared.deploys, &ctx);
+    record_deploy(&shared, &ctx);
 
     let env_vars = resolve_env_vars_for_app(&effective_config, shared.secrets_store, &app_name);
 
@@ -376,7 +380,7 @@ pub(crate) async fn execute_deploy_inner(
             Some(p) => p.clone(),
             None => {
                 ctx.fail("pod deploy requires [app].manifest in repo config (slip.toml)");
-                record_deploy(shared.deploys, &ctx);
+                record_deploy(&shared, &ctx);
                 set_app_failed(shared.app_states, &app_name);
                 return;
             }
@@ -392,13 +396,13 @@ pub(crate) async fn execute_deploy_inner(
                 ctx.fail(&format!(
                     "manifest '{manifest_in_image}' not found in image"
                 ));
-                record_deploy(shared.deploys, &ctx);
+                record_deploy(&shared, &ctx);
                 set_app_failed(shared.app_states, &app_name);
                 return;
             }
             Err(e) => {
                 ctx.fail(&format!("failed to extract manifest from image: {e}"));
-                record_deploy(shared.deploys, &ctx);
+                record_deploy(&shared, &ctx);
                 set_app_failed(shared.app_states, &app_name);
                 return;
             }
@@ -425,7 +429,7 @@ pub(crate) async fn execute_deploy_inner(
             Ok(yaml) => yaml,
             Err(e) => {
                 ctx.fail(&format!("failed to render manifest: {e}"));
-                record_deploy(shared.deploys, &ctx);
+                record_deploy(&shared, &ctx);
                 set_app_failed(shared.app_states, &app_name);
                 return;
             }
@@ -435,14 +439,14 @@ pub(crate) async fn execute_deploy_inner(
         let manifests_dir = shared.config.storage.path.join("manifests");
         if let Err(e) = std::fs::create_dir_all(&manifests_dir) {
             ctx.fail(&format!("failed to create manifests directory: {e}"));
-            record_deploy(shared.deploys, &ctx);
+            record_deploy(&shared, &ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
         }
         let manifest_path = manifests_dir.join(format!("{app_name}-{}.yaml", ctx.id));
         if let Err(e) = std::fs::write(&manifest_path, &rendered_yaml) {
             ctx.fail(&format!("failed to write manifest file: {e}"));
-            record_deploy(shared.deploys, &ctx);
+            record_deploy(&shared, &ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
         }
@@ -450,7 +454,7 @@ pub(crate) async fn execute_deploy_inner(
         // Deploy the pod via `podman kube play`.
         if let Err(e) = runtime.deploy_pod(&manifest_path, &pod_name).await {
             ctx.fail(&format!("pod deploy failed: {e}"));
-            record_deploy(shared.deploys, &ctx);
+            record_deploy(&shared, &ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
         }
@@ -461,7 +465,7 @@ pub(crate) async fn execute_deploy_inner(
 
         // ── PER-CONTAINER HEALTH CHECK (pod) ──────────────────────────────
         ctx.status = DeployStatus::HealthChecking;
-        record_deploy(shared.deploys, &ctx);
+        record_deploy(&shared, &ctx);
 
         if is_worker {
             // App-level worker: skip all health checks, pod was already verified as deployed
@@ -595,7 +599,7 @@ pub(crate) async fn execute_deploy_inner(
                     tracing::warn!(app = %app_name, error = %te, "failed to teardown pod after health check failure (non-fatal)");
                 }
                 ctx.fail("health check failed for one or more HTTP containers");
-                record_deploy(shared.deploys, &ctx);
+                record_deploy(&shared, &ctx);
                 set_app_failed(shared.app_states, &app_name);
                 return;
             }
@@ -605,7 +609,7 @@ pub(crate) async fn execute_deploy_inner(
 
             // ── SWITCH (pod) ──────────────────────────────────────────────
             ctx.status = DeployStatus::Switching;
-            record_deploy(shared.deploys, &ctx);
+            record_deploy(&shared, &ctx);
 
             let old_pod_manifest = {
                 let states = shared.app_states.read().await;
@@ -634,7 +638,7 @@ pub(crate) async fn execute_deploy_inner(
                     tracing::warn!(app = %app_name, error = %te, "failed to teardown pod after caddy failure (non-fatal)");
                 }
                 ctx.fail(&format!("caddy route update failed: {e}"));
-                record_deploy(shared.deploys, &ctx);
+                record_deploy(&shared, &ctx);
                 set_app_failed(shared.app_states, &app_name);
                 return;
             }
@@ -715,7 +719,7 @@ pub(crate) async fn execute_deploy_inner(
             }
             Err(e) => {
                 ctx.fail(&format!("container start failed: {e}"));
-                record_deploy(shared.deploys, &ctx);
+                record_deploy(&shared, &ctx);
                 set_app_failed(shared.app_states, &app_name);
                 return;
             }
@@ -723,7 +727,7 @@ pub(crate) async fn execute_deploy_inner(
 
         // ── HEALTH CHECK ─────────────────────────────────────────────────
         ctx.status = DeployStatus::HealthChecking;
-        record_deploy(shared.deploys, &ctx);
+        record_deploy(&shared, &ctx);
 
         let new_port: u16;
         if is_worker {
@@ -735,14 +739,14 @@ pub(crate) async fn execute_deploy_inner(
                     Ok(false) => {
                         tracing::error!(app = %app_name, container_id = %id, "worker container not running after start");
                         ctx.fail("worker container exited during start");
-                        record_deploy(shared.deploys, &ctx);
+                        record_deploy(&shared, &ctx);
                         set_app_failed(shared.app_states, &app_name);
                         return;
                     }
                     Err(e) => {
                         tracing::error!(app = %app_name, error = %e, "failed to verify worker container state");
                         ctx.fail(&format!("worker container state check failed: {e}"));
-                        record_deploy(shared.deploys, &ctx);
+                        record_deploy(&shared, &ctx);
                         set_app_failed(shared.app_states, &app_name);
                         return;
                     }
@@ -753,7 +757,7 @@ pub(crate) async fn execute_deploy_inner(
                 Some(port) => port,
                 None => {
                     ctx.fail("internal error: port not set after container start");
-                    record_deploy(shared.deploys, &ctx);
+                    record_deploy(&shared, &ctx);
                     set_app_failed(shared.app_states, &app_name);
                     return;
                 }
@@ -765,7 +769,7 @@ pub(crate) async fn execute_deploy_inner(
                     let _ = runtime.stop_and_remove(id).await;
                 }
                 ctx.fail(&format!("health check failed: {e}"));
-                record_deploy(shared.deploys, &ctx);
+                record_deploy(&shared, &ctx);
                 set_app_failed(shared.app_states, &app_name);
                 return;
             }
@@ -778,14 +782,14 @@ pub(crate) async fn execute_deploy_inner(
                     Ok(false) => {
                         tracing::error!(app = %app_name, container_id = %id, "container not running after health check");
                         ctx.fail("container exited during health check");
-                        record_deploy(shared.deploys, &ctx);
+                        record_deploy(&shared, &ctx);
                         set_app_failed(shared.app_states, &app_name);
                         return;
                     }
                     Err(e) => {
                         tracing::error!(app = %app_name, error = %e, "failed to verify container state");
                         ctx.fail(&format!("container state check failed: {e}"));
-                        record_deploy(shared.deploys, &ctx);
+                        record_deploy(&shared, &ctx);
                         set_app_failed(shared.app_states, &app_name);
                         return;
                     }
@@ -795,7 +799,7 @@ pub(crate) async fn execute_deploy_inner(
 
         // ── SWITCH ───────────────────────────────────────────────────────
         ctx.status = DeployStatus::Switching;
-        record_deploy(shared.deploys, &ctx);
+        record_deploy(&shared, &ctx);
 
         let old_container_id = {
             let states = shared.app_states.read().await;
@@ -837,7 +841,7 @@ pub(crate) async fn execute_deploy_inner(
                 let _ = runtime.stop_and_remove(id).await;
             }
             ctx.fail(&format!("caddy route update failed: {e}"));
-            record_deploy(shared.deploys, &ctx);
+            record_deploy(&shared, &ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
         }
@@ -893,7 +897,7 @@ pub(crate) async fn execute_deploy_inner(
     // ── COMPLETED ────────────────────────────────────────────────────────────
     ctx.status = DeployStatus::Completed;
     ctx.finished_at = Some(Utc::now());
-    record_deploy(shared.deploys, &ctx);
+    record_deploy(&shared, &ctx);
     tracing::info!(
         app = %app_name,
         tag = %ctx.tag,
@@ -930,12 +934,30 @@ fn parse_image_ref(full_ref: &str) -> (&str, &str) {
     (full_ref, "latest")
 }
 
-/// Record (insert/update) a deploy context in the in-memory cache.
+/// Record (insert/update) a deploy context: persist to SQLite and update the
+/// in-memory cache.
 ///
 /// The cache is keyed by app name and stores only the latest deploy per app.
-/// Persistence to SQLite is handled by `AppState::record_deploy`.
-pub fn record_deploy(deploys: &DashMap<String, DeployContext>, ctx: &DeployContext) {
-    deploys.insert(ctx.app.clone(), ctx.clone());
+/// SQLite is the source of truth for `GET /v1/deploys/{id}` (per-deploy history),
+/// so every state transition during a deploy must be persisted here — not just
+/// the initial "accepted" write done by the API handler.
+///
+/// The SQLite write is synchronous (the `Db` mutex is held briefly for a fast
+/// local WAL write). Failures are logged but non-fatal — deploy history is
+/// best-effort and must never block or fail a deploy.
+pub(crate) fn record_deploy(shared: &DeploySharedState, ctx: &DeployContext) {
+    // Update the in-memory cache (latest deploy per app).
+    shared.deploys.insert(ctx.app.clone(), ctx.clone());
+
+    // Persist to SQLite (best-effort).
+    if let Err(e) = shared.db.insert_deploy(ctx) {
+        tracing::error!(
+            deploy_id = %ctx.id,
+            app = %ctx.app,
+            error = %e,
+            "failed to persist deploy to SQLite"
+        );
+    }
 }
 
 /// Set the app status to Failed in the shared state.
@@ -1567,6 +1589,7 @@ mod tests {
             apps,
             app_states,
             deploys,
+            db: Db::open_in_memory().expect("in-memory db for tests"),
             credentials: None,
             secrets_store: None,
         }

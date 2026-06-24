@@ -679,8 +679,41 @@ mod tests {
             StatusCode::OK
         }
 
+        async fn mock_get_config(
+            State(s): State<MockState>,
+        ) -> (StatusCode, axum::Json<serde_json::Value>) {
+            let map = s.lock().await;
+            if let Some(server) = map.get("__server__") {
+                (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "apps": {"http": {"servers": {"slip": server}}}
+                    })),
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({"admin": {"listen": "localhost:2019"}})),
+                )
+            }
+        }
+
+        async fn mock_load_config(
+            State(s): State<MockState>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> StatusCode {
+            if let Some(server) = body.pointer("/apps/http/servers/slip") {
+                s.lock()
+                    .await
+                    .insert("__server__".to_string(), server.clone());
+            }
+            StatusCode::OK
+        }
+
         let state: MockState = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let app = Router::new()
+            .route("/config/", get(mock_get_config))
+            .route("/load", post(mock_load_config))
             .route(
                 "/config/apps/http/servers/slip",
                 get(mock_get_server).post(mock_create_server),
@@ -689,7 +722,6 @@ mod tests {
                 "/config/apps/http/servers/slip/routes",
                 post(mock_add_route),
             )
-            .route("/config/", get(|| async { StatusCode::OK }))
             .with_state(state.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
