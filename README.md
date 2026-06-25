@@ -57,6 +57,12 @@ listen = "127.0.0.1:7890"
 [runtime]
 backend = "auto"          # auto-detects Podman or Docker
 
+[auth]
+secret = "${SLIP_SECRET}"  # global HMAC secret (per-app secrets override it)
+
+[registry]
+# ghcr_token = "${GHCR_TOKEN}"   # optional: token for pulling private images
+
 [caddy]
 admin_api = "http://localhost:2019"
 
@@ -65,11 +71,15 @@ path = "/var/lib/slip"
 EOF
 ```
 
+> The `[auth]` and `[registry]` sections are **required** (even if `registry` is
+> empty). `[auth].secret` is the fallback webhook secret; per-app secrets
+> (`slip secrets set <app> SLIP_SECRET=...`) override it.
+
 ### 2. Create an app config
 
 ```bash
 sudo tee /etc/slip/apps/myapp.toml > /dev/null << 'EOF'
-[[apps]]
+[app]
 name = "myapp"
 image = "ghcr.io/you/myapp"
 
@@ -94,10 +104,15 @@ cpus = "1.0"
 EOF
 ```
 
+> Each app is a separate file in `/etc/slip/apps/` with a single `[app]` table
+> (not `[[apps]]`). The `[health]` section is required; omit `path` to skip the
+> HTTP probe and health-check on "container running" instead.
+
 ### 3. Set the webhook secret
 
 ```bash
-sudo slip secret set myapp/SLIP_SECRET --value "your-hmac-secret"
+# slip secrets set <app> KEY=VALUE  (the management API needs the global token)
+sudo slip secrets set myapp SLIP_SECRET=your-hmac-secret --token "$SLIP_SECRET"
 ```
 
 ### 4. Start the daemon
@@ -146,7 +161,7 @@ slip deploy myapp sha-abc123f \
 ### Single-container (blue-green)
 
 ```toml
-[[apps]]
+[app]
 name = "api"
 image = "ghcr.io/you/api"
 
@@ -154,20 +169,29 @@ image = "ghcr.io/you/api"
 domain = "api.example.com"
 port = 8080
 
+[health]
+path = "/health"
+
 [deploy]
 strategy = "blue-green"
 ```
 
-### Worker (non-HTTP, e.g. a pipeline)
+### Worker (non-HTTP, e.g. a single-writer service)
 
-The repo's `slip.toml` declares `kind = "worker"`. No domain, no port, health = container running.
+The repo's `slip.toml` declares `kind = "worker"`. No domain, no port, health = container running. Pair with `strategy = "recreate"` for single-writer state.
 
 ```toml
-[[apps]]
+[app]
 name = "pipeline"
 image = "ghcr.io/you/pipeline"
 
-[[apps.volumes]]
+[health]
+# no path → health-check on "container running"
+
+[deploy]
+strategy = "recreate"
+
+[[volumes]]
 host_path = "/var/lib/slip/volumes/pipeline/state"
 mount_path = "/app/data"
 read_only = false
@@ -175,25 +199,28 @@ read_only = false
 
 ### Pod (multi-container)
 
-The repo declares `kind = "pod"` with a `pod.yaml` manifest. slip renders it and runs via `podman kube play`.
+The repo declares `kind = "pod"` with a `pod.yaml` manifest. slip renders it and runs via `podman kube play`. Multiple routes target containers by name.
 
 ```toml
-[[apps]]
+[app]
 name = "statstream"
 image = "ghcr.io/you/statstream-api"
+
+[health]
+path = "/health"
 
 [deploy]
 strategy = "recreate"
 
-[[apps.routes]]
+[[routing.routes]]
 hostname = "statstream.example.com"
 container = "api"
 
-[[apps.routes]]
+[[routing.routes]]
 hostname = "dagster.example.com"
 container = "dagster-webserver"
 
-[[apps.volumes]]
+[[volumes]]
 host_path = "/var/lib/slip/volumes/statstream/dagster-home"
 mount_path = "/opt/dagster/dagster_home"
 ```
