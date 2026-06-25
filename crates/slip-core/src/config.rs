@@ -506,6 +506,33 @@ pub fn resolve_env_vars(input: &str) -> Result<String, ConfigError> {
     Ok(result)
 }
 
+// ─── Strategy validation ───────────────────────────────────────────────────────
+
+/// Validate that `DeployConfig.strategy` is a known value.
+///
+/// Accepts `"blue-green"` and `"recreate"`. Warns (does not error) if
+/// `strategy == "recreate"` and `drain_timeout > Duration::ZERO`.
+pub fn validate_deploy_strategy(deploy: &DeployConfig) -> Result<(), ConfigError> {
+    let valid: Vec<&'static str> = vec!["blue-green", "recreate"];
+    match deploy.strategy.as_str() {
+        "blue-green" | "recreate" => {}
+        other => {
+            return Err(ConfigError::InvalidStrategy {
+                strategy: other.to_string(),
+                valid,
+            });
+        }
+    }
+    if deploy.strategy == "recreate" && deploy.drain_timeout > Duration::ZERO {
+        tracing::warn!(
+            strategy = "recreate",
+            drain_timeout = ?deploy.drain_timeout,
+            "drain_timeout has no effect with 'recreate' strategy; the old container is stopped immediately"
+        );
+    }
+    Ok(())
+}
+
 // ─── Config loading ───────────────────────────────────────────────────────────
 
 /// Loads the daemon config from `{path}/slip.toml` and all app configs from
@@ -590,6 +617,9 @@ pub fn load_config(path: &Path) -> Result<(SlipConfig, HashMap<String, AppConfig
             if let Some(secret) = app_cfg.app.secret.take() {
                 app_cfg.app.secret = Some(resolve_env_vars(&secret)?);
             }
+
+            // Validate deploy strategy
+            validate_deploy_strategy(&app_cfg.deploy)?;
 
             apps.insert(app_cfg.app.name.clone(), app_cfg);
         }

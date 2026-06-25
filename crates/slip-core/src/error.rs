@@ -51,6 +51,13 @@ pub enum ConfigError {
     /// A merge error occurred (e.g., route count mismatch).
     #[error("merge error: {0}")]
     Merge(String),
+
+    /// Invalid deploy strategy value.
+    #[error("invalid deploy strategy '{strategy}': valid values are {valid:?}")]
+    InvalidStrategy {
+        strategy: String,
+        valid: Vec<&'static str>,
+    },
 }
 
 /// Errors that can occur during container health checking.
