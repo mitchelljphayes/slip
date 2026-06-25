@@ -359,514 +359,476 @@ pub(crate) async fn execute_deploy_inner(
         None => app_config.clone(),
     };
 
-    // ── START NEW ────────────────────────────────────────────────────────────
-    ctx.status = DeployStatus::Starting;
-    record_deploy(&shared, &ctx);
-
+    // ── STRATEGY DISPATCH ────────────────────────────────────────────────────
     let env_vars = resolve_env_vars_for_app(&effective_config, shared.secrets_store, &app_name);
 
     // Determine if this is a pod or container deploy.
     let is_pod = merged.as_ref().map(|m| m.kind == "pod").unwrap_or(false);
     let is_worker = merged.as_ref().map(|m| m.kind == "worker").unwrap_or(false);
 
-    if is_pod {
-        // ── POD DEPLOY FLOW ───────────────────────────────────────────────
-
-        // Get the merged config — required for pod deploys.
-        let merged_cfg = merged.as_ref().expect("merged is Some when is_pod is true");
-
-        // Get the manifest path from repo config.
-        let manifest_in_image = match &merged_cfg.manifest {
-            Some(p) => p.clone(),
-            None => {
-                ctx.fail("pod deploy requires [app].manifest in repo config (slip.toml)");
-                record_deploy(&shared, &ctx);
-                set_app_failed(shared.app_states, &app_name);
-                return;
+    match effective_config.deploy.strategy.as_str() {
+        "blue-green" => {
+            if is_pod {
+                execute_blue_green_deploy_pod(
+                    &shared,
+                    runtime,
+                    caddy,
+                    health,
+                    &mut ctx,
+                    &effective_config,
+                    &merged,
+                    &env_vars,
+                    &app_name,
+                    is_worker,
+                )
+                .await;
+            } else {
+                execute_blue_green_deploy_container(
+                    &shared,
+                    runtime,
+                    caddy,
+                    health,
+                    &mut ctx,
+                    &effective_config,
+                    &merged,
+                    &env_vars,
+                    &app_name,
+                    is_worker,
+                )
+                .await;
             }
-        };
-
-        // Extract pod.yaml (or custom path) from the image.
-        let manifest_bytes = match runtime
-            .extract_file(&ctx.image, &ctx.tag, &manifest_in_image)
-            .await
-        {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => {
-                ctx.fail(&format!(
-                    "manifest '{manifest_in_image}' not found in image"
-                ));
-                record_deploy(&shared, &ctx);
-                set_app_failed(shared.app_states, &app_name);
-                return;
+        }
+        "recreate" => {
+            if is_pod {
+                // TODO: implement recreate for pod path
+                tracing::warn!(
+                    app = %app_name,
+                    "recreate strategy not yet implemented for pods, falling back to blue-green"
+                );
+                execute_blue_green_deploy_pod(
+                    &shared,
+                    runtime,
+                    caddy,
+                    health,
+                    &mut ctx,
+                    &effective_config,
+                    &merged,
+                    &env_vars,
+                    &app_name,
+                    is_worker,
+                )
+                .await;
+            } else {
+                execute_recreate_deploy_container(
+                    &shared,
+                    runtime,
+                    caddy,
+                    health,
+                    &mut ctx,
+                    &effective_config,
+                    &merged,
+                    &env_vars,
+                    &app_name,
+                    is_worker,
+                )
+                .await;
             }
-            Err(e) => {
-                ctx.fail(&format!("failed to extract manifest from image: {e}"));
-                record_deploy(&shared, &ctx);
-                set_app_failed(shared.app_states, &app_name);
-                return;
-            }
-        };
-
-        // Generate a unique pod suffix from a ULID fragment.
-        let pod_suffix = ulid::Ulid::new().to_string()[..8].to_lowercase();
-        let pod_name = format!("{app_name}-{pod_suffix}");
-
-        // Render the manifest with deploy-time transformations.
-        let has_workers = merged_cfg.routes.iter().any(|r| r.kind == "worker");
-        let render_ctx = crate::manifest::RenderContext {
-            app_name: app_name.clone(),
-            tag: ctx.tag.clone(),
-            primary_image: effective_config.app.image.clone(),
-            pod_suffix: pod_suffix.clone(),
-            env_vars: env_vars.clone(),
-            image_overrides: ctx.images.clone(),
-            volumes: merged_cfg.volumes.clone(),
-            has_workers,
-        };
-
-        let rendered_yaml = match crate::manifest::render_manifest(&manifest_bytes, &render_ctx) {
-            Ok(yaml) => yaml,
-            Err(e) => {
-                ctx.fail(&format!("failed to render manifest: {e}"));
-                record_deploy(&shared, &ctx);
-                set_app_failed(shared.app_states, &app_name);
-                return;
-            }
-        };
-
-        // Write rendered manifest to storage dir.
-        let manifests_dir = shared.config.storage.path.join("manifests");
-        if let Err(e) = std::fs::create_dir_all(&manifests_dir) {
-            ctx.fail(&format!("failed to create manifests directory: {e}"));
+        }
+        other => {
+            ctx.fail(&format!("unknown deploy strategy: {other}"));
             record_deploy(&shared, &ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
         }
-        let manifest_path = manifests_dir.join(format!("{app_name}-{}.yaml", ctx.id));
-        if let Err(e) = std::fs::write(&manifest_path, &rendered_yaml) {
-            ctx.fail(&format!("failed to write manifest file: {e}"));
-            record_deploy(&shared, &ctx);
-            set_app_failed(shared.app_states, &app_name);
-            return;
-        }
+    }
 
-        // Deploy the pod via `podman kube play`.
-        if let Err(e) = runtime.deploy_pod(&manifest_path, &pod_name).await {
-            ctx.fail(&format!("pod deploy failed: {e}"));
-            record_deploy(&shared, &ctx);
-            set_app_failed(shared.app_states, &app_name);
-            return;
-        }
-
-        // Record pod name and manifest path in context for later steps.
-        ctx.new_pod_name = Some(pod_name.clone());
-        ctx.new_manifest_path = Some(manifest_path.clone());
-
-        // ── PER-CONTAINER HEALTH CHECK (pod) ──────────────────────────────
-        ctx.status = DeployStatus::HealthChecking;
+    // ── COMPLETED ────────────────────────────────────────────────────────────
+    if ctx.status != DeployStatus::Failed {
+        ctx.status = DeployStatus::Completed;
+        ctx.finished_at = Some(Utc::now());
         record_deploy(&shared, &ctx);
+        tracing::info!(
+            app = %app_name,
+            tag = %ctx.tag,
+            deploy_id = %ctx.id,
+            "deploy completed"
+        );
+    }
+}
 
-        if is_worker {
-            // App-level worker: skip all health checks, pod was already verified as deployed
-            tracing::info!(app = %app_name, "worker pod deployed, skipping HTTP health check");
+// ─── Blue-green deploy: container path ─────────────────────────────────────────
 
-            // Update app runtime state for worker pod.
-            let state_snapshot = {
-                let mut states = shared.app_states.write().await;
-                let app_state = states.entry(app_name.clone()).or_default();
-                app_state.previous_tag = app_state.current_tag.take();
-                app_state.current_tag = Some(ctx.tag.clone());
-                app_state.current_pod_name = Some(pod_name.clone());
-                app_state.current_manifest_path = Some(manifest_path.clone());
-                app_state.current_port = None;
-                app_state.current_routes = vec![];
-                app_state.deployed_at = Some(Utc::now());
-                app_state.deploy_id = Some(ctx.id.clone());
-                app_state.status = AppStatus::Running;
-                app_state.kind = merged.as_ref().map(|m| m.kind.clone());
-                app_state.clone()
-            };
+/// Execute a blue-green deploy for a single container.
+///
+/// Extracted from the original `execute_deploy_inner` — exact same logic,
+/// no behavior changes.
+#[allow(clippy::too_many_arguments)]
+async fn execute_blue_green_deploy_container(
+    shared: &DeploySharedState<'_>,
+    runtime: &dyn RuntimeBackend,
+    caddy: &dyn ReverseProxy,
+    health: &dyn HealthCheck,
+    ctx: &mut DeployContext,
+    effective_config: &AppConfig,
+    merged: &Option<crate::merge::MergedConfig>,
+    env_vars: &[String],
+    app_name: &str,
+    is_worker: bool,
+) {
+    // ── START NEW ────────────────────────────────────────────────────────────
+    ctx.status = DeployStatus::Starting;
+    record_deploy(shared, ctx);
 
-            // Persist state to disk (non-fatal).
-            let state_dir = shared.config.storage.path.join("state");
-            if let Err(e) = state::save_app_state(&state_dir, &app_name, &state_snapshot) {
-                tracing::warn!(app = %app_name, error = %e, "failed to persist app state (non-fatal)");
+    // ── CONTAINER DEPLOY FLOW ─────────────────────────────────────────
+
+    let container_volumes: Vec<crate::merge::MergedVolume> = merged
+        .as_ref()
+        .map(|m| m.volumes.clone())
+        .unwrap_or_default();
+
+    match runtime
+        .create_and_start(
+            app_name,
+            &ctx.image,
+            &ctx.tag,
+            if is_worker {
+                0
+            } else {
+                effective_config.routing.port.unwrap_or(0)
+            },
+            env_vars.to_vec(),
+            &effective_config.network.name,
+            &effective_config.resources,
+            &container_volumes,
+        )
+        .await
+    {
+        Ok((container_id, port)) => {
+            ctx.new_container_id = Some(container_id);
+            if !is_worker {
+                ctx.new_port = Some(port);
             }
+            // Workers: current_port stays None
+        }
+        Err(e) => {
+            ctx.fail(&format!("container start failed: {e}"));
+            record_deploy(shared, ctx);
+            set_app_failed(shared.app_states, app_name);
+            return;
+        }
+    }
 
-            // ── DRAIN + TEARDOWN OLD POD ──────────────────────────────────
-            let old_pod_manifest = {
-                let states = shared.app_states.read().await;
-                states
-                    .get(&app_name)
-                    .and_then(|s| s.current_manifest_path.clone())
-            };
-            if let Some(old_manifest) = old_pod_manifest {
-                tracing::info!(app = %app_name, "draining old pod");
-                tokio::time::sleep(effective_config.deploy.drain_timeout).await;
-                if let Err(e) = runtime.teardown_pod(&old_manifest).await {
-                    tracing::warn!(
-                        app = %app_name,
-                        error = %e,
-                        "failed to teardown old pod (non-fatal)"
-                    );
+    // ── HEALTH CHECK ─────────────────────────────────────────────────
+    ctx.status = DeployStatus::HealthChecking;
+    record_deploy(shared, ctx);
+
+    let new_port: u16;
+    if is_worker {
+        // Workers: use container_is_running() instead of HTTP health check
+        new_port = 0;
+        if let Some(ref id) = ctx.new_container_id {
+            match runtime.container_is_running(id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::error!(app = %app_name, container_id = %id, "worker container not running after start");
+                    ctx.fail("worker container exited during start");
+                    record_deploy(shared, ctx);
+                    set_app_failed(shared.app_states, app_name);
+                    return;
                 }
-            }
-        } else {
-            // Iterate over routes and check per-container health.
-            let mut http_route_ports: Vec<(String, u16)> = Vec::new();
-            let mut any_http_failure = false;
-
-            for route in &merged_cfg.routes {
-                let container = route.container.as_deref().unwrap_or("web");
-                let container_port = route.port;
-
-                if route.kind == "worker" {
-                    // Worker containers: check container_is_running, warn on failure
-                    let container_name = format!("{pod_name}-{container}");
-                    tracing::info!(
-                        app = %app_name,
-                        container = %container,
-                        container_name = %container_name,
-                        "checking worker container"
-                    );
-                    match runtime.container_is_running(&container_name).await {
-                        Ok(true) => {
-                            tracing::info!(
-                                app = %app_name,
-                                container = %container,
-                                "worker container is running"
-                            );
-                        }
-                        Ok(false) => {
-                            tracing::warn!(
-                                app = %app_name,
-                                container = %container,
-                                "worker container is not running (will be restarted by restartPolicy)"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                app = %app_name,
-                                container = %container,
-                                error = %e,
-                                "failed to check worker container state (non-fatal)"
-                            );
-                        }
-                    }
-                } else {
-                    // HTTP containers: discover port and health check
-                    match runtime
-                        .pod_container_port(&pod_name, container, container_port)
-                        .await
-                    {
-                        Ok(host_port) => {
-                            tracing::info!(
-                                app = %app_name,
-                                container = %container,
-                                host_port = host_port,
-                                "checking HTTP container health"
-                            );
-                            if let Err(e) = health.check(host_port, &effective_config.health).await
-                            {
-                                tracing::error!(
-                                    app = %app_name,
-                                    container = %container,
-                                    error = %e,
-                                    "HTTP health check failed"
-                                );
-                                any_http_failure = true;
-                            } else {
-                                http_route_ports.push((route.hostname.clone(), host_port));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                app = %app_name,
-                                container = %container,
-                                error = %e,
-                                "failed to get container port"
-                            );
-                            any_http_failure = true;
-                        }
-                    }
-                }
-            }
-
-            // If any HTTP container failed, tear down and fail the deploy.
-            if any_http_failure {
-                if let Err(te) = runtime.teardown_pod(&manifest_path).await {
-                    tracing::warn!(app = %app_name, error = %te, "failed to teardown pod after health check failure (non-fatal)");
-                }
-                ctx.fail("health check failed for one or more HTTP containers");
-                record_deploy(&shared, &ctx);
-                set_app_failed(shared.app_states, &app_name);
-                return;
-            }
-
-            // Record the first HTTP route port for backward compat.
-            ctx.new_port = http_route_ports.first().map(|(_, p)| *p);
-
-            // ── SWITCH (pod) ──────────────────────────────────────────────
-            ctx.status = DeployStatus::Switching;
-            record_deploy(&shared, &ctx);
-
-            let old_pod_manifest = {
-                let states = shared.app_states.read().await;
-                states
-                    .get(&app_name)
-                    .and_then(|s| s.current_manifest_path.clone())
-            };
-
-            // Set Caddy routes only for HTTP routes.
-            if !http_route_ports.is_empty()
-                && let Err(e) = caddy
-                    .set_routes(
-                        &app_name,
-                        &http_route_ports
-                            .iter()
-                            .map(|(hostname, port)| crate::caddy::Route {
-                                hostname: hostname.clone(),
-                                port: *port,
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .await
-            {
-                tracing::error!(app = %app_name, error = %e, "caddy route update failed");
-                if let Err(te) = runtime.teardown_pod(&manifest_path).await {
-                    tracing::warn!(app = %app_name, error = %te, "failed to teardown pod after caddy failure (non-fatal)");
-                }
-                ctx.fail(&format!("caddy route update failed: {e}"));
-                record_deploy(&shared, &ctx);
-                set_app_failed(shared.app_states, &app_name);
-                return;
-            }
-
-            // Update app runtime state for pod with per-route ports.
-            let state_snapshot = {
-                let mut states = shared.app_states.write().await;
-                let app_state = states.entry(app_name.clone()).or_default();
-                app_state.previous_tag = app_state.current_tag.take();
-                app_state.current_tag = Some(ctx.tag.clone());
-                app_state.current_pod_name = Some(pod_name.clone());
-                app_state.current_manifest_path = Some(manifest_path.clone());
-                app_state.current_port = http_route_ports.first().map(|(_, p)| *p);
-                app_state.current_routes = http_route_ports
-                    .iter()
-                    .map(|(hostname, port)| RouteState {
-                        hostname: hostname.clone(),
-                        port: *port,
-                    })
-                    .collect();
-                app_state.deployed_at = Some(Utc::now());
-                app_state.deploy_id = Some(ctx.id.clone());
-                app_state.status = AppStatus::Running;
-                app_state.kind = merged.as_ref().map(|m| m.kind.clone());
-                app_state.clone()
-            };
-
-            // Persist state to disk (non-fatal).
-            let state_dir = shared.config.storage.path.join("state");
-            if let Err(e) = state::save_app_state(&state_dir, &app_name, &state_snapshot) {
-                tracing::warn!(app = %app_name, error = %e, "failed to persist app state (non-fatal)");
-            }
-
-            // ── DRAIN + TEARDOWN OLD POD ──────────────────────────────────
-            if let Some(old_manifest) = old_pod_manifest {
-                tracing::info!(app = %app_name, "draining old pod");
-                tokio::time::sleep(effective_config.deploy.drain_timeout).await;
-                if let Err(e) = runtime.teardown_pod(&old_manifest).await {
-                    tracing::warn!(
-                        app = %app_name,
-                        error = %e,
-                        "failed to teardown old pod (non-fatal)"
-                    );
+                Err(e) => {
+                    tracing::error!(app = %app_name, error = %e, "failed to verify worker container state");
+                    ctx.fail(&format!("worker container state check failed: {e}"));
+                    record_deploy(shared, ctx);
+                    set_app_failed(shared.app_states, app_name);
+                    return;
                 }
             }
         }
     } else {
-        // ── CONTAINER DEPLOY FLOW ─────────────────────────────────────────
-
-        let container_volumes: Vec<crate::merge::MergedVolume> = merged
-            .as_ref()
-            .map(|m| m.volumes.clone())
-            .unwrap_or_default();
-
-        match runtime
-            .create_and_start(
-                &app_name,
-                &ctx.image,
-                &ctx.tag,
-                if is_worker {
-                    0
-                } else {
-                    effective_config.routing.port.unwrap_or(0)
-                },
-                env_vars,
-                &effective_config.network.name,
-                &effective_config.resources,
-                &container_volumes,
-            )
-            .await
-        {
-            Ok((container_id, port)) => {
-                ctx.new_container_id = Some(container_id);
-                if !is_worker {
-                    ctx.new_port = Some(port);
-                }
-                // Workers: current_port stays None
-            }
-            Err(e) => {
-                ctx.fail(&format!("container start failed: {e}"));
-                record_deploy(&shared, &ctx);
-                set_app_failed(shared.app_states, &app_name);
+        new_port = match ctx.new_port {
+            Some(port) => port,
+            None => {
+                ctx.fail("internal error: port not set after container start");
+                record_deploy(shared, ctx);
+                set_app_failed(shared.app_states, app_name);
                 return;
             }
-        }
-
-        // ── HEALTH CHECK ─────────────────────────────────────────────────
-        ctx.status = DeployStatus::HealthChecking;
-        record_deploy(&shared, &ctx);
-
-        let new_port: u16;
-        if is_worker {
-            // Workers: use container_is_running() instead of HTTP health check
-            new_port = 0;
-            if let Some(ref id) = ctx.new_container_id {
-                match runtime.container_is_running(id).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        tracing::error!(app = %app_name, container_id = %id, "worker container not running after start");
-                        ctx.fail("worker container exited during start");
-                        record_deploy(&shared, &ctx);
-                        set_app_failed(shared.app_states, &app_name);
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::error!(app = %app_name, error = %e, "failed to verify worker container state");
-                        ctx.fail(&format!("worker container state check failed: {e}"));
-                        record_deploy(&shared, &ctx);
-                        set_app_failed(shared.app_states, &app_name);
-                        return;
-                    }
-                }
-            }
-        } else {
-            new_port = match ctx.new_port {
-                Some(port) => port,
-                None => {
-                    ctx.fail("internal error: port not set after container start");
-                    record_deploy(&shared, &ctx);
-                    set_app_failed(shared.app_states, &app_name);
-                    return;
-                }
-            };
-
-            if let Err(e) = health.check(new_port, &effective_config.health).await {
-                tracing::error!(app = %app_name, error = %e, "health check failed");
-                if let Some(ref id) = ctx.new_container_id {
-                    let _ = runtime.stop_and_remove(id).await;
-                }
-                ctx.fail(&format!("health check failed: {e}"));
-                record_deploy(&shared, &ctx);
-                set_app_failed(shared.app_states, &app_name);
-                return;
-            }
-
-            // Verify container is still running after health check wait
-            // (container could have crashed during start_period wait)
-            if let Some(ref id) = ctx.new_container_id {
-                match runtime.container_is_running(id).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        tracing::error!(app = %app_name, container_id = %id, "container not running after health check");
-                        ctx.fail("container exited during health check");
-                        record_deploy(&shared, &ctx);
-                        set_app_failed(shared.app_states, &app_name);
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::error!(app = %app_name, error = %e, "failed to verify container state");
-                        ctx.fail(&format!("container state check failed: {e}"));
-                        record_deploy(&shared, &ctx);
-                        set_app_failed(shared.app_states, &app_name);
-                        return;
-                    }
-                }
-            }
-        }
-
-        // ── SWITCH ───────────────────────────────────────────────────────
-        ctx.status = DeployStatus::Switching;
-        record_deploy(&shared, &ctx);
-
-        let old_container_id = {
-            let states = shared.app_states.read().await;
-            states
-                .get(&app_name)
-                .and_then(|s| s.current_container_id.clone())
         };
 
-        if !is_worker
-            && let Err(e) = caddy
-                .set_routes(
-                    &app_name,
-                    &merged
-                        .as_ref()
-                        .map(|m| {
-                            m.routes
-                                .iter()
-                                .map(|r| crate::caddy::Route {
-                                    hostname: r.hostname.clone(),
-                                    port: new_port,
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_else(|| {
-                            vec![crate::caddy::Route {
-                                hostname: effective_config
-                                    .routing
-                                    .domain
-                                    .clone()
-                                    .unwrap_or_default(),
-                                port: new_port,
-                            }]
-                        }),
-                )
-                .await
-        {
-            tracing::error!(app = %app_name, error = %e, "caddy route update failed");
+        if let Err(e) = health.check(new_port, &effective_config.health).await {
+            tracing::error!(app = %app_name, error = %e, "health check failed");
             if let Some(ref id) = ctx.new_container_id {
                 let _ = runtime.stop_and_remove(id).await;
             }
-            ctx.fail(&format!("caddy route update failed: {e}"));
-            record_deploy(&shared, &ctx);
-            set_app_failed(shared.app_states, &app_name);
+            ctx.fail(&format!("health check failed: {e}"));
+            record_deploy(shared, ctx);
+            set_app_failed(shared.app_states, app_name);
             return;
         }
 
-        // Update app runtime state
+        // Verify container is still running after health check wait
+        // (container could have crashed during start_period wait)
+        if let Some(ref id) = ctx.new_container_id {
+            match runtime.container_is_running(id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::error!(app = %app_name, container_id = %id, "container not running after health check");
+                    ctx.fail("container exited during health check");
+                    record_deploy(shared, ctx);
+                    set_app_failed(shared.app_states, app_name);
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(app = %app_name, error = %e, "failed to verify container state");
+                    ctx.fail(&format!("container state check failed: {e}"));
+                    record_deploy(shared, ctx);
+                    set_app_failed(shared.app_states, app_name);
+                    return;
+                }
+            }
+        }
+    }
+
+    // ── SWITCH ───────────────────────────────────────────────────────
+    ctx.status = DeployStatus::Switching;
+    record_deploy(shared, ctx);
+
+    let old_container_id = {
+        let states = shared.app_states.read().await;
+        states
+            .get(app_name)
+            .and_then(|s| s.current_container_id.clone())
+    };
+
+    if !is_worker
+        && let Err(e) = caddy
+            .set_routes(
+                app_name,
+                &merged
+                    .as_ref()
+                    .map(|m| {
+                        m.routes
+                            .iter()
+                            .map(|r| crate::caddy::Route {
+                                hostname: r.hostname.clone(),
+                                port: new_port,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| {
+                        vec![crate::caddy::Route {
+                            hostname: effective_config.routing.domain.clone().unwrap_or_default(),
+                            port: new_port,
+                        }]
+                    }),
+            )
+            .await
+    {
+        tracing::error!(app = %app_name, error = %e, "caddy route update failed");
+        if let Some(ref id) = ctx.new_container_id {
+            let _ = runtime.stop_and_remove(id).await;
+        }
+        ctx.fail(&format!("caddy route update failed: {e}"));
+        record_deploy(shared, ctx);
+        set_app_failed(shared.app_states, app_name);
+        return;
+    }
+
+    // Update app runtime state
+    let state_snapshot = {
+        let mut states = shared.app_states.write().await;
+        let app_state = states.entry(app_name.to_string()).or_default();
+        app_state.previous_tag = app_state.current_tag.take();
+        app_state.previous_container_id = app_state.current_container_id.take();
+        app_state.current_tag = Some(ctx.tag.clone());
+        app_state.current_container_id = ctx.new_container_id.clone();
+        app_state.current_port = if is_worker { None } else { ctx.new_port };
+        app_state.current_routes = merged
+            .as_ref()
+            .map(|m| {
+                m.routes
+                    .iter()
+                    .map(|r| RouteState {
+                        hostname: r.hostname.clone(),
+                        port: new_port,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        app_state.deployed_at = Some(Utc::now());
+        app_state.deploy_id = Some(ctx.id.clone());
+        app_state.status = AppStatus::Running;
+        app_state.kind = merged.as_ref().map(|m| m.kind.clone());
+        app_state.clone()
+    };
+
+    // Persist state to disk (non-fatal)
+    let state_dir = shared.config.storage.path.join("state");
+    if let Err(e) = state::save_app_state(&state_dir, app_name, &state_snapshot) {
+        tracing::warn!(app = %app_name, error = %e, "failed to persist app state (non-fatal)");
+    }
+
+    // ── DRAIN + STOP OLD ─────────────────────────────────────────────
+    if let Some(old_id) = old_container_id {
+        tracing::info!(app = %app_name, "draining old container");
+        tokio::time::sleep(effective_config.deploy.drain_timeout).await;
+        if let Err(e) = runtime.stop_and_remove(&old_id).await {
+            tracing::warn!(
+                app = %app_name,
+                error = %e,
+                "failed to stop old container (non-fatal)"
+            );
+        }
+    }
+
+    // ── COMPLETED ────────────────────────────────────────────────────────────
+    ctx.status = DeployStatus::Completed;
+    ctx.finished_at = Some(Utc::now());
+    record_deploy(shared, ctx);
+    tracing::info!(
+        app = %app_name,
+        tag = %ctx.tag,
+        deploy_id = %ctx.id,
+        "deploy completed"
+    );
+}
+
+// ─── Blue-green deploy: pod path ───────────────────────────────────────────────
+
+/// Execute a blue-green deploy for a pod.
+///
+/// Extracted from the original `execute_deploy_inner` — exact same logic,
+/// no behavior changes.
+#[allow(clippy::too_many_arguments)]
+async fn execute_blue_green_deploy_pod(
+    shared: &DeploySharedState<'_>,
+    runtime: &dyn RuntimeBackend,
+    caddy: &dyn ReverseProxy,
+    health: &dyn HealthCheck,
+    ctx: &mut DeployContext,
+    effective_config: &AppConfig,
+    merged: &Option<crate::merge::MergedConfig>,
+    env_vars: &[String],
+    app_name: &str,
+    is_worker: bool,
+) {
+    // ── START NEW ────────────────────────────────────────────────────────────
+    ctx.status = DeployStatus::Starting;
+    record_deploy(shared, ctx);
+
+    // Get the merged config — required for pod deploys.
+    let merged_cfg = merged.as_ref().expect("merged is Some when is_pod is true");
+
+    // Get the manifest path from repo config.
+    let manifest_in_image = match &merged_cfg.manifest {
+        Some(p) => p.clone(),
+        None => {
+            ctx.fail("pod deploy requires [app].manifest in repo config (slip.toml)");
+            record_deploy(shared, ctx);
+            set_app_failed(shared.app_states, app_name);
+            return;
+        }
+    };
+
+    // Extract pod.yaml (or custom path) from the image.
+    let manifest_bytes = match runtime
+        .extract_file(&ctx.image, &ctx.tag, &manifest_in_image)
+        .await
+    {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            ctx.fail(&format!(
+                "manifest '{manifest_in_image}' not found in image"
+            ));
+            record_deploy(shared, ctx);
+            set_app_failed(shared.app_states, app_name);
+            return;
+        }
+        Err(e) => {
+            ctx.fail(&format!("failed to extract manifest from image: {e}"));
+            record_deploy(shared, ctx);
+            set_app_failed(shared.app_states, app_name);
+            return;
+        }
+    };
+
+    // Generate a unique pod suffix from a ULID fragment.
+    let pod_suffix = ulid::Ulid::new().to_string()[..8].to_lowercase();
+    let pod_name = format!("{app_name}-{pod_suffix}");
+
+    // Render the manifest with deploy-time transformations.
+    let has_workers = merged_cfg.routes.iter().any(|r| r.kind == "worker");
+    let render_ctx = crate::manifest::RenderContext {
+        app_name: app_name.to_string(),
+        tag: ctx.tag.clone(),
+        primary_image: effective_config.app.image.clone(),
+        pod_suffix: pod_suffix.clone(),
+        env_vars: env_vars.to_vec(),
+        image_overrides: ctx.images.clone(),
+        volumes: merged_cfg.volumes.clone(),
+        has_workers,
+    };
+
+    let rendered_yaml = match crate::manifest::render_manifest(&manifest_bytes, &render_ctx) {
+        Ok(yaml) => yaml,
+        Err(e) => {
+            ctx.fail(&format!("failed to render manifest: {e}"));
+            record_deploy(shared, ctx);
+            set_app_failed(shared.app_states, app_name);
+            return;
+        }
+    };
+
+    // Write rendered manifest to storage dir.
+    let manifests_dir = shared.config.storage.path.join("manifests");
+    if let Err(e) = std::fs::create_dir_all(&manifests_dir) {
+        ctx.fail(&format!("failed to create manifests directory: {e}"));
+        record_deploy(shared, ctx);
+        set_app_failed(shared.app_states, app_name);
+        return;
+    }
+    let manifest_path = manifests_dir.join(format!("{app_name}-{}.yaml", ctx.id));
+    if let Err(e) = std::fs::write(&manifest_path, &rendered_yaml) {
+        ctx.fail(&format!("failed to write manifest file: {e}"));
+        record_deploy(shared, ctx);
+        set_app_failed(shared.app_states, app_name);
+        return;
+    }
+
+    // Deploy the pod via `podman kube play`.
+    if let Err(e) = runtime.deploy_pod(&manifest_path, &pod_name).await {
+        ctx.fail(&format!("pod deploy failed: {e}"));
+        record_deploy(shared, ctx);
+        set_app_failed(shared.app_states, app_name);
+        return;
+    }
+
+    // Record pod name and manifest path in context for later steps.
+    ctx.new_pod_name = Some(pod_name.clone());
+    ctx.new_manifest_path = Some(manifest_path.clone());
+
+    // ── PER-CONTAINER HEALTH CHECK (pod) ──────────────────────────────
+    ctx.status = DeployStatus::HealthChecking;
+    record_deploy(shared, ctx);
+
+    if is_worker {
+        // App-level worker: skip all health checks, pod was already verified as deployed
+        tracing::info!(
+            app = app_name,
+            "worker pod deployed, skipping HTTP health check"
+        );
+
+        // Update app runtime state for worker pod.
         let state_snapshot = {
             let mut states = shared.app_states.write().await;
-            let app_state = states.entry(app_name.clone()).or_default();
+            let app_state = states.entry(app_name.to_string()).or_default();
             app_state.previous_tag = app_state.current_tag.take();
-            app_state.previous_container_id = app_state.current_container_id.take();
             app_state.current_tag = Some(ctx.tag.clone());
-            app_state.current_container_id = ctx.new_container_id.clone();
-            app_state.current_port = if is_worker { None } else { ctx.new_port };
-            app_state.current_routes = merged
-                .as_ref()
-                .map(|m| {
-                    m.routes
-                        .iter()
-                        .map(|r| RouteState {
-                            hostname: r.hostname.clone(),
-                            port: new_port,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            app_state.current_pod_name = Some(pod_name.clone());
+            app_state.current_manifest_path = Some(manifest_path.clone());
+            app_state.current_port = None;
+            app_state.current_routes = vec![];
             app_state.deployed_at = Some(Utc::now());
             app_state.deploy_id = Some(ctx.id.clone());
             app_state.status = AppStatus::Running;
@@ -874,36 +836,702 @@ pub(crate) async fn execute_deploy_inner(
             app_state.clone()
         };
 
-        // Persist state to disk (non-fatal)
+        // Persist state to disk (non-fatal).
         let state_dir = shared.config.storage.path.join("state");
-        if let Err(e) = state::save_app_state(&state_dir, &app_name, &state_snapshot) {
-            tracing::warn!(app = %app_name, error = %e, "failed to persist app state (non-fatal)");
+        if let Err(e) = state::save_app_state(&state_dir, app_name, &state_snapshot) {
+            tracing::warn!(app = app_name, error = %e, "failed to persist app state (non-fatal)");
         }
 
-        // ── DRAIN + STOP OLD ─────────────────────────────────────────────
-        if let Some(old_id) = old_container_id {
-            tracing::info!(app = %app_name, "draining old container");
+        // ── DRAIN + TEARDOWN OLD POD ──────────────────────────────────
+        let old_pod_manifest = {
+            let states = shared.app_states.read().await;
+            states
+                .get(app_name)
+                .and_then(|s| s.current_manifest_path.clone())
+        };
+        if let Some(old_manifest) = old_pod_manifest {
+            tracing::info!(app = app_name, "draining old pod");
             tokio::time::sleep(effective_config.deploy.drain_timeout).await;
-            if let Err(e) = runtime.stop_and_remove(&old_id).await {
+            if let Err(e) = runtime.teardown_pod(&old_manifest).await {
                 tracing::warn!(
-                    app = %app_name,
+                    app = app_name,
                     error = %e,
-                    "failed to stop old container (non-fatal)"
+                    "failed to teardown old pod (non-fatal)"
+                );
+            }
+        }
+    } else {
+        // Iterate over routes and check per-container health.
+        let mut http_route_ports: Vec<(String, u16)> = Vec::new();
+        let mut any_http_failure = false;
+
+        for route in &merged_cfg.routes {
+            let container = route.container.as_deref().unwrap_or("web");
+            let container_port = route.port;
+
+            if route.kind == "worker" {
+                // Worker containers: check container_is_running, warn on failure
+                let container_name = format!("{pod_name}-{container}");
+                tracing::info!(
+                    app = app_name,
+                    container = %container,
+                    container_name = %container_name,
+                    "checking worker container"
+                );
+                match runtime.container_is_running(&container_name).await {
+                    Ok(true) => {
+                        tracing::info!(
+                            app = app_name,
+                            container = %container,
+                            "worker container is running"
+                        );
+                    }
+                    Ok(false) => {
+                        tracing::warn!(
+                            app = app_name,
+                            container = %container,
+                            "worker container is not running (will be restarted by restartPolicy)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            app = app_name,
+                            container = %container,
+                            error = %e,
+                            "failed to check worker container state (non-fatal)"
+                        );
+                    }
+                }
+            } else {
+                // HTTP containers: discover port and health check
+                match runtime
+                    .pod_container_port(&pod_name, container, container_port)
+                    .await
+                {
+                    Ok(host_port) => {
+                        tracing::info!(
+                            app = app_name,
+                            container = %container,
+                            host_port = host_port,
+                            "checking HTTP container health"
+                        );
+                        if let Err(e) = health.check(host_port, &effective_config.health).await {
+                            tracing::error!(
+                                app = app_name,
+                                container = %container,
+                                error = %e,
+                                "HTTP health check failed"
+                            );
+                            any_http_failure = true;
+                        } else {
+                            http_route_ports.push((route.hostname.clone(), host_port));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            app = app_name,
+                            container = %container,
+                            error = %e,
+                            "failed to get container port"
+                        );
+                        any_http_failure = true;
+                    }
+                }
+            }
+        }
+
+        // If any HTTP container failed, tear down and fail the deploy.
+        if any_http_failure {
+            if let Err(te) = runtime.teardown_pod(&manifest_path).await {
+                tracing::warn!(app = app_name, error = %te, "failed to teardown pod after health check failure (non-fatal)");
+            }
+            ctx.fail("health check failed for one or more HTTP containers");
+            record_deploy(shared, ctx);
+            set_app_failed(shared.app_states, app_name);
+            return;
+        }
+
+        // Record the first HTTP route port for backward compat.
+        ctx.new_port = http_route_ports.first().map(|(_, p)| *p);
+
+        // ── SWITCH (pod) ──────────────────────────────────────────────
+        ctx.status = DeployStatus::Switching;
+        record_deploy(shared, ctx);
+
+        let old_pod_manifest = {
+            let states = shared.app_states.read().await;
+            states
+                .get(app_name)
+                .and_then(|s| s.current_manifest_path.clone())
+        };
+
+        // Set Caddy routes only for HTTP routes.
+        if !http_route_ports.is_empty()
+            && let Err(e) = caddy
+                .set_routes(
+                    app_name,
+                    &http_route_ports
+                        .iter()
+                        .map(|(hostname, port)| crate::caddy::Route {
+                            hostname: hostname.clone(),
+                            port: *port,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .await
+        {
+            tracing::error!(app = app_name, error = %e, "caddy route update failed");
+            if let Err(te) = runtime.teardown_pod(&manifest_path).await {
+                tracing::warn!(app = app_name, error = %te, "failed to teardown pod after caddy failure (non-fatal)");
+            }
+            ctx.fail(&format!("caddy route update failed: {e}"));
+            record_deploy(shared, ctx);
+            set_app_failed(shared.app_states, app_name);
+            return;
+        }
+
+        // Update app runtime state for pod with per-route ports.
+        let state_snapshot = {
+            let mut states = shared.app_states.write().await;
+            let app_state = states.entry(app_name.to_string()).or_default();
+            app_state.previous_tag = app_state.current_tag.take();
+            app_state.current_tag = Some(ctx.tag.clone());
+            app_state.current_pod_name = Some(pod_name.clone());
+            app_state.current_manifest_path = Some(manifest_path.clone());
+            app_state.current_port = http_route_ports.first().map(|(_, p)| *p);
+            app_state.current_routes = http_route_ports
+                .iter()
+                .map(|(hostname, port)| RouteState {
+                    hostname: hostname.clone(),
+                    port: *port,
+                })
+                .collect();
+            app_state.deployed_at = Some(Utc::now());
+            app_state.deploy_id = Some(ctx.id.clone());
+            app_state.status = AppStatus::Running;
+            app_state.kind = merged.as_ref().map(|m| m.kind.clone());
+            app_state.clone()
+        };
+
+        // Persist state to disk (non-fatal).
+        let state_dir = shared.config.storage.path.join("state");
+        if let Err(e) = state::save_app_state(&state_dir, app_name, &state_snapshot) {
+            tracing::warn!(app = app_name, error = %e, "failed to persist app state (non-fatal)");
+        }
+
+        // ── DRAIN + TEARDOWN OLD POD ──────────────────────────────────
+        if let Some(old_manifest) = old_pod_manifest {
+            tracing::info!(app = app_name, "draining old pod");
+            tokio::time::sleep(effective_config.deploy.drain_timeout).await;
+            if let Err(e) = runtime.teardown_pod(&old_manifest).await {
+                tracing::warn!(
+                    app = app_name,
+                    error = %e,
+                    "failed to teardown old pod (non-fatal)"
                 );
             }
         }
     }
 
     // ── COMPLETED ────────────────────────────────────────────────────────────
-    ctx.status = DeployStatus::Completed;
-    ctx.finished_at = Some(Utc::now());
-    record_deploy(&shared, &ctx);
-    tracing::info!(
-        app = %app_name,
-        tag = %ctx.tag,
-        deploy_id = %ctx.id,
-        "deploy completed"
+    if ctx.status != DeployStatus::Failed {
+        ctx.status = DeployStatus::Completed;
+        ctx.finished_at = Some(Utc::now());
+        record_deploy(shared, ctx);
+        tracing::info!(
+            app = %app_name,
+            tag = %ctx.tag,
+            deploy_id = %ctx.id,
+            "deploy completed"
+        );
+    }
+}
+
+// ─── Recreate deploy: container path ────────────────────────────────────────────
+
+/// Execute a recreate deploy for a single container.
+///
+/// Flow: stop old → remove route → start new → health check → set route →
+/// update state → remove old → complete.
+/// On failure: restart old (Tier 1), or create from previous_tag (Tier 2),
+/// or mark rollback_failed (Tier 3).
+#[allow(clippy::too_many_arguments)]
+async fn execute_recreate_deploy_container(
+    shared: &DeploySharedState<'_>,
+    runtime: &dyn RuntimeBackend,
+    caddy: &dyn ReverseProxy,
+    health: &dyn HealthCheck,
+    ctx: &mut DeployContext,
+    effective_config: &AppConfig,
+    merged: &Option<crate::merge::MergedConfig>,
+    env_vars: &[String],
+    app_name: &str,
+    is_worker: bool,
+) {
+    let container_volumes: Vec<crate::merge::MergedVolume> = merged
+        .as_ref()
+        .map(|m| m.volumes.clone())
+        .unwrap_or_default();
+
+    // Read old container id from app state (if any).
+    let old_container_id = {
+        let states = shared.app_states.read().await;
+        states
+            .get(app_name)
+            .and_then(|s| s.current_container_id.clone())
+    };
+    let old_tag = {
+        let states = shared.app_states.read().await;
+        states.get(app_name).and_then(|s| s.current_tag.clone())
+    };
+
+    // ── STEP 1: STOP OLD CONTAINER ──────────────────────────────────────────
+    if let Some(ref old_id) = old_container_id {
+        ctx.status = DeployStatus::StoppingOld;
+        record_deploy(shared, ctx);
+        tracing::info!(
+            app = app_name,
+            old_id = %old_id,
+            "stopping old container (recreate)"
+        );
+        if let Err(e) = runtime.stop_container(old_id).await {
+            ctx.fail(&format!("failed to stop old container: {e}"));
+            record_deploy(shared, ctx);
+            set_app_failed(shared.app_states, app_name);
+            return;
+        }
+    }
+
+    // ── STEP 2: REMOVE CADDY ROUTE ─────────────────────────────────────────
+    ctx.status = DeployStatus::RemovingRoute;
+    record_deploy(shared, ctx);
+    if let Err(e) = caddy.remove_route(app_name).await {
+        // Non-fatal: route might not exist (first deploy) or already gone.
+        tracing::warn!(
+            app = app_name,
+            error = %e,
+            "failed to remove caddy route (non-fatal, continuing)"
+        );
+    }
+
+    // ── STEP 3: START NEW CONTAINER ─────────────────────────────────────────
+    ctx.status = DeployStatus::Starting;
+    record_deploy(shared, ctx);
+
+    let create_result = runtime
+        .create_and_start(
+            app_name,
+            &ctx.image,
+            &ctx.tag,
+            if is_worker {
+                0
+            } else {
+                effective_config.routing.port.unwrap_or(0)
+            },
+            env_vars.to_vec(),
+            &effective_config.network.name,
+            &effective_config.resources,
+            &container_volumes,
+        )
+        .await;
+
+    let (new_container_id, new_port) = match create_result {
+        Ok((id, port)) => {
+            ctx.new_container_id = Some(id.clone());
+            if !is_worker {
+                ctx.new_port = Some(port);
+            }
+            (id, port)
+        }
+        Err(e) => {
+            // Rollback: restart old container, restore route.
+            tracing::error!(app = app_name, error = %e, "new container failed to start (recreate)");
+            rollback_recreate_container(
+                shared,
+                runtime,
+                caddy,
+                health,
+                ctx,
+                app_name,
+                &old_container_id,
+                &old_tag,
+                effective_config,
+                &container_volumes,
+                env_vars,
+                None,
+            )
+            .await;
+            return;
+        }
+    };
+
+    // ── STEP 4: HEALTH CHECK ───────────────────────────────────────────────
+    ctx.status = DeployStatus::HealthChecking;
+    record_deploy(shared, ctx);
+
+    let health_ok = if is_worker {
+        // Workers: use container_is_running() instead of HTTP health check
+        if let Some(ref id) = ctx.new_container_id {
+            match runtime.container_is_running(id).await {
+                Ok(true) => true,
+                Ok(false) => {
+                    tracing::error!(app = app_name, container_id = %id, "worker container not running after start");
+                    false
+                }
+                Err(e) => {
+                    tracing::error!(app = app_name, error = %e, "failed to verify worker container state");
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    } else {
+        // HTTP health check
+        let check_result = health.check(new_port, &effective_config.health).await;
+        if let Err(e) = &check_result {
+            tracing::error!(app = app_name, error = %e, "health check failed (recreate)");
+        }
+
+        // Also verify container is still running after health check wait
+        let still_running = if let Some(ref id) = ctx.new_container_id {
+            runtime.container_is_running(id).await.unwrap_or(true)
+        } else {
+            true
+        };
+
+        check_result.is_ok() && still_running
+    };
+
+    if !health_ok {
+        tracing::error!(
+            app = app_name,
+            "health check failed, rolling back (recreate)"
+        );
+        // Remove the failed new container
+        let _ = runtime.stop_and_remove(&new_container_id).await;
+        rollback_recreate_container(
+            shared,
+            runtime,
+            caddy,
+            health,
+            ctx,
+            app_name,
+            &old_container_id,
+            &old_tag,
+            effective_config,
+            &container_volumes,
+            env_vars,
+            None,
+        )
+        .await;
+        return;
+    }
+
+    // ── STEP 5: SET CADDY ROUTE ────────────────────────────────────────────
+    ctx.status = DeployStatus::Switching;
+    record_deploy(shared, ctx);
+
+    if !is_worker
+        && let Err(e) = caddy
+            .set_routes(
+                app_name,
+                &merged
+                    .as_ref()
+                    .map(|m| {
+                        m.routes
+                            .iter()
+                            .map(|r| crate::caddy::Route {
+                                hostname: r.hostname.clone(),
+                                port: new_port,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| {
+                        vec![crate::caddy::Route {
+                            hostname: effective_config.routing.domain.clone().unwrap_or_default(),
+                            port: new_port,
+                        }]
+                    }),
+            )
+            .await
+    {
+        tracing::error!(app = app_name, error = %e, "caddy route update failed (recreate)");
+        let _ = runtime.stop_and_remove(&new_container_id).await;
+        rollback_recreate_container(
+            shared,
+            runtime,
+            caddy,
+            health,
+            ctx,
+            app_name,
+            &old_container_id,
+            &old_tag,
+            effective_config,
+            &container_volumes,
+            env_vars,
+            None,
+        )
+        .await;
+        return;
+    }
+
+    // ── STEP 6: UPDATE APP STATE ───────────────────────────────────────────
+    let state_snapshot = {
+        let mut states = shared.app_states.write().await;
+        let app_state = states.entry(app_name.to_string()).or_default();
+        app_state.previous_tag = app_state.current_tag.take();
+        app_state.previous_container_id = app_state.current_container_id.take();
+        app_state.current_tag = Some(ctx.tag.clone());
+        app_state.current_container_id = ctx.new_container_id.clone();
+        app_state.current_port = if is_worker { None } else { ctx.new_port };
+        app_state.current_routes = merged
+            .as_ref()
+            .map(|m| {
+                m.routes
+                    .iter()
+                    .map(|r| RouteState {
+                        hostname: r.hostname.clone(),
+                        port: new_port,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        app_state.deployed_at = Some(Utc::now());
+        app_state.deploy_id = Some(ctx.id.clone());
+        app_state.status = AppStatus::Running;
+        app_state.kind = merged.as_ref().map(|m| m.kind.clone());
+        app_state.clone()
+    };
+
+    // Persist state to disk (non-fatal)
+    let state_dir = shared.config.storage.path.join("state");
+    if let Err(e) = state::save_app_state(&state_dir, app_name, &state_snapshot) {
+        tracing::warn!(app = app_name, error = %e, "failed to persist app state (non-fatal)");
+    }
+
+    // ── STEP 7: REMOVE OLD CONTAINER ────────────────────────────────────────
+    if let Some(ref old_id) = old_container_id {
+        tracing::info!(
+            app = app_name,
+            old_id = %old_id,
+            "removing old container (recreate cleanup)"
+        );
+        if let Err(e) = runtime.stop_and_remove(old_id).await {
+            tracing::warn!(
+                app = app_name,
+                error = %e,
+                "failed to remove old container (non-fatal)"
+            );
+        }
+    }
+
+    // ── COMPLETED ────────────────────────────────────────────────────────────
+    if ctx.status != DeployStatus::Failed {
+        ctx.status = DeployStatus::Completed;
+        ctx.finished_at = Some(Utc::now());
+        record_deploy(shared, ctx);
+        tracing::info!(
+            app = %app_name,
+            tag = %ctx.tag,
+            deploy_id = %ctx.id,
+            "deploy completed"
+        );
+    }
+}
+
+// ─── Recreate rollback ────────────────────────────────────────────────────────
+
+/// Rollback a failed recreate deploy.
+///
+/// Tier 1: restart old container, restore route.
+/// Tier 2: create fresh container from previous_tag.
+/// Tier 3: mark rollback_failed, log catastrophic error.
+///
+/// Always removes the failed new container.
+#[allow(clippy::too_many_arguments)]
+async fn rollback_recreate_container(
+    shared: &DeploySharedState<'_>,
+    runtime: &dyn RuntimeBackend,
+    caddy: &dyn ReverseProxy,
+    health: &dyn HealthCheck,
+    ctx: &mut DeployContext,
+    app_name: &str,
+    old_container_id: &Option<String>,
+    old_tag: &Option<String>,
+    effective_config: &AppConfig,
+    container_volumes: &[crate::merge::MergedVolume],
+    env_vars: &[String],
+    _new_container_id: Option<String>,
+) {
+    let old_port = {
+        let states = shared.app_states.read().await;
+        states.get(app_name).and_then(|s| s.current_port)
+    };
+
+    // ── TIER 1: Restart old container ───────────────────────────────────────
+    if let Some(old_id) = old_container_id {
+        ctx.status = DeployStatus::RestartingOld;
+        record_deploy(shared, ctx);
+        tracing::info!(
+            app = app_name,
+            old_id = %old_id,
+            "Tier 1 rollback: restarting old container"
+        );
+
+        if runtime.start_container(old_id).await.is_ok() {
+            // Re-discover port (may have changed after restart)
+            let container_port = effective_config.routing.port.unwrap_or(0);
+            let discovered_port = runtime
+                .inspect_container_port(old_id, container_port)
+                .await
+                .unwrap_or(old_port.unwrap_or(0));
+
+            // Restore Caddy route
+            if effective_config.routing.domain.is_none()
+                && effective_config.routing.routes.is_empty()
+            {
+                // Worker — no route to restore
+            } else if let Err(e) = caddy
+                .set_routes(
+                    app_name,
+                    &effective_config
+                        .routing
+                        .effective_routes()
+                        .iter()
+                        .map(|r| crate::caddy::Route {
+                            hostname: r.hostname.clone(),
+                            port: discovered_port,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    app = app_name,
+                    error = %e,
+                    "Tier 1 rollback: failed to restore route (non-fatal)"
+                );
+            }
+
+            tracing::info!(app = app_name, "Tier 1 rollback succeeded");
+            ctx.fail("deploy failed, old container restarted (Tier 1 rollback)");
+            record_deploy(shared, ctx);
+            set_app_failed(shared.app_states, app_name);
+            return;
+        }
+
+        tracing::warn!(
+            app = app_name,
+            old_id = %old_id,
+            "Tier 1 rollback failed: old container would not restart"
+        );
+    }
+
+    // ── TIER 2: Create from previous_tag ────────────────────────────────────
+    if let Some(prev_tag) = old_tag {
+        tracing::info!(
+            app = app_name,
+            previous_tag = %prev_tag,
+            "Tier 2 rollback: creating container from previous_tag"
+        );
+
+        match runtime
+            .create_and_start(
+                app_name,
+                &ctx.image,
+                prev_tag,
+                effective_config.routing.port.unwrap_or(0),
+                env_vars.to_vec(),
+                &effective_config.network.name,
+                &effective_config.resources,
+                container_volumes,
+            )
+            .await
+        {
+            Ok((fallback_id, fallback_port)) => {
+                // Health check the fallback container
+                let fallback_healthy = if effective_config.health.path.is_some() {
+                    health
+                        .check(fallback_port, &effective_config.health)
+                        .await
+                        .is_ok()
+                } else {
+                    true
+                };
+
+                if fallback_healthy {
+                    // Set route
+                    if effective_config.routing.domain.is_none()
+                        && effective_config.routing.routes.is_empty()
+                    {
+                        // Worker — no route
+                    } else if let Err(e) = caddy
+                        .set_routes(
+                            app_name,
+                            &effective_config
+                                .routing
+                                .effective_routes()
+                                .iter()
+                                .map(|r| crate::caddy::Route {
+                                    hostname: r.hostname.clone(),
+                                    port: fallback_port,
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            app = app_name,
+                            error = %e,
+                            "Tier 2 rollback: failed to restore route (non-fatal)"
+                        );
+                    }
+
+                    // Update app state with fallback container
+                    {
+                        let mut states = shared.app_states.write().await;
+                        if let Some(app_state) = states.get_mut(app_name) {
+                            app_state.current_container_id = Some(fallback_id);
+                            app_state.current_port = Some(fallback_port);
+                            app_state.current_tag = Some(prev_tag.clone());
+                        }
+                    }
+
+                    tracing::info!(app = app_name, "Tier 2 rollback succeeded");
+                    ctx.fail("deploy failed, fallback from previous_tag (Tier 2 rollback)");
+                    record_deploy(shared, ctx);
+                    set_app_failed(shared.app_states, app_name);
+                    return;
+                }
+
+                // Fallback container unhealthy — clean it up
+                let _ = runtime.stop_and_remove(&fallback_id).await;
+                tracing::warn!(
+                    app = app_name,
+                    "Tier 2 rollback failed: fallback container unhealthy"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    app = app_name,
+                    error = %e,
+                    "Tier 2 rollback failed: could not create fallback container"
+                );
+            }
+        }
+    }
+
+    // ── TIER 3: Catastrophic failure ────────────────────────────────────────
+    ctx.rollback_failed = true;
+    tracing::error!(
+        app = app_name,
+        "App {} is DOWN. New container failed health check AND old container cannot be restarted. Manual intervention required.",
+        app_name,
     );
+    ctx.fail("deploy failed, rollback failed — manual intervention required");
+    record_deploy(shared, ctx);
+    set_app_failed(shared.app_states, app_name);
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
@@ -2713,5 +3341,359 @@ container = "web"
         let (image, tag) = parse_image_ref("registry:5000/img:v1");
         assert_eq!(image, "registry:5000/img");
         assert_eq!(tag, "v1");
+    }
+
+    // ── Recreate strategy tests ───────────────────────────────────────────────
+
+    fn recreate_app_config() -> AppConfig {
+        AppConfig {
+            deploy: DeployConfig {
+                strategy: "recreate".to_string(),
+                drain_timeout: Duration::ZERO,
+            },
+            ..test_app_config()
+        }
+    }
+
+    /// Happy path: recreate with old container.
+    /// Verify: stop_container called on old BEFORE create_and_start,
+    /// remove_route called, health check passes, set_route called,
+    /// stop_and_remove called on old (cleanup), status=Completed.
+    #[tokio::test]
+    async fn test_recreate_happy_path_full_deploy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), recreate_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
+
+        // Pre-populate app state with an existing container.
+        let mut initial_states = HashMap::new();
+        initial_states.insert(
+            "testapp".to_string(),
+            AppRuntimeState {
+                status: AppStatus::Running,
+                current_tag: Some("v0.9.0".to_string()),
+                current_container_id: Some("old-container-id".to_string()),
+                current_port: Some(50000),
+                ..Default::default()
+            },
+        );
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(initial_states);
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::new();
+        let stop_only_count = docker.stop_only_count();
+        let stop_count = docker.stop_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            test_deploy_ctx(),
+        )
+        .await;
+
+        // stop_container should have been called on old (stop only, not remove)
+        assert_eq!(
+            stop_only_count.load(Ordering::SeqCst),
+            1,
+            "stop_container should be called on old container"
+        );
+
+        // stop_and_remove should have been called on old (cleanup after success)
+        assert_eq!(
+            stop_count.load(Ordering::SeqCst),
+            1,
+            "stop_and_remove should be called on old container (cleanup)"
+        );
+
+        // Status should be Completed.
+        let recorded = deploys.get("testapp").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Completed);
+        assert!(recorded.error.is_none());
+
+        // New container should be current.
+        let states = app_states.read().await;
+        let app = states.get("testapp").unwrap();
+        assert_eq!(
+            app.current_container_id.as_deref(),
+            Some("mock-container-id")
+        );
+        assert_eq!(
+            app.previous_container_id.as_deref(),
+            Some("old-container-id")
+        );
+    }
+
+    /// First deploy with recreate: no old container to stop.
+    /// Verify: stop_container NOT called, create_and_start called,
+    /// stop_and_remove NOT called (no old to clean up), status=Completed.
+    #[tokio::test]
+    async fn test_recreate_first_deploy_no_old_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), recreate_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::new();
+        let stop_only_count = docker.stop_only_count();
+        let stop_count = docker.stop_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            test_deploy_ctx(),
+        )
+        .await;
+
+        // stop_container should NOT have been called (no old container).
+        assert_eq!(stop_only_count.load(Ordering::SeqCst), 0);
+        // stop_and_remove should NOT have been called (no old to clean up).
+        assert_eq!(stop_count.load(Ordering::SeqCst), 0);
+
+        // Status should be Completed.
+        let recorded = deploys.get("testapp").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Completed);
+        assert!(recorded.error.is_none());
+    }
+
+    /// Recreate with health check failure: old container should be restarted.
+    #[tokio::test]
+    async fn test_recreate_health_check_failure_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), recreate_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
+
+        // Pre-populate app state with an existing container.
+        let mut initial_states = HashMap::new();
+        initial_states.insert(
+            "testapp".to_string(),
+            AppRuntimeState {
+                status: AppStatus::Running,
+                current_tag: Some("v0.9.0".to_string()),
+                current_container_id: Some("old-container-id".to_string()),
+                current_port: Some(50000),
+                ..Default::default()
+            },
+        );
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(initial_states);
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::new();
+        let stop_only_count = docker.stop_only_count();
+        let start_count = docker.start_count();
+        let stop_count = docker.stop_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::failing(); // health check always fails
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            test_deploy_ctx(),
+        )
+        .await;
+
+        // stop_container should have been called on old.
+        assert_eq!(stop_only_count.load(Ordering::SeqCst), 1);
+
+        // start_container should have been called (Tier 1 rollback).
+        assert_eq!(start_count.load(Ordering::SeqCst), 1);
+
+        // stop_and_remove should have been called on new container (cleanup).
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+
+        // Status should be Failed.
+        let recorded = deploys.get("testapp").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Failed);
+        assert!(
+            recorded
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Tier 1 rollback"),
+            "error should mention Tier 1 rollback: {:?}",
+            recorded.error
+        );
+        assert!(!recorded.rollback_failed);
+    }
+
+    /// Recreate: old container won't stop → deploy fails immediately.
+    #[tokio::test]
+    async fn test_recreate_old_container_wont_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), recreate_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
+
+        // Pre-populate app state with an existing container.
+        let mut initial_states = HashMap::new();
+        initial_states.insert(
+            "testapp".to_string(),
+            AppRuntimeState {
+                status: AppStatus::Running,
+                current_tag: Some("v0.9.0".to_string()),
+                current_container_id: Some("old-container-id".to_string()),
+                current_port: Some(50000),
+                ..Default::default()
+            },
+        );
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(initial_states);
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker {
+            stop_ok: false, // stop_container fails
+            ..MockDocker::new()
+        };
+        let stop_only_count = docker.stop_only_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            test_deploy_ctx(),
+        )
+        .await;
+
+        // stop_container should have been attempted.
+        assert_eq!(stop_only_count.load(Ordering::SeqCst), 1);
+
+        // Deploy should be Failed.
+        let recorded = deploys.get("testapp").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Failed);
+        assert!(
+            recorded
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("failed to stop old container")
+        );
+    }
+
+    /// Recreate with no health check path: health check skipped, deploy completes.
+    #[tokio::test]
+    async fn test_recreate_no_health_check_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        // Use default app config which has health.path = None
+        apps.insert("testapp".to_string(), recreate_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
+
+        // Pre-populate app state with an existing container.
+        let mut initial_states = HashMap::new();
+        initial_states.insert(
+            "testapp".to_string(),
+            AppRuntimeState {
+                status: AppStatus::Running,
+                current_tag: Some("v0.9.0".to_string()),
+                current_container_id: Some("old-container-id".to_string()),
+                current_port: Some(50000),
+                ..Default::default()
+            },
+        );
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(initial_states);
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::new();
+        let stop_only_count = docker.stop_only_count();
+        let stop_count = docker.stop_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            test_deploy_ctx(),
+        )
+        .await;
+
+        // stop_container should have been called on old.
+        assert_eq!(stop_only_count.load(Ordering::SeqCst), 1);
+        // stop_and_remove should have been called on old (cleanup).
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+
+        // Status should be Completed.
+        let recorded = deploys.get("testapp").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Completed);
+        assert!(recorded.error.is_none());
+    }
+
+    /// Explicit blue-green strategy should behave exactly as before.
+    #[tokio::test]
+    async fn test_blue_green_unchanged_with_strategy_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        // Explicitly set strategy = "blue-green"
+        let mut app_cfg = test_app_config();
+        app_cfg.deploy.strategy = "blue-green".to_string();
+        apps.insert("testapp".to_string(), app_cfg);
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
+
+        // Pre-populate app state with an existing container.
+        let mut initial_states = HashMap::new();
+        initial_states.insert(
+            "testapp".to_string(),
+            AppRuntimeState {
+                status: AppStatus::Running,
+                current_tag: Some("v0.9.0".to_string()),
+                current_container_id: Some("old-container-id".to_string()),
+                current_port: Some(50000),
+                ..Default::default()
+            },
+        );
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(initial_states);
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::new();
+        let stop_count = docker.stop_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            test_deploy_ctx(),
+        )
+        .await;
+
+        // stop_and_remove should have been called exactly once (old container, after new is live).
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+
+        // Status should be Completed.
+        let recorded = deploys.get("testapp").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Completed);
+        assert!(recorded.error.is_none());
+
+        // New container should be current.
+        let states = app_states.read().await;
+        let app = states.get("testapp").unwrap();
+        assert_eq!(
+            app.current_container_id.as_deref(),
+            Some("mock-container-id")
+        );
     }
 }
