@@ -82,7 +82,13 @@ sudo tee /etc/slip/slip.toml > /dev/null << 'EOF'
 listen = "127.0.0.1:7890"
 
 [runtime]
-backend = "auto"          # auto-detects Podman or Docker
+backend = "auto"          # "auto" | "docker" | "podman"
+
+[auth]
+secret = "${SLIP_SECRET}"  # global HMAC fallback; per-app secrets override it
+
+[registry]
+# ghcr_token = "${GHCR_TOKEN}"   # optional: token for pulling private images
 
 [caddy]
 admin_api = "http://localhost:2019"
@@ -92,6 +98,10 @@ path = "/var/lib/slip"
 EOF
 ```
 
+> **Required sections:** `[server]`, `[auth]`, `[registry]`, `[caddy]`,
+> `[storage]`. `[registry]` may be empty but must be present. `[auth].secret`
+> supports `${ENV}` interpolation (set `SLIP_SECRET` in slipd's systemd unit).
+>
 > **Note:** `listen = "127.0.0.1:7890"` means slip only listens on localhost. Caddy will proxy webhook traffic to it on a public-facing route (see step 5). This keeps the webhook endpoint behind TLS.
 
 ## 4. Create your first app config
@@ -100,9 +110,11 @@ Each app gets its own TOML file in `/etc/slip/apps/`. This is the **server-side*
 
 ### Simple single-container app (blue-green)
 
+Each app is a single `[app]` table (not `[[apps]]`). The `[health]` section is required — omit `path` to skip the HTTP probe and health-check on "container running" instead.
+
 ```bash
 sudo tee /etc/slip/apps/my-app.toml > /dev/null << 'EOF'
-[[apps]]
+[app]
 name = "my-app"
 image = "ghcr.io/youruser/my-app"
 
@@ -131,22 +143,24 @@ EOF
 
 ```bash
 sudo tee /etc/slip/apps/pipeline.toml > /dev/null << 'EOF'
-[[apps]]
+[app]
 name = "pipeline"
 image = "ghcr.io/youruser/pipeline"
 
-# kind = "worker" is declared in the repo's slip.toml (baked into the image)
-# Worker apps skip domain, port, and HTTP health checks.
-# Health = container running.
+# kind = "worker" is declared in the repo's slip.toml (baked into the image).
+# Worker apps skip domain, port, and HTTP health checks. Health = container running.
+
+[health]
+# no path → health-check on "container running"
 
 [deploy]
-strategy = "blue-green"
+strategy = "recreate"        # single-writer state: never run two instances
 
 [resources]
 memory = "1g"
 cpus = "2.0"
 
-[[apps.volumes]]
+[[volumes]]
 host_path = "/var/lib/slip/volumes/pipeline/dlt-state"
 mount_path = "/app/data"
 read_only = false
@@ -157,29 +171,32 @@ EOF
 
 ```bash
 sudo tee /etc/slip/apps/statstream.toml > /dev/null << 'EOF'
-[[apps]]
+[app]
 name = "statstream"
 image = "ghcr.io/youruser/statstream-api"
 
 # The repo's slip.toml (baked into the image) declares kind = "pod"
 # and points to the pod manifest (pod.yaml).
 
+[health]
+path = "/health"
+
 [deploy]
 strategy = "recreate"
 
-[[apps.routes]]
+[[routing.routes]]
 hostname = "statstream.yourdomain.com"
 container = "api"
 
-[[apps.routes]]
+[[routing.routes]]
 hostname = "dagster.yourdomain.com"
 container = "dagster-webserver"
 
-[[apps.volumes]]
+[[volumes]]
 host_path = "/var/lib/slip/volumes/statstream/dagster-home"
 mount_path = "/opt/dagster/dagster_home"
 
-[[apps.volumes]]
+[[volumes]]
 host_path = "/var/lib/slip/volumes/statstream/catalog"
 mount_path = "/app/catalog"
 EOF
@@ -228,16 +245,27 @@ sudo systemctl reload caddy
 
 ## 6. Set up secrets
 
-```bash
-# Set the webhook signing secret (used to verify CI webhooks)
-sudo slip secret set my-app/SLIP_SECRET --value "your-hmac-secret-here"
+The CLI subcommand is `slip secrets` (plural). It calls slipd's management API,
+which requires the global token (`[auth].secret`). The form is
+`slip secrets set <app> KEY=VALUE [KEY=VALUE ...]`.
 
-# Set app secrets (injected as env vars at deploy time)
-sudo slip secret set my-app/DATABASE_URL --value "postgres://..."
-sudo slip secret set my-app/SECRET_KEY --value "your-secret-key"
+```bash
+TOKEN="your-global-auth-secret"   # the [auth].secret from slip.toml
+
+# Set the webhook signing secret (used to verify CI webhooks)
+sudo slip secrets set my-app SLIP_SECRET=your-hmac-secret-here --token "$TOKEN"
+
+# Set app secrets (injected as env vars at deploy time) — multiple at once
+sudo slip secrets set my-app \
+  DATABASE_URL=postgres://... \
+  SECRET_KEY=your-secret-key \
+  --token "$TOKEN"
+
+# List keys (values are never returned)
+sudo slip secrets list my-app --token "$TOKEN"
 ```
 
-> Use `sudo -u slip slip secret set ...` if the slip user owns the secrets dir.
+> Set `SLIP_TOKEN` in your environment to avoid passing `--token` each time.
 
 ## 7. Create a systemd service
 
@@ -352,4 +380,6 @@ Your slip-deployed containers can then reach `postgres:5432` by name. See [docs/
 - **Health check fails** — verify your app's `/health` endpoint works inside the container
 - **Caddy route not created** — check `sudo journalctl -u slipd | grep caddy`, ensure Caddy admin API is on `:2019`
 - **Permission denied on Podman socket** — ensure the `slip` user is in the `podman` group, or use Docker's `/var/run/docker.sock`
-- **Webhook 403** — verify the HMAC signature matches; the secret in `slip secret set` must match what CI uses
+- **Webhook 403** — verify the HMAC signature matches; the secret set via `slip secrets set <app> SLIP_SECRET=...` must match what CI uses
+- **`missing field 'auth'` / `'registry'` / `'health'`** — those sections are required; see steps 3-4
+- **`unrecognized subcommand 'secret'`** — the command is `slip secrets` (plural)
