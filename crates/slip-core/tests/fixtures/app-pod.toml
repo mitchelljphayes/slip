@@ -1,0 +1,28 @@
+[app]
+name = "statstream"
+image = "ghcr.io/youruser/statstream-api"
+
+# The repo's slip.toml (baked into the image) declares kind = "pod"
+# and points to the pod manifest (pod.yaml).
+
+[health]
+path = "/health"
+
+[deploy]
+strategy = "recreate"
+
+[[routing.routes]]
+hostname = "statstream.yourdomain.com"
+container = "api"
+
+[[routing.routes]]
+hostname = "dagster.yourdomain.com"
+container = "dagster-webserver"
+
+[[volumes]]
+host_path = "/var/lib/slip/volumes/statstream/dagster-home"
+mount_path = "/opt/dagster/dagster_home"
+
+[[volumes]]
+host_path = "/var/lib/slip/volumes/statstream/catalog"
+mount_path = "/app/catalog"

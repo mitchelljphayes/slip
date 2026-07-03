@@ -1,0 +1,21 @@
+[app]
+name = "pipeline"
+image = "ghcr.io/youruser/pipeline"
+
+# kind = "worker" is declared in the repo's slip.toml (baked into the image).
+# Worker apps skip domain, port, and HTTP health checks. Health = container running.
+
+[health]
+# no path → health-check on "container running"
+
+[deploy]
+strategy = "recreate"        # single-writer state: never run two instances
+
+[resources]
+memory = "1g"
+cpus = "2.0"
+
+[[volumes]]
+host_path = "/var/lib/slip/volumes/pipeline/dlt-state"
+mount_path = "/app/data"
+read_only = false

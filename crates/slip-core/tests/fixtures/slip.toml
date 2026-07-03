@@ -1,0 +1,17 @@
+[server]
+listen = "127.0.0.1:7890"
+
+[runtime]
+backend = "auto"          # "auto" | "docker" | "podman"
+
+[auth]
+secret = "${SLIP_SECRET}"  # global HMAC fallback; per-app secrets override it
+
+[registry]
+# ghcr_token = "${GHCR_TOKEN}"   # optional: token for pulling private images
+
+[caddy]
+admin_api = "http://localhost:2019"
+
+[storage]
+path = "/var/lib/slip"

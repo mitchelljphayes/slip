@@ -366,6 +366,24 @@ pub(crate) async fn execute_deploy_inner(
     let is_pod = merged.as_ref().map(|m| m.kind == "pod").unwrap_or(false);
     let is_worker = merged.as_ref().map(|m| m.kind == "worker").unwrap_or(false);
 
+    // ── ROUTING GUARD ─────────────────────────────────────────────────────────
+    // HTTP (non-worker) container apps must have a reachable route.
+    if !is_worker {
+        let has_routes = !effective_config.routing.routes.is_empty();
+        let has_domain = effective_config
+            .routing
+            .domain
+            .as_ref()
+            .is_some_and(|d| !d.is_empty());
+        let has_port = effective_config.routing.port.is_some_and(|p| p > 0);
+        if !(has_routes || (has_domain && has_port)) {
+            ctx.fail("HTTP app requires routing.domain+port or [[routing.routes]]");
+            record_deploy(&shared, &ctx);
+            set_app_failed(shared.app_states, &app_name);
+            return;
+        }
+    }
+
     match effective_config.deploy.strategy.as_str() {
         "blue-green" => {
             if is_pod {
@@ -1662,6 +1680,7 @@ pub(crate) fn resolve_env_vars_for_app(
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
@@ -1713,6 +1732,8 @@ mod tests {
         pod_port: Option<u16>,
         /// Tracks how many times `teardown_pod` was called.
         teardown_count: Arc<AtomicU32>,
+        /// Ordered log of method calls for ordering assertions.
+        call_log: Arc<Mutex<Vec<String>>>,
     }
 
     impl MockDocker {
@@ -1734,6 +1755,7 @@ mod tests {
                 manifest_extract_result: None,
                 pod_port: None,
                 teardown_count: Arc::new(AtomicU32::new(0)),
+                call_log: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -1800,6 +1822,10 @@ mod tests {
         fn teardown_count(&self) -> Arc<AtomicU32> {
             self.teardown_count.clone()
         }
+
+        fn call_log(&self) -> Arc<Mutex<Vec<String>>> {
+            self.call_log.clone()
+        }
     }
 
     fn clone_runtime_error(e: &RuntimeError) -> RuntimeError {
@@ -1847,6 +1873,7 @@ mod tests {
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
         > {
+            self.call_log.lock().unwrap().push("pull_image".to_string());
             let result = if self.pull_ok {
                 Ok(())
             } else {
@@ -1868,6 +1895,10 @@ mod tests {
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<(String, u16), RuntimeError>> + Send + 'a>,
         > {
+            self.call_log
+                .lock()
+                .unwrap()
+                .push("create_and_start".to_string());
             let result = Ok((self.container_id.clone(), self.container_port));
             Box::pin(async move { result })
         }
@@ -1878,6 +1909,10 @@ mod tests {
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
         > {
+            self.call_log
+                .lock()
+                .unwrap()
+                .push("stop_and_remove".to_string());
             self.stop_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
@@ -1888,6 +1923,10 @@ mod tests {
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
         > {
+            self.call_log
+                .lock()
+                .unwrap()
+                .push("stop_container".to_string());
             self.stop_only_count.fetch_add(1, Ordering::SeqCst);
             let ok = self.stop_ok;
             Box::pin(async move {
@@ -1907,6 +1946,10 @@ mod tests {
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
         > {
+            self.call_log
+                .lock()
+                .unwrap()
+                .push("start_container".to_string());
             self.start_count.fetch_add(1, Ordering::SeqCst);
             let ok = self.start_ok;
             Box::pin(async move {
@@ -2218,6 +2261,26 @@ mod tests {
             app_states,
             deploys,
             db: Db::open_in_memory().expect("in-memory db for tests"),
+            credentials: None,
+            secrets_store: None,
+        }
+    }
+
+    /// Build a `DeploySharedState` with an externally-owned `Db` (e.g. for
+    /// asserting SQLite persistence after the deploy completes).
+    fn make_shared_with_db<'a>(
+        config: &'a SlipConfig,
+        apps: &'a RwLock<HashMap<String, AppConfig>>,
+        app_states: &'a RwLock<HashMap<String, AppRuntimeState>>,
+        deploys: &'a DashMap<String, DeployContext>,
+        db: Db,
+    ) -> DeploySharedState<'a> {
+        DeploySharedState {
+            config,
+            apps,
+            app_states,
+            deploys,
+            db,
             credentials: None,
             secrets_store: None,
         }
@@ -3694,6 +3757,262 @@ container = "web"
         assert_eq!(
             app.current_container_id.as_deref(),
             Some("mock-container-id")
+        );
+    }
+
+    // ── Call-log ordering tests ───────────────────────────────────────────────
+
+    /// Recreate strategy: stop_container before create_and_start.
+    #[tokio::test]
+    async fn test_recreate_stops_old_before_starting_new() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut app_config = test_app_config();
+        app_config.deploy.strategy = "recreate".to_string();
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), app_config);
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
+
+        // Seed app_states with a prior running container.
+        let mut initial_states = HashMap::new();
+        initial_states.insert(
+            "testapp".to_string(),
+            AppRuntimeState {
+                status: AppStatus::Running,
+                current_tag: Some("v0.9.0".to_string()),
+                current_container_id: Some("old-ctr".into()),
+                current_port: Some(50000),
+                ..Default::default()
+            },
+        );
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(initial_states);
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::new();
+        let call_log = docker.call_log();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            test_deploy_ctx(),
+        )
+        .await;
+
+        // Assert ordering: stop_container before create_and_start.
+        let log = call_log.lock().unwrap();
+        let stop_idx = log.iter().position(|s| s == "stop_container");
+        let create_idx = log.iter().position(|s| s == "create_and_start");
+        assert!(stop_idx.is_some(), "stop_container should have been called");
+        assert!(
+            create_idx.is_some(),
+            "create_and_start should have been called"
+        );
+        assert!(
+            stop_idx.unwrap() < create_idx.unwrap(),
+            "stop_container should be called before create_and_start in recreate strategy"
+        );
+
+        // Final status should be Completed.
+        let recorded = deploys.get("testapp").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Completed);
+    }
+
+    /// Blue-green strategy: create_and_start before stop_and_remove.
+    #[tokio::test]
+    async fn test_blue_green_starts_new_before_stopping_old() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
+
+        // Seed app_states with a prior running container.
+        let mut initial_states = HashMap::new();
+        initial_states.insert(
+            "testapp".to_string(),
+            AppRuntimeState {
+                status: AppStatus::Running,
+                current_tag: Some("v0.9.0".to_string()),
+                current_container_id: Some("old-ctr".into()),
+                current_port: Some(50000),
+                ..Default::default()
+            },
+        );
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(initial_states);
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::new();
+        let call_log = docker.call_log();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            test_deploy_ctx(),
+        )
+        .await;
+
+        // Assert ordering: create_and_start before stop_and_remove.
+        let log = call_log.lock().unwrap();
+        let create_idx = log.iter().position(|s| s == "create_and_start");
+        let stop_remove_idx = log.iter().position(|s| s == "stop_and_remove");
+        assert!(
+            create_idx.is_some(),
+            "create_and_start should have been called"
+        );
+        assert!(
+            stop_remove_idx.is_some(),
+            "stop_and_remove should have been called"
+        );
+        assert!(
+            create_idx.unwrap() < stop_remove_idx.unwrap(),
+            "create_and_start should be called before stop_and_remove in blue-green strategy"
+        );
+
+        // Final status should be Completed.
+        let recorded = deploys.get("testapp").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Completed);
+    }
+
+    // ── SQLite persistence tests ─────────────────────────────────────────────
+
+    /// Deploy with MockHealth::passing persists Completed status to SQLite.
+    #[tokio::test]
+    async fn test_deploy_persists_final_status_to_sqlite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+        let db = Db::open_in_memory().unwrap();
+
+        let docker = MockDocker::new();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let ctx = test_deploy_ctx();
+
+        execute_deploy_inner(
+            make_shared_with_db(&config, &apps, &app_states, &deploys, db.clone()),
+            &docker,
+            &caddy,
+            &health,
+            ctx,
+        )
+        .await;
+
+        // Assert the deploy was persisted to SQLite with Completed status.
+        let stored = db
+            .get_deploy("dep_test001")
+            .unwrap()
+            .expect("deploy must be in SQLite");
+        assert_eq!(stored.status, DeployStatus::Completed);
+        assert!(
+            stored.finished_at.is_some(),
+            "finished_at should be set for a completed deploy"
+        );
+    }
+
+    /// Deploy with MockHealth::failing persists Failed status to SQLite.
+    #[tokio::test]
+    async fn test_failed_deploy_persists_failed_status_to_sqlite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+        let db = Db::open_in_memory().unwrap();
+
+        let docker = MockDocker::new();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::failing();
+        let ctx = test_deploy_ctx();
+
+        execute_deploy_inner(
+            make_shared_with_db(&config, &apps, &app_states, &deploys, db.clone()),
+            &docker,
+            &caddy,
+            &health,
+            ctx,
+        )
+        .await;
+
+        // Assert the deploy was persisted to SQLite with Failed status.
+        let stored = db
+            .get_deploy("dep_test001")
+            .unwrap()
+            .expect("deploy must be in SQLite");
+        assert_eq!(stored.status, DeployStatus::Failed);
+        assert!(
+            stored.finished_at.is_some(),
+            "finished_at should be set for a failed deploy"
+        );
+    }
+
+    // ── Routing guard test ───────────────────────────────────────────────────
+
+    /// HTTP (non-worker) app without routing must fail deploy with a clear error
+    /// and NO create_and_start call.
+    #[tokio::test]
+    async fn test_http_app_without_routing_fails_deploy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut app_config = test_app_config();
+        // Remove routing: no domain, no port, no routes.
+        app_config.routing = RoutingConfig {
+            domain: None,
+            port: None,
+            routes: vec![],
+        };
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), app_config);
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::new();
+        let call_log = docker.call_log();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            test_deploy_ctx(),
+        )
+        .await;
+
+        // Deploy should be Failed.
+        let recorded = deploys.get("testapp").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Failed);
+        assert!(
+            recorded
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("HTTP app requires routing"),
+            "error should mention missing routing: {:?}",
+            recorded.error
+        );
+
+        // No create_and_start should have been called.
+        let log = call_log.lock().unwrap();
+        assert!(
+            !log.contains(&"create_and_start".to_string()),
+            "create_and_start should NOT be called for app without routing: {:?}",
+            *log
         );
     }
 }
