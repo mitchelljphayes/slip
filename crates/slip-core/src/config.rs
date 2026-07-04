@@ -39,7 +39,7 @@ mod duration_serde {
         serializer.serialize_str(&format!("{secs}s"))
     }
 
-    fn parse_duration(s: &str) -> Result<Duration, String> {
+    pub(super) fn parse_duration(s: &str) -> Result<Duration, String> {
         let s = s.trim();
         if let Some(rest) = s.strip_suffix("ms") {
             let millis: u64 = rest
@@ -72,6 +72,42 @@ mod duration_serde {
         Err(format!(
             "invalid duration '{s}': expected suffix 'ms', 's', 'm', or 'h'"
         ))
+    }
+}
+
+/// Serde helpers for `Option<Duration>` — accepts `"10m"` or absent/null.
+mod duration_serde_option {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // If the field is absent or null, return None.
+        let s = Option::<String>::deserialize(deserializer)?;
+        match s {
+            None => Ok(None),
+            Some(s) => {
+                let dur =
+                    super::duration_serde::parse_duration(&s).map_err(serde::de::Error::custom)?;
+                Ok(Some(dur))
+            }
+        }
+    }
+
+    pub fn serialize<S>(duration: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match duration {
+            None => serializer.serialize_none(),
+            Some(dur) => {
+                let secs = dur.as_secs();
+                serializer.serialize_some(&format!("{secs}s"))
+            }
+        }
     }
 }
 
@@ -113,6 +149,10 @@ fn default_drain_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
+fn default_deploy_timeout() -> Duration {
+    Duration::from_secs(600)
+}
+
 fn default_network_name() -> String {
     "slip".to_owned()
 }
@@ -151,6 +191,29 @@ pub struct ServerPreviewConfig {
     pub max_cpus: Option<String>,
 }
 
+/// Server-level deploy configuration.
+///
+/// Provides defaults for all deployments on this daemon.
+/// Apps may override the timeout via [`DeployConfig::timeout`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ServerDeployConfig {
+    /// Maximum time a production deploy is allowed to run before being killed.
+    #[serde(default = "default_deploy_timeout", with = "duration_serde")]
+    pub timeout: Duration,
+    /// Maximum time a preview deploy is allowed to run before being killed.
+    #[serde(default = "default_deploy_timeout", with = "duration_serde")]
+    pub preview_timeout: Duration,
+}
+
+impl Default for ServerDeployConfig {
+    fn default() -> Self {
+        Self {
+            timeout: default_deploy_timeout(),
+            preview_timeout: default_deploy_timeout(),
+        }
+    }
+}
+
 /// Top-level daemon configuration (`slip.toml`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SlipConfig {
@@ -164,6 +227,9 @@ pub struct SlipConfig {
     /// Optional server-level preview configuration.
     #[serde(default)]
     pub preview: Option<ServerPreviewConfig>,
+    /// Optional server-level deploy configuration.
+    #[serde(default)]
+    pub deploy: Option<ServerDeployConfig>,
 }
 
 /// Container runtime backend settings.
@@ -431,6 +497,11 @@ pub struct DeployConfig {
     pub strategy: String,
     #[serde(default = "default_drain_timeout", with = "duration_serde")]
     pub drain_timeout: Duration,
+    /// Per-app deploy timeout override. If `Some`, overrides the server-level
+    /// `[deploy].timeout` (or `[deploy].preview_timeout` for previews).
+    /// If `None`, the server-level default is used.
+    #[serde(default, with = "duration_serde_option")]
+    pub timeout: Option<Duration>,
 }
 
 impl Default for DeployConfig {
@@ -438,6 +509,7 @@ impl Default for DeployConfig {
         Self {
             strategy: default_deploy_strategy(),
             drain_timeout: default_drain_timeout(),
+            timeout: None,
         }
     }
 }
@@ -1345,5 +1417,88 @@ hostname = "api.example.com"
         assert_eq!(cfg.routing.routes.len(), 1);
         assert_eq!(cfg.routing.routes[0].hostname, "api.example.com");
         assert!(cfg.routing.routes[0].port.is_none());
+    }
+
+    // ── Deploy timeout config tests ──────────────────────────────────────────
+
+    #[test]
+    fn parse_slip_config_with_deploy_section() {
+        let toml = r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+
+[deploy]
+timeout = "5m"
+preview_timeout = "15m"
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        let deploy = cfg.deploy.expect("deploy config should be present");
+        assert_eq!(deploy.timeout, Duration::from_secs(300));
+        assert_eq!(deploy.preview_timeout, Duration::from_secs(900));
+    }
+
+    #[test]
+    fn parse_slip_config_deploy_defaults() {
+        let toml = r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.deploy.is_none(), "deploy should be None when absent");
+    }
+
+    #[test]
+    fn parse_app_config_with_timeout_override() {
+        let toml = r#"
+[app]
+name = "myapp"
+image = "ghcr.io/org/myapp:latest"
+
+[routing]
+domain = "myapp.example.com"
+port = 3000
+
+[health]
+
+[deploy]
+timeout = "30s"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.deploy.timeout, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn parse_app_config_timeout_defaults_to_none() {
+        let toml = r#"
+[app]
+name = "myapp"
+image = "ghcr.io/org/myapp:latest"
+
+[routing]
+domain = "myapp.example.com"
+port = 3000
+
+[health]
+
+[deploy]
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.deploy.timeout, None);
     }
 }

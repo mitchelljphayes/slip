@@ -255,6 +255,7 @@ mod tests {
             deploy: DeployConfig {
                 strategy: "blue-green".to_string(),
                 drain_timeout: Duration::from_secs(30),
+                timeout: None,
             },
             env: HashMap::new(),
             env_file: None,
