@@ -495,16 +495,25 @@ fn update_preview_deploy_status(
 /// This function is designed to be called inside a `tokio::spawn`. It drives
 /// the preview deploy state machine through: Pull → Configure → Start →
 /// HealthCheck → SetRoute → Complete (or Fail at any step).
+///
+/// The deploy is wrapped in a configurable timeout. If the timeout fires, the
+/// preview is marked as Failed and the preview lock (held by the spawn caller)
+/// is released when this function returns.
 pub async fn execute_preview_deploy(state: Arc<crate::api::AppState>, ctx: PreviewDeployContext) {
-    let app_config = match state.apps.read().await.get(&ctx.app_name) {
+    let app_name = ctx.app_name.clone();
+    let preview_id = ctx.preview_id.clone();
+    let state_key = format!("{app_name}:{preview_id}");
+
+    let app_config = match state.apps.read().await.get(&app_name) {
         Some(cfg) => cfg.clone(),
         None => {
-            tracing::error!(app = %ctx.app_name, "preview deploy: app not found in config");
-            let key = format!("{}:{}", ctx.app_name, ctx.preview_id);
-            update_preview_status(&state.preview_states, &key, AppStatus::Failed);
+            tracing::error!(app = %app_name, "preview deploy: app not found in config");
+            update_preview_status(&state.preview_states, &state_key, AppStatus::Failed);
             return;
         }
     };
+
+    let timeout_dur = crate::deploy::resolve_preview_timeout(&state.config, &app_config.deploy);
 
     let shared = PreviewSharedState {
         config: state.config.clone(),
@@ -515,16 +524,33 @@ pub async fn execute_preview_deploy(state: Arc<crate::api::AppState>, ctx: Previ
         secrets_store: Some(state.secrets_store.clone()),
     };
 
-    if let Err(e) = execute_preview_deploy_inner(
-        shared,
-        state.runtime.as_ref(),
-        &state.caddy,
-        &state.health,
-        ctx,
+    let result = tokio::time::timeout(
+        timeout_dur,
+        execute_preview_deploy_inner(
+            shared,
+            state.runtime.as_ref(),
+            &state.caddy,
+            &state.health,
+            ctx,
+        ),
     )
-    .await
-    {
-        tracing::error!(error = %e, "preview deploy failed");
+    .await;
+
+    match result {
+        Ok(Ok(())) => {
+            // Inner function handled success.
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "preview deploy failed");
+        }
+        Err(_elapsed) => {
+            let msg = format!(
+                "preview deploy timed out after {}",
+                crate::deploy::format_duration(timeout_dur)
+            );
+            tracing::error!(app = %app_name, preview_id = %preview_id, "{}", msg);
+            fail_preview(&state.preview_states, &state_key);
+        }
     }
 }
 
@@ -1364,6 +1390,7 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use dashmap::DashMap;
     use tempfile::TempDir;
+    use tokio::sync::RwLock;
 
     use super::*;
     use crate::caddy::{ReverseProxy, Route};
@@ -1381,6 +1408,7 @@ mod tests {
 
     struct MockDocker {
         pull_ok: bool,
+        hung: bool,
         container_id: String,
         container_port: u16,
         stop_count: Arc<AtomicU32>,
@@ -1400,6 +1428,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 pull_ok: true,
+                hung: false,
                 container_id: "preview-container-id".to_string(),
                 container_port: 54321,
                 stop_count: Arc::new(AtomicU32::new(0)),
@@ -1423,6 +1452,13 @@ mod tests {
         fn failing_pull() -> Self {
             Self {
                 pull_ok: false,
+                ..Self::new()
+            }
+        }
+
+        fn hung_pull() -> Self {
+            Self {
+                hung: true,
                 ..Self::new()
             }
         }
@@ -1509,6 +1545,12 @@ mod tests {
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
         > {
+            if self.hung {
+                return Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(u64::MAX)).await;
+                    Ok(())
+                });
+            }
             let result = if self.pull_ok {
                 Ok(())
             } else {
@@ -1838,6 +1880,7 @@ mod tests {
                 max_memory: None,
                 max_cpus: None,
             }),
+            deploy: None,
         }
     }
 
@@ -1863,6 +1906,7 @@ mod tests {
             deploy: DeployConfig {
                 strategy: "blue-green".to_string(),
                 drain_timeout: Duration::ZERO,
+                timeout: None,
             },
             env: HashMap::new(),
             env_file: None,
@@ -3382,5 +3426,74 @@ enabled = true
         }];
         let preview = super::derive_preview_volumes(&volumes, "test-1");
         assert!(preview[0].read_only);
+    }
+
+    // ── Preview deploy timeout tests ──────────────────────────────────────────
+
+    /// Build an `AppState` for preview timeout tests.
+    fn make_preview_timeout_test_state(
+        docker: MockDocker,
+        timeout_secs: u64,
+    ) -> Arc<crate::api::AppState> {
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+
+        let secrets_tmp = tempfile::tempdir().expect("tempdir for secrets");
+        let secrets_path = secrets_tmp.path().to_path_buf();
+        Box::leak(Box::new(secrets_tmp));
+
+        let mut config = test_slip_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        config.deploy = Some(crate::config::ServerDeployConfig {
+            timeout: Duration::from_secs(timeout_secs),
+            preview_timeout: Duration::from_secs(timeout_secs),
+        });
+
+        Arc::new(crate::api::AppState {
+            config,
+            apps: RwLock::new(apps),
+            config_dir: std::path::PathBuf::from("/tmp/slip-test"),
+            deploy_locks: DashMap::new(),
+            runtime: Arc::new(docker),
+            caddy: crate::caddy::CaddyClient::new("http://127.0.0.1:19999".to_string()),
+            health: crate::health::HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
+            db: crate::db::Db::open_in_memory().unwrap(),
+            started_at: chrono::Utc::now(),
+            preview_states: Arc::new(DashMap::new()),
+            preview_locks: DashMap::new(),
+            secrets_store: crate::secrets::SecretsStore::new(secrets_path).unwrap(),
+        })
+    }
+
+    /// A hung preview pull should time out and mark the preview as Failed.
+    #[tokio::test(start_paused = true)]
+    async fn test_preview_deploy_timeout() {
+        let docker = MockDocker::hung_pull();
+        let state = make_preview_timeout_test_state(docker, 1);
+
+        let ctx = PreviewDeployContext {
+            deploy_id: "dep_preview_timeout".to_string(),
+            app_name: "testapp".to_string(),
+            image: "ghcr.io/org/testapp".to_string(),
+            tag: "sha-abc123".to_string(),
+            preview_id: "pr-timeout".to_string(),
+            sha: "abc123def456".to_string(),
+            images: HashMap::new(),
+        };
+
+        execute_preview_deploy(state.clone(), ctx).await;
+
+        // Preview state should be Failed.
+        let state_entry = state.preview_states.get("testapp:pr-timeout");
+        assert!(
+            state_entry.is_some(),
+            "preview state should exist after deploy attempt"
+        );
+        assert_eq!(
+            state_entry.unwrap().status,
+            AppStatus::Failed,
+            "preview should be marked as Failed after timeout"
+        );
     }
 }

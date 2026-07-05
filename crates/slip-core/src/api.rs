@@ -1533,6 +1533,7 @@ mod tests {
             storage: StorageConfig::default(),
             runtime: RuntimeConfig::default(),
             preview: None,
+            deploy: None,
         }
     }
 

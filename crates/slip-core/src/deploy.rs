@@ -143,9 +143,49 @@ impl DeployContext {
     }
 }
 
-// ─── App runtime state ────────────────────────────────────────────────────────
+// ─── Timeout resolution ────────────────────────────────────────────────────────
 
-/// Runtime state for a single route of a deployed app.
+/// Resolve the effective deploy timeout for a production deploy.
+///
+/// Resolution order:
+/// 1. Per-app `DeployConfig.timeout` (if `Some`)
+/// 2. Server-level `[deploy].timeout` (if `Some`)
+/// 3. Hardcoded default of 10 minutes
+pub(crate) fn resolve_deploy_timeout(
+    config: &crate::config::SlipConfig,
+    app_config: &crate::config::DeployConfig,
+) -> std::time::Duration {
+    app_config
+        .timeout
+        .or_else(|| config.deploy.as_ref().map(|d| d.timeout))
+        .unwrap_or_else(|| std::time::Duration::from_secs(600))
+}
+
+/// Resolve the effective deploy timeout for a preview deploy.
+///
+/// Resolution order:
+/// 1. Per-app `DeployConfig.timeout` (if `Some`)
+/// 2. Server-level `[deploy].preview_timeout` (if `Some`)
+/// 3. Hardcoded default of 10 minutes
+pub(crate) fn resolve_preview_timeout(
+    config: &crate::config::SlipConfig,
+    app_config: &crate::config::DeployConfig,
+) -> std::time::Duration {
+    app_config
+        .timeout
+        .or_else(|| config.deploy.as_ref().map(|d| d.preview_timeout))
+        .unwrap_or_else(|| std::time::Duration::from_secs(600))
+}
+
+/// Format a duration for error messages, e.g. "10m0s".
+pub(crate) fn format_duration(dur: std::time::Duration) -> String {
+    let total_secs = dur.as_secs();
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    format!("{mins}m{secs}s")
+}
+
+// ─── App runtime state
 #[derive(Debug, Clone)]
 pub struct RouteState {
     pub hostname: String,
@@ -204,7 +244,19 @@ pub(crate) struct DeploySharedState<'a> {
 /// This function is designed to be called inside a `tokio::spawn`. It drives
 /// the deploy state machine through: Pull → Start → Health Check → Switch →
 /// Drain Old → Complete (or Fail at any step).
-pub async fn execute_deploy(state: Arc<AppState>, ctx: DeployContext) {
+///
+/// The deploy is wrapped in a configurable timeout. If the timeout fires, the
+/// deploy is recorded as Failed and the deploy lock (held by the spawn caller)
+/// is released when this function returns.
+pub async fn execute_deploy(state: Arc<AppState>, mut ctx: DeployContext) {
+    // Read app config and resolve timeout before building shared state.
+    let app_name = ctx.app.clone();
+    let app_config = state.apps.read().await.get(&app_name).cloned();
+    let timeout_dur = app_config
+        .as_ref()
+        .map(|cfg| resolve_deploy_timeout(&state.config, &cfg.deploy))
+        .unwrap_or_else(|| std::time::Duration::from_secs(600));
+
     let shared = DeploySharedState {
         config: &state.config,
         apps: &state.apps,
@@ -214,14 +266,41 @@ pub async fn execute_deploy(state: Arc<AppState>, ctx: DeployContext) {
         credentials: state.registry_credentials(),
         secrets_store: Some(&state.secrets_store),
     };
-    execute_deploy_inner(
-        shared,
-        state.runtime.as_ref(),
-        &state.caddy,
-        &state.health,
-        ctx,
+
+    let result = tokio::time::timeout(
+        timeout_dur,
+        execute_deploy_inner(
+            shared,
+            state.runtime.as_ref(),
+            &state.caddy,
+            &state.health,
+            &mut ctx,
+        ),
     )
     .await;
+
+    match result {
+        Ok(()) => {
+            // Inner function handled success/failure recording internally.
+        }
+        Err(_elapsed) => {
+            let msg = format!("deploy timed out after {}", format_duration(timeout_dur));
+            ctx.fail(&msg);
+
+            // Use `state` directly (NOT the borrowed `shared`) to avoid
+            // holding the `'_` lifetime across the timeout boundary.
+            state.deploys.insert(ctx.app.clone(), ctx.clone());
+            if let Err(e) = state.db.insert_deploy(&ctx) {
+                tracing::error!(
+                    deploy_id = %ctx.id,
+                    app = %ctx.app,
+                    error = %e,
+                    "failed to persist timed-out deploy to SQLite"
+                );
+            }
+            set_app_failed(&state.app_states, &app_name);
+        }
+    }
 }
 
 /// Inner deploy state machine — generic over trait objects so it can be driven
@@ -231,14 +310,14 @@ pub(crate) async fn execute_deploy_inner(
     runtime: &dyn RuntimeBackend,
     caddy: &dyn ReverseProxy,
     health: &dyn HealthCheck,
-    mut ctx: DeployContext,
+    ctx: &mut DeployContext,
 ) {
     let app_name = ctx.app.clone();
     let app_config = match shared.apps.read().await.get(&app_name) {
         Some(cfg) => cfg.clone(),
         None => {
             ctx.fail(&format!("app '{}' not found in config", app_name));
-            record_deploy(&shared, &ctx);
+            record_deploy(&shared, ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
         }
@@ -254,7 +333,7 @@ pub(crate) async fn execute_deploy_inner(
 
     // ── PULL ─────────────────────────────────────────────────────────────────
     ctx.status = DeployStatus::Pulling;
-    record_deploy(&shared, &ctx);
+    record_deploy(&shared, ctx);
     tracing::info!(
         app = %app_name,
         tag = %ctx.tag,
@@ -267,7 +346,7 @@ pub(crate) async fn execute_deploy_inner(
         .await
     {
         ctx.fail(&format!("image pull failed: {e}"));
-        record_deploy(&shared, &ctx);
+        record_deploy(&shared, ctx);
         set_app_failed(shared.app_states, &app_name);
         return;
     }
@@ -289,7 +368,7 @@ pub(crate) async fn execute_deploy_inner(
             ctx.fail(&format!(
                 "sidecar image pull failed for '{container_name}': {e}"
             ));
-            record_deploy(&shared, &ctx);
+            record_deploy(&shared, ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
         }
@@ -297,7 +376,7 @@ pub(crate) async fn execute_deploy_inner(
 
     // ── EXTRACT + MERGE CONFIG ────────────────────────────────────────────────
     ctx.status = DeployStatus::Configuring;
-    record_deploy(&shared, &ctx);
+    record_deploy(&shared, ctx);
 
     let merged = match runtime
         .extract_file(&ctx.image, &ctx.tag, "/slip/slip.toml")
@@ -312,7 +391,7 @@ pub(crate) async fn execute_deploy_inner(
                             "repo config app name '{}' does not match deploy app '{}'",
                             repo_config.app.name, app_name
                         ));
-                        record_deploy(&shared, &ctx);
+                        record_deploy(&shared, ctx);
                         set_app_failed(shared.app_states, &app_name);
                         return;
                     }
@@ -320,7 +399,7 @@ pub(crate) async fn execute_deploy_inner(
                         Ok(merged) => Some(merged),
                         Err(e) => {
                             ctx.fail(&format!("config merge failed: {e}"));
-                            record_deploy(&shared, &ctx);
+                            record_deploy(&shared, ctx);
                             set_app_failed(shared.app_states, &app_name);
                             return;
                         }
@@ -328,7 +407,7 @@ pub(crate) async fn execute_deploy_inner(
                 }
                 Err(e) => {
                     ctx.fail(&format!("failed to parse repo config: {e}"));
-                    record_deploy(&shared, &ctx);
+                    record_deploy(&shared, ctx);
                     set_app_failed(shared.app_states, &app_name);
                     return;
                 }
@@ -347,7 +426,7 @@ pub(crate) async fn execute_deploy_inner(
         }
         Err(e) => {
             ctx.fail(&format!("failed to extract config from image: {e}"));
-            record_deploy(&shared, &ctx);
+            record_deploy(&shared, ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
         }
@@ -378,7 +457,7 @@ pub(crate) async fn execute_deploy_inner(
         let has_port = effective_config.routing.port.is_some_and(|p| p > 0);
         if !(has_routes || (has_domain && has_port)) {
             ctx.fail("HTTP app requires routing.domain+port or [[routing.routes]]");
-            record_deploy(&shared, &ctx);
+            record_deploy(&shared, ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
         }
@@ -392,7 +471,7 @@ pub(crate) async fn execute_deploy_inner(
                     runtime,
                     caddy,
                     health,
-                    &mut ctx,
+                    ctx,
                     &effective_config,
                     &merged,
                     &env_vars,
@@ -406,7 +485,7 @@ pub(crate) async fn execute_deploy_inner(
                     runtime,
                     caddy,
                     health,
-                    &mut ctx,
+                    ctx,
                     &effective_config,
                     &merged,
                     &env_vars,
@@ -428,7 +507,7 @@ pub(crate) async fn execute_deploy_inner(
                     runtime,
                     caddy,
                     health,
-                    &mut ctx,
+                    ctx,
                     &effective_config,
                     &merged,
                     &env_vars,
@@ -442,7 +521,7 @@ pub(crate) async fn execute_deploy_inner(
                     runtime,
                     caddy,
                     health,
-                    &mut ctx,
+                    ctx,
                     &effective_config,
                     &merged,
                     &env_vars,
@@ -454,7 +533,7 @@ pub(crate) async fn execute_deploy_inner(
         }
         other => {
             ctx.fail(&format!("unknown deploy strategy: {other}"));
-            record_deploy(&shared, &ctx);
+            record_deploy(&shared, ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
         }
@@ -464,7 +543,7 @@ pub(crate) async fn execute_deploy_inner(
     if ctx.status != DeployStatus::Failed {
         ctx.status = DeployStatus::Completed;
         ctx.finished_at = Some(Utc::now());
-        record_deploy(&shared, &ctx);
+        record_deploy(&shared, ctx);
         tracing::info!(
             app = %app_name,
             tag = %ctx.tag,
@@ -1703,6 +1782,8 @@ mod tests {
     struct MockDocker {
         /// Whether `pull_image` should succeed.
         pull_ok: bool,
+        /// If true, `pull_image` returns a future that never completes (for timeout tests).
+        hung: bool,
         /// Container ID + port returned by `create_and_start`.
         container_id: String,
         container_port: u16,
@@ -1740,6 +1821,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 pull_ok: true,
+                hung: false,
                 container_id: "mock-container-id".to_string(),
                 container_port: 54321,
                 stop_count: Arc::new(AtomicU32::new(0)),
@@ -1762,6 +1844,15 @@ mod tests {
         fn failing_pull() -> Self {
             Self {
                 pull_ok: false,
+                ..Self::new()
+            }
+        }
+
+        /// Create a mock where `pull_image` never completes (sleeps forever).
+        /// Used with `#[tokio::test(start_paused = true)]` to test deploy timeouts.
+        fn hung_pull() -> Self {
+            Self {
+                hung: true,
                 ..Self::new()
             }
         }
@@ -1874,6 +1965,14 @@ mod tests {
             Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
         > {
             self.call_log.lock().unwrap().push("pull_image".to_string());
+            if self.hung {
+                // Return a future that never completes (sleeps forever).
+                // Under `start_paused = true`, this will cause the timeout to fire.
+                return Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(u64::MAX)).await;
+                    Ok(())
+                });
+            }
             let result = if self.pull_ok {
                 Ok(())
             } else {
@@ -2201,6 +2300,7 @@ mod tests {
             storage: StorageConfig { path: storage_path },
             runtime: crate::config::RuntimeConfig::default(),
             preview: None,
+            deploy: None,
         }
     }
 
@@ -2228,6 +2328,7 @@ mod tests {
                 strategy: "blue-green".to_string(),
                 // Zero drain timeout so tests don't sleep.
                 drain_timeout: Duration::ZERO,
+                timeout: None,
             },
             env: HashMap::new(),
             env_file: None,
@@ -2302,14 +2403,14 @@ mod tests {
         let docker = MockDocker::new();
         let caddy = MockCaddy::success();
         let health = MockHealth::passing();
-        let ctx = test_deploy_ctx();
+        let mut ctx = test_deploy_ctx();
 
         execute_deploy_inner(
             make_shared(&config, &apps, &app_states, &deploys),
             &docker,
             &caddy,
             &health,
-            ctx,
+            &mut ctx,
         )
         .await;
 
@@ -2353,7 +2454,7 @@ mod tests {
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -2400,7 +2501,7 @@ mod tests {
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -2442,7 +2543,7 @@ mod tests {
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -2493,7 +2594,7 @@ mod tests {
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -2555,7 +2656,7 @@ mod tests {
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -2621,14 +2722,14 @@ memory = "256m"
         let docker = MockDocker::with_repo_config(valid_repo_config_bytes("testapp"));
         let caddy = MockCaddy::success();
         let health = MockHealth::passing();
-        let ctx = test_deploy_ctx();
+        let mut ctx = test_deploy_ctx();
 
         execute_deploy_inner(
             make_shared(&config, &apps, &app_states, &deploys),
             &docker,
             &caddy,
             &health,
-            ctx,
+            &mut ctx,
         )
         .await;
 
@@ -2653,14 +2754,14 @@ memory = "256m"
         let docker = MockDocker::with_no_repo_config();
         let caddy = MockCaddy::success();
         let health = MockHealth::passing();
-        let ctx = test_deploy_ctx();
+        let mut ctx = test_deploy_ctx();
 
         execute_deploy_inner(
             make_shared(&config, &apps, &app_states, &deploys),
             &docker,
             &caddy,
             &health,
-            ctx,
+            &mut ctx,
         )
         .await;
 
@@ -2691,7 +2792,7 @@ memory = "256m"
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -2722,14 +2823,14 @@ memory = "256m"
         let docker = MockDocker::new();
         let caddy = MockCaddy::success();
         let health = MockHealth::passing();
-        let ctx = test_deploy_ctx();
+        let mut ctx = test_deploy_ctx();
 
         execute_deploy_inner(
             make_shared(&config, &apps, &app_states, &deploys),
             &docker,
             &caddy,
             &health,
-            ctx,
+            &mut ctx,
         )
         .await;
 
@@ -2762,7 +2863,7 @@ memory = "256m"
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -2798,7 +2899,7 @@ memory = "256m"
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -2883,14 +2984,14 @@ path = "/health"
         let teardown_count = docker.teardown_count();
         let caddy = MockCaddy::success();
         let health = MockHealth::passing();
-        let ctx = pod_deploy_ctx();
+        let mut ctx = pod_deploy_ctx();
 
         execute_deploy_inner(
             make_shared(&config, &apps, &app_states, &deploys),
             &docker,
             &caddy,
             &health,
-            ctx,
+            &mut ctx,
         )
         .await;
 
@@ -2948,7 +3049,7 @@ path = "/health"
             &docker,
             &caddy,
             &health,
-            pod_deploy_ctx(),
+            &mut pod_deploy_ctx(),
         )
         .await;
 
@@ -3013,7 +3114,7 @@ container = "web"
             &docker,
             &caddy,
             &health,
-            pod_deploy_ctx(),
+            &mut pod_deploy_ctx(),
         )
         .await;
 
@@ -3052,7 +3153,7 @@ container = "web"
             &docker,
             &caddy,
             &health,
-            pod_deploy_ctx(),
+            &mut pod_deploy_ctx(),
         )
         .await;
 
@@ -3109,7 +3210,7 @@ container = "web"
             &docker,
             &caddy,
             &health,
-            pod_deploy_ctx(),
+            &mut pod_deploy_ctx(),
         )
         .await;
 
@@ -3154,7 +3255,7 @@ container = "web"
         let caddy = MockCaddy::success();
         let health = MockHealth::passing();
 
-        let ctx = DeployContext::new(
+        let mut ctx = DeployContext::new(
             "dep_rollback001".to_string(),
             "testapp".to_string(),
             "ghcr.io/org/testapp".to_string(),
@@ -3167,7 +3268,7 @@ container = "web"
             &docker,
             &caddy,
             &health,
-            ctx,
+            &mut ctx,
         )
         .await;
 
@@ -3211,7 +3312,7 @@ container = "web"
         let health = MockHealth::passing();
 
         // Deploy v1.0 — simulating a rollback.
-        let ctx = DeployContext::new(
+        let mut ctx = DeployContext::new(
             "dep_rollback002".to_string(),
             "testapp".to_string(),
             "ghcr.io/org/testapp".to_string(),
@@ -3224,7 +3325,7 @@ container = "web"
             &docker,
             &caddy,
             &health,
-            ctx,
+            &mut ctx,
         )
         .await;
 
@@ -3413,6 +3514,7 @@ container = "web"
             deploy: DeployConfig {
                 strategy: "recreate".to_string(),
                 drain_timeout: Duration::ZERO,
+                timeout: None,
             },
             ..test_app_config()
         }
@@ -3456,7 +3558,7 @@ container = "web"
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -3516,7 +3618,7 @@ container = "web"
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -3567,7 +3669,7 @@ container = "web"
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -3632,7 +3734,7 @@ container = "web"
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -3687,7 +3789,7 @@ container = "web"
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -3739,7 +3841,7 @@ container = "web"
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -3798,7 +3900,7 @@ container = "web"
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -3855,7 +3957,7 @@ container = "web"
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -3898,14 +4000,14 @@ container = "web"
         let docker = MockDocker::new();
         let caddy = MockCaddy::success();
         let health = MockHealth::passing();
-        let ctx = test_deploy_ctx();
+        let mut ctx = test_deploy_ctx();
 
         execute_deploy_inner(
             make_shared_with_db(&config, &apps, &app_states, &deploys, db.clone()),
             &docker,
             &caddy,
             &health,
-            ctx,
+            &mut ctx,
         )
         .await;
 
@@ -3936,14 +4038,14 @@ container = "web"
         let docker = MockDocker::new();
         let caddy = MockCaddy::success();
         let health = MockHealth::failing();
-        let ctx = test_deploy_ctx();
+        let mut ctx = test_deploy_ctx();
 
         execute_deploy_inner(
             make_shared_with_db(&config, &apps, &app_states, &deploys, db.clone()),
             &docker,
             &caddy,
             &health,
-            ctx,
+            &mut ctx,
         )
         .await;
 
@@ -3990,7 +4092,7 @@ container = "web"
             &docker,
             &caddy,
             &health,
-            test_deploy_ctx(),
+            &mut test_deploy_ctx(),
         )
         .await;
 
@@ -4013,6 +4115,185 @@ container = "web"
             !log.contains(&"create_and_start".to_string()),
             "create_and_start should NOT be called for app without routing: {:?}",
             *log
+        );
+    }
+
+    // ── Deploy timeout tests ──────────────────────────────────────────────────
+
+    /// Build an `AppState` with a mock runtime for timeout tests.
+    /// Uses a 1-second server-level deploy timeout so the test completes quickly
+    /// under `start_paused = true`.
+    fn make_timeout_test_state(docker: MockDocker, timeout_secs: u64) -> Arc<crate::api::AppState> {
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+
+        let secrets_tmp = tempfile::tempdir().expect("tempdir for secrets");
+        let secrets_path = secrets_tmp.path().to_path_buf();
+        Box::leak(Box::new(secrets_tmp));
+
+        let mut config = test_slip_config(tempfile::tempdir().unwrap().path().to_path_buf());
+        config.deploy = Some(crate::config::ServerDeployConfig {
+            timeout: Duration::from_secs(timeout_secs),
+            preview_timeout: Duration::from_secs(timeout_secs),
+        });
+
+        Arc::new(crate::api::AppState {
+            config,
+            apps: RwLock::new(apps),
+            config_dir: std::path::PathBuf::from("/tmp/slip-test"),
+            deploy_locks: DashMap::new(),
+            runtime: Arc::new(docker),
+            caddy: crate::caddy::CaddyClient::new("http://127.0.0.1:19999".to_string()),
+            health: crate::health::HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
+            db: crate::db::Db::open_in_memory().unwrap(),
+            started_at: chrono::Utc::now(),
+            preview_states: Arc::new(DashMap::new()),
+            preview_locks: DashMap::new(),
+            secrets_store: crate::secrets::SecretsStore::new(secrets_path).unwrap(),
+        })
+    }
+
+    /// A hung pull should time out and record the deploy as Failed.
+    #[tokio::test(start_paused = true)]
+    async fn test_deploy_timeout_fires_and_records_failure() {
+        let docker = MockDocker::hung_pull();
+        let state = make_timeout_test_state(docker, 1);
+
+        // Acquire the deploy lock (simulates what the API handler does).
+        let lock = state
+            .deploy_locks
+            .entry("testapp".to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let guard = lock
+            .clone()
+            .try_lock_owned()
+            .expect("lock should be available");
+
+        let ctx = DeployContext::new(
+            "dep_timeout001".to_string(),
+            "testapp".to_string(),
+            "ghcr.io/org/testapp".to_string(),
+            "v1.0.0".to_string(),
+            TriggerSource::Webhook,
+        );
+
+        execute_deploy(state.clone(), ctx).await;
+
+        // The deploy should be recorded as Failed with a timeout error.
+        let recorded = state.deploys.get("testapp").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Failed);
+        assert!(
+            recorded
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("timed out"),
+            "error should mention 'timed out': {:?}",
+            recorded.error
+        );
+
+        // App runtime state should be Failed.
+        let app_states = state.app_states.read().await;
+        if let Some(app_state) = app_states.get("testapp") {
+            assert_eq!(app_state.status, AppStatus::Failed);
+        }
+
+        // The lock guard should still be held (we haven't dropped it yet).
+        // Drop it and verify the lock is re-acquirable.
+        drop(guard);
+        let reacquired = lock.try_lock();
+        assert!(
+            reacquired.is_ok(),
+            "deploy lock should be re-acquirable after timeout"
+        );
+    }
+
+    /// After a timeout, the deploy lock must be released so a new deploy can start.
+    #[tokio::test(start_paused = true)]
+    async fn test_deploy_timeout_releases_lock() {
+        let docker = MockDocker::hung_pull();
+        let state = make_timeout_test_state(docker, 1);
+
+        let lock = state
+            .deploy_locks
+            .entry("testapp".to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let guard = lock
+            .clone()
+            .try_lock_owned()
+            .expect("lock should be available");
+
+        let ctx = DeployContext::new(
+            "dep_timeout002".to_string(),
+            "testapp".to_string(),
+            "ghcr.io/org/testapp".to_string(),
+            "v1.0.0".to_string(),
+            TriggerSource::Webhook,
+        );
+
+        execute_deploy(state.clone(), ctx).await;
+
+        // Drop the guard that was moved into the spawn (simulated by the wrapper).
+        drop(guard);
+
+        // The lock should now be re-acquirable.
+        let reacquired = lock.try_lock();
+        assert!(
+            reacquired.is_ok(),
+            "deploy lock must be re-acquirable after timeout completes"
+        );
+    }
+
+    /// A fast deploy (non-hung mock) should succeed even under a timeout.
+    /// Uses `execute_deploy_inner` directly (like all other tests) since the
+    /// wrapper `execute_deploy` uses real Caddy/Health clients from AppState.
+    #[tokio::test(start_paused = true)]
+    async fn test_fast_deploy_succeeds_under_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = test_slip_config(tmp.path().to_path_buf());
+        config.deploy = Some(crate::config::ServerDeployConfig {
+            timeout: Duration::from_secs(600),
+            preview_timeout: Duration::from_secs(600),
+        });
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::new();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+        let mut ctx = test_deploy_ctx();
+
+        // Wrap the inner call in a timeout to verify it completes before the deadline.
+        let result = tokio::time::timeout(
+            Duration::from_secs(600),
+            execute_deploy_inner(
+                make_shared(&config, &apps, &app_states, &deploys),
+                &docker,
+                &caddy,
+                &health,
+                &mut ctx,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "inner deploy should complete before timeout"
+        );
+
+        let recorded = deploys.get("testapp").unwrap();
+        assert_eq!(
+            recorded.status,
+            DeployStatus::Completed,
+            "fast deploy should complete: {:?}",
+            recorded.error
         );
     }
 }
