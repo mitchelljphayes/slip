@@ -499,13 +499,11 @@ async fn verify_preview_auth(
         .get("X-Slip-Signature")
         .and_then(|v| v.to_str().ok())
     {
-        let app_cfg = state
-            .apps
-            .read()
-            .await
-            .get(app)
-            .cloned()
-            .ok_or_else(|| AppError::NotFound(format!("unknown app: {app}")))?;
+        let app_cfg = state.apps.read().await.get(app).cloned().ok_or_else(|| {
+            AppError::NotFound(format!(
+                "unknown app: {app} — register it via POST /v1/apps or run `slip apply`"
+            ))
+        })?;
 
         let secret = resolve_secret(
             app_cfg.app.secret.as_deref(),
@@ -631,9 +629,12 @@ async fn handle_get_app(
     Path(name): Path<String>,
 ) -> Result<(StatusCode, Json<AppResponse>), AppError> {
     let apps = state.apps.read().await;
-    let app_config = apps
-        .get(&name)
-        .ok_or_else(|| AppError::NotFound(format!("app '{}' not found", name)))?;
+    let app_config = apps.get(&name).ok_or_else(|| {
+        AppError::NotFound(format!(
+            "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+            name
+        ))
+    })?;
     Ok((StatusCode::OK, Json(AppResponse::from(app_config))))
 }
 
@@ -648,7 +649,12 @@ async fn handle_update_app(
         let mut apps = state.apps.write().await;
         let existing = apps
             .get(&name)
-            .ok_or_else(|| AppError::NotFound(format!("app '{}' not found", name)))?
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+                    name
+                ))
+            })?
             .clone();
 
         let mut updated = existing.clone();
@@ -712,7 +718,10 @@ async fn handle_delete_app(
     {
         let mut apps = state.apps.write().await;
         if apps.remove(&name).is_none() {
-            return Err(AppError::NotFound(format!("app '{}' not found", name)));
+            return Err(AppError::NotFound(format!(
+                "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+                name
+            )));
         }
     }
 
@@ -778,13 +787,12 @@ async fn handle_rollback(
     Json(req): Json<RollbackRequest>,
 ) -> Result<(StatusCode, Json<DeployResponse>), AppError> {
     // Look up app config.
-    let app_cfg = state
-        .apps
-        .read()
-        .await
-        .get(&name)
-        .cloned()
-        .ok_or_else(|| AppError::NotFound(format!("app '{}' not found", name)))?;
+    let app_cfg = state.apps.read().await.get(&name).cloned().ok_or_else(|| {
+        AppError::NotFound(format!(
+            "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+            name
+        ))
+    })?;
 
     // Resolve target tag.
     let target_tag = match req.to {
@@ -895,7 +903,10 @@ async fn handle_list_secrets(
     {
         let apps = state.apps.read().await;
         if !apps.contains_key(&name) {
-            return Err(AppError::NotFound(format!("app '{}' not found", name)));
+            return Err(AppError::NotFound(format!(
+                "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+                name
+            )));
         }
     }
 
@@ -920,7 +931,10 @@ async fn handle_set_secrets(
     {
         let apps = state.apps.read().await;
         if !apps.contains_key(&name) {
-            return Err(AppError::NotFound(format!("app '{}' not found", name)));
+            return Err(AppError::NotFound(format!(
+                "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+                name
+            )));
         }
     }
 
@@ -964,7 +978,10 @@ async fn handle_remove_secret(
     {
         let apps = state.apps.read().await;
         if !apps.contains_key(&name) {
-            return Err(AppError::NotFound(format!("app '{}' not found", name)));
+            return Err(AppError::NotFound(format!(
+                "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+                name
+            )));
         }
     }
 
@@ -1027,7 +1044,10 @@ async fn handle_set_deploy_key(
     {
         let apps = state.apps.read().await;
         if !apps.contains_key(&name) {
-            return Err(AppError::NotFound(format!("app '{}' not found", name)));
+            return Err(AppError::NotFound(format!(
+                "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+                name
+            )));
         }
     }
 
@@ -1119,7 +1139,12 @@ async fn handle_deploy(
         .await
         .get(&request.app)
         .cloned()
-        .ok_or_else(|| AppError::NotFound(format!("unknown app: {}", request.app)))?;
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "unknown app: {} — register it via POST /v1/apps or run `slip apply`",
+                request.app
+            ))
+        })?;
 
     // 5. Resolve HMAC secret (deploy key → app TOML → global fallback).
     let secret = resolve_secret(
@@ -1474,7 +1499,9 @@ async fn handle_preview_teardown(
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     // Validate app exists.
     if !state.apps.read().await.contains_key(&app) {
-        return Err(AppError::NotFound(format!("unknown app: {app}")));
+        return Err(AppError::NotFound(format!(
+            "unknown app: {app} — register it via POST /v1/apps or run `slip apply`"
+        )));
     }
 
     // Verify auth (Bearer token or HMAC).
@@ -1505,7 +1532,9 @@ async fn handle_list_previews(
 ) -> Result<(StatusCode, Json<Vec<PreviewStatusResponse>>), AppError> {
     // Validate app exists.
     if !state.apps.read().await.contains_key(&app) {
-        return Err(AppError::NotFound(format!("unknown app: {app}")));
+        return Err(AppError::NotFound(format!(
+            "unknown app: {app} — register it via POST /v1/apps or run `slip apply`"
+        )));
     }
 
     let prefix = format!("{app}:");
@@ -1529,7 +1558,9 @@ async fn handle_preview_status(
 ) -> Result<(StatusCode, Json<PreviewStatusResponse>), AppError> {
     // Validate app exists.
     if !state.apps.read().await.contains_key(&app) {
-        return Err(AppError::NotFound(format!("unknown app: {app}")));
+        return Err(AppError::NotFound(format!(
+            "unknown app: {app} — register it via POST /v1/apps or run `slip apply`"
+        )));
     }
 
     let key = format!("{app}:{preview_id}");
@@ -1551,7 +1582,9 @@ async fn handle_preview_teardown_all(
 ) -> Result<(StatusCode, Json<TeardownAllResponse>), AppError> {
     // Validate app exists.
     if !state.apps.read().await.contains_key(&app) {
-        return Err(AppError::NotFound(format!("unknown app: {app}")));
+        return Err(AppError::NotFound(format!(
+            "unknown app: {app} — register it via POST /v1/apps or run `slip apply`"
+        )));
     }
 
     // Verify auth (Bearer token or HMAC).
@@ -4105,5 +4138,294 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Live app registration: create → immediate visibility → survive restart ──
+
+    #[tokio::test]
+    async fn test_live_app_registration_full_flow() {
+        // This test verifies the SLIP-90 acceptance criteria:
+        // 1. Register an app via API → immediately visible in GET /v1/apps
+        // 2. Secrets settable immediately (no restart)
+        // 3. Simulate restart (re-load from disk) → app still present
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_dir = tmp.path().to_path_buf();
+
+        // Create a minimal slip.toml so load_config can find it.
+        let slip_toml = r#"
+[server]
+listen = "0.0.0.0:7890"
+
+[caddy]
+admin_api = "http://localhost:2019"
+
+[auth]
+secret = "test-secret"
+
+[registry]
+
+[storage]
+path = "/tmp/slip-test"
+"#;
+        std::fs::write(config_dir.join("slip.toml"), slip_toml).unwrap();
+
+        let secrets_tmp = tempfile::tempdir().expect("tempdir for secrets");
+        let secrets_path = secrets_tmp.path().to_path_buf();
+        Box::leak(Box::new(secrets_tmp));
+
+        let state = Arc::new(AppState {
+            config: test_slip_config(),
+            apps: RwLock::new(HashMap::new()),
+            config_dir: config_dir.clone(),
+            deploy_locks: DashMap::new(),
+            runtime: Arc::new(
+                DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            ),
+            caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
+            health: HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
+            db: Db::open_in_memory().unwrap(),
+            started_at: Utc::now(),
+            preview_states: Arc::new(DashMap::new()),
+            preview_locks: DashMap::new(),
+            secrets_store: SecretsStore::new(secrets_path).unwrap(),
+        });
+
+        // Step 1: Register an app via POST /v1/apps
+        let app = build_router(state.clone());
+        let create_body = serde_json::json!({
+            "name": "liveapp",
+            "image": "ghcr.io/org/liveapp:latest",
+            "domain": "liveapp.example.com",
+            "port": 8080,
+            "health": {"path": "/healthz"}
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/apps")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create_body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "app should be created"
+        );
+
+        // Step 2: Immediately visible in GET /v1/apps/{name}
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/apps/liveapp")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let app2 = build_router(state.clone());
+        let response = app2.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "app should be immediately visible"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: AppResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload.name, "liveapp");
+        assert_eq!(payload.image, "ghcr.io/org/liveapp:latest");
+        assert_eq!(payload.port, 8080);
+
+        // Step 3: Secrets settable immediately (no restart)
+        let secrets_body = serde_json::json!({
+            "secrets": {"DB_URL": "postgres://localhost/liveapp"}
+        });
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/v1/apps/liveapp/secrets")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&secrets_body).unwrap()))
+            .unwrap();
+
+        let app3 = build_router(state.clone());
+        let response = app3.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "secrets should be settable immediately"
+        );
+
+        // Step 4: Simulate restart — re-load config from disk
+        let (_reloaded_cfg, reloaded_apps) =
+            crate::config::load_config(&config_dir).expect("should reload config from disk");
+
+        assert!(
+            reloaded_apps.contains_key("liveapp"),
+            "app should survive restart (persisted to disk)"
+        );
+        let reloaded = &reloaded_apps["liveapp"];
+        assert_eq!(reloaded.app.name, "liveapp");
+        assert_eq!(reloaded.app.image, "ghcr.io/org/liveapp:latest");
+        assert_eq!(reloaded.routing.port, Some(8080));
+        assert_eq!(
+            reloaded.health.path.as_deref(),
+            Some("/healthz"),
+            "health config should be persisted"
+        );
+
+        // Step 5: Verify the generated TOML has the managed-by header
+        let toml_path = config_dir.join("apps").join("liveapp.toml");
+        assert!(toml_path.exists(), "generated TOML should exist");
+        let toml_content = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(
+            toml_content.starts_with("# managed by slip"),
+            "generated TOML should have the managed-by header"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_live_app_update_persists() {
+        // Verify PATCH updates survive restart
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_dir = tmp.path().to_path_buf();
+
+        let slip_toml = r#"
+[server]
+listen = "0.0.0.0:7890"
+
+[caddy]
+admin_api = "http://localhost:2019"
+
+[auth]
+secret = "test-secret"
+
+[registry]
+
+[storage]
+path = "/tmp/slip-test"
+"#;
+        std::fs::write(config_dir.join("slip.toml"), slip_toml).unwrap();
+
+        let secrets_tmp = tempfile::tempdir().expect("tempdir for secrets");
+        let secrets_path = secrets_tmp.path().to_path_buf();
+        Box::leak(Box::new(secrets_tmp));
+
+        let state = Arc::new(AppState {
+            config: test_slip_config(),
+            apps: RwLock::new(HashMap::new()),
+            config_dir: config_dir.clone(),
+            deploy_locks: DashMap::new(),
+            runtime: Arc::new(
+                DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            ),
+            caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
+            health: HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
+            db: Db::open_in_memory().unwrap(),
+            started_at: Utc::now(),
+            preview_states: Arc::new(DashMap::new()),
+            preview_locks: DashMap::new(),
+            secrets_store: SecretsStore::new(secrets_path).unwrap(),
+        });
+
+        // Create app
+        let app = build_router(state.clone());
+        let create_body = serde_json::json!({
+            "name": "updateapp",
+            "image": "ghcr.io/org/updateapp:latest",
+            "domain": "updateapp.example.com",
+            "port": 8080,
+            "health": {"path": "/healthz"}
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/apps")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create_body).unwrap()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // Update health path via PATCH
+        let patch_body = serde_json::json!({
+            "health": {"path": "/readyz"},
+            "port": 9090
+        });
+        let request = Request::builder()
+            .method("PATCH")
+            .uri("/v1/apps/updateapp")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&patch_body).unwrap()))
+            .unwrap();
+
+        let app2 = build_router(state.clone());
+        let response = app2.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "PATCH should succeed");
+
+        // Verify in-memory
+        {
+            let apps = state.apps.read().await;
+            let cfg = apps.get("updateapp").unwrap();
+            assert_eq!(cfg.routing.port, Some(9090));
+            assert_eq!(cfg.health.path.as_deref(), Some("/readyz"));
+        }
+
+        // Simulate restart
+        let (_reloaded_cfg, reloaded_apps) =
+            crate::config::load_config(&config_dir).expect("should reload config from disk");
+
+        assert!(reloaded_apps.contains_key("updateapp"));
+        let reloaded = &reloaded_apps["updateapp"];
+        assert_eq!(
+            reloaded.routing.port,
+            Some(9090),
+            "PATCH port should survive restart"
+        );
+        assert_eq!(
+            reloaded.health.path.as_deref(),
+            Some("/readyz"),
+            "PATCH health path should survive restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_secrets_unknown_app_prescriptive_error() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "secrets": {"KEY": "value"}
+        });
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/v1/apps/nonexistent/secrets")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            payload.error.contains("register it via POST /v1/apps")
+                || payload.error.contains("run `slip apply`"),
+            "error should be prescriptive: {}",
+            payload.error
+        );
     }
 }
