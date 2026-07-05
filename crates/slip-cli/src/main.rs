@@ -4,6 +4,9 @@ use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
+#[allow(dead_code)]
+mod output;
+
 /// slip CLI — manage apps, deploys, secrets, and status.
 #[derive(Parser)]
 #[command(name = "slip", version, about)]
@@ -16,20 +19,24 @@ struct Cli {
     #[arg(long, global = true)]
     token: Option<String>,
 
+    /// Emit JSON output instead of human-readable text.
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Manage applications.
-    #[command(subcommand)]
-    Apps(AppsCommands),
-    /// Show app or daemon status.
-    Status {
-        /// App name (omit for all apps).
-        app: Option<String>,
-    },
+    /// Initialize slip on this machine (repo scaffold).
+    Init,
+    /// Link a local repo to a remote slipd server.
+    Link,
+    /// Manage deploy keys.
+    Key,
+    /// Apply a slip.toml config (create or update an app).
+    Apply,
     /// Trigger a deploy.
     Deploy {
         /// App name.
@@ -43,13 +50,10 @@ enum Commands {
         #[arg(long)]
         secret: Option<String>,
     },
-    /// Roll back to the previous version.
-    Rollback {
-        /// App name.
-        app: String,
-        /// Target tag to roll back to (defaults to previous tag).
-        #[arg(long)]
-        to: Option<String>,
+    /// Show app or daemon status.
+    Status {
+        /// App name (omit for all apps).
+        app: Option<String>,
     },
     /// Tail container logs.
     Logs {
@@ -59,8 +63,14 @@ enum Commands {
         #[arg(long)]
         since: Option<String>,
     },
-    /// Initialize slip on a new server.
-    Init,
+    /// Roll back to the previous version.
+    Rollback {
+        /// App name.
+        app: String,
+        /// Target tag to roll back to (defaults to previous tag).
+        #[arg(long)]
+        to: Option<String>,
+    },
     /// Validate a repo-side slip.toml config file.
     Validate {
         /// Path to slip.toml (default: ./slip.toml).
@@ -70,14 +80,94 @@ enum Commands {
         #[arg(long)]
         strict: bool,
     },
+    /// Manage the slipd server.
+    #[command(subcommand)]
+    Server(ServerCommands),
+    /// Manage preview deployments.
+    #[command(subcommand)]
+    Services(ServicesCommands),
     /// Manage application secrets.
     #[command(subcommand)]
     Secrets(SecretsCommands),
     /// Manage preview deployments.
     #[command(subcommand)]
     Previews(PreviewsCommands),
+    /// Log in to a container registry.
+    #[command(subcommand)]
+    Registry(RegistryCommands),
+    /// Diagnose slipd health and configuration.
+    Doctor,
+    /// Manage applications (deprecated: use `slip apply` instead).
+    #[command(subcommand, hide = true)]
+    Apps(AppsCommands),
 }
 
+// ─── Noun-group subcommand enums ──────────────────────────────────────────────
+
+#[derive(Subcommand)]
+enum ServerCommands {
+    /// Bootstrap slipd on a new server.
+    Init,
+    /// Show server status.
+    Status,
+}
+
+#[derive(Subcommand)]
+enum ServicesCommands {
+    /// List registered services.
+    List,
+}
+
+#[derive(Subcommand)]
+enum SecretsCommands {
+    /// List secret keys for an app.
+    List {
+        /// App name.
+        app: String,
+    },
+    /// Set one or more secrets for an app.
+    Set {
+        /// App name.
+        app: String,
+        /// Secret key=value pairs (e.g. KEY=VALUE).
+        #[arg(value_parser = parse_key_val, num_args = 1..)]
+        pairs: Vec<(String, String)>,
+    },
+    /// Remove a secret from an app.
+    Rm {
+        /// App name.
+        app: String,
+        /// Secret key to remove.
+        key: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PreviewsCommands {
+    /// List active previews for an app.
+    List {
+        /// App name.
+        app: String,
+    },
+    /// Tear down preview deployments.
+    Teardown {
+        /// App name.
+        app: String,
+        /// Preview ID to tear down.
+        preview: Option<String>,
+        /// Tear down all previews for the app.
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RegistryCommands {
+    /// Log in to a container registry.
+    Login,
+}
+
+/// Deprecated `slip apps` subcommands (hidden, still functional).
 #[derive(Subcommand)]
 enum AppsCommands {
     /// List all registered apps.
@@ -127,49 +217,6 @@ enum AppsCommands {
         /// Skip confirmation prompt.
         #[arg(long)]
         force: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum SecretsCommands {
-    /// List secret keys for an app.
-    List {
-        /// App name.
-        app: String,
-    },
-    /// Set one or more secrets for an app.
-    Set {
-        /// App name.
-        app: String,
-        /// Secret key=value pairs (e.g. KEY=VALUE).
-        #[arg(value_parser = parse_key_val, num_args = 1..)]
-        pairs: Vec<(String, String)>,
-    },
-    /// Remove a secret from an app.
-    Rm {
-        /// App name.
-        app: String,
-        /// Secret key to remove.
-        key: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum PreviewsCommands {
-    /// List active previews for an app.
-    List {
-        /// App name.
-        app: String,
-    },
-    /// Tear down preview deployments.
-    Teardown {
-        /// App name.
-        app: String,
-        /// Preview ID to tear down.
-        preview: Option<String>,
-        /// Tear down all previews for the app.
-        #[arg(long)]
-        all: bool,
     },
 }
 
@@ -707,6 +754,14 @@ async fn previews_teardown(
     Ok(())
 }
 
+// ─── Deprecation warning helper ────────────────────────────────────────────────
+
+fn deprecation_warning() {
+    eprintln!(
+        "warning: `slip apps` is deprecated; apps are now created via `slip apply` (see SLIP-94). This command still works."
+    );
+}
+
 // ─── Main entry point ──────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -714,67 +769,50 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Apps(command) => {
-            let token = cli.token.context(
-                "SLIP_TOKEN is required for apps commands. Set --token or SLIP_TOKEN env var.",
-            )?;
-            match command {
-                AppsCommands::List => {
-                    apps_list(&cli.server, &token).await?;
-                }
-                AppsCommands::Add {
-                    name,
-                    image,
-                    domain,
-                    port,
-                    secret,
-                    env,
-                } => {
-                    apps_add(
-                        &cli.server,
-                        &token,
-                        AppsAddArgs {
-                            name,
-                            image,
-                            domain,
-                            port,
-                            secret,
-                            env,
-                        },
-                    )
-                    .await?;
-                }
-                AppsCommands::Edit {
-                    name,
-                    image,
-                    domain,
-                    port,
-                    secret,
-                    env,
-                } => {
-                    apps_edit(
-                        &cli.server,
-                        &token,
-                        AppsEditArgs {
-                            name,
-                            image,
-                            domain,
-                            port,
-                            secret,
-                            env,
-                        },
-                    )
-                    .await?;
-                }
-                AppsCommands::Rm { name, force } => {
-                    apps_rm(&cli.server, &token, &name, force).await?;
-                }
-            }
+        // ── Stubs (Phase 2) ────────────────────────────────────────────────
+        Commands::Init => {
+            output::not_implemented("init", cli.json);
+        }
+        Commands::Link => {
+            output::not_implemented("link", cli.json);
+        }
+        Commands::Key => {
+            output::not_implemented("key", cli.json);
+        }
+        Commands::Apply => {
+            output::not_implemented("apply", cli.json);
         }
         Commands::Status { app } => {
             let target = app.as_deref().unwrap_or("all apps");
-            println!("slip status {target} — not yet implemented (Phase 2)");
+            output::not_implemented(&format!("status {target}"), cli.json);
         }
+        Commands::Logs { app, since } => {
+            let since_str = since.as_deref().unwrap_or("now");
+            output::not_implemented(&format!("logs {app} --since {since_str}"), cli.json);
+        }
+        Commands::Server(command) => match command {
+            ServerCommands::Init => {
+                output::not_implemented("server init", cli.json);
+            }
+            ServerCommands::Status => {
+                output::not_implemented("server status", cli.json);
+            }
+        },
+        Commands::Services(command) => match command {
+            ServicesCommands::List => {
+                output::not_implemented("services list", cli.json);
+            }
+        },
+        Commands::Registry(command) => match command {
+            RegistryCommands::Login => {
+                output::not_implemented("registry login", cli.json);
+            }
+        },
+        Commands::Doctor => {
+            output::not_implemented("doctor", cli.json);
+        }
+
+        // ── Working commands ────────────────────────────────────────────────
         Commands::Deploy {
             app,
             tag,
@@ -788,13 +826,6 @@ async fn main() -> anyhow::Result<()> {
                 "SLIP_TOKEN is required for rollback. Set --token or SLIP_TOKEN env var.",
             )?;
             rollback(&cli.server, &token, &app, to).await?;
-        }
-        Commands::Logs { app, since } => {
-            let since_str = since.as_deref().unwrap_or("now");
-            println!("slip logs {app} --since {since_str} — not yet implemented (Phase 2)");
-        }
-        Commands::Init => {
-            println!("slip init — not yet implemented (Phase 2)");
         }
         Commands::Validate { path, strict } => {
             let content = match std::fs::read_to_string(&path) {
@@ -876,6 +907,66 @@ async fn main() -> anyhow::Result<()> {
                 }
                 PreviewsCommands::Teardown { app, preview, all } => {
                     previews_teardown(&cli.server, &token, &app, preview, all).await?;
+                }
+            }
+        }
+
+        // ── Deprecated aliases ──────────────────────────────────────────────
+        Commands::Apps(command) => {
+            deprecation_warning();
+            let token = cli.token.context(
+                "SLIP_TOKEN is required for apps commands. Set --token or SLIP_TOKEN env var.",
+            )?;
+            match command {
+                AppsCommands::List => {
+                    apps_list(&cli.server, &token).await?;
+                }
+                AppsCommands::Add {
+                    name,
+                    image,
+                    domain,
+                    port,
+                    secret,
+                    env,
+                } => {
+                    apps_add(
+                        &cli.server,
+                        &token,
+                        AppsAddArgs {
+                            name,
+                            image,
+                            domain,
+                            port,
+                            secret,
+                            env,
+                        },
+                    )
+                    .await?;
+                }
+                AppsCommands::Edit {
+                    name,
+                    image,
+                    domain,
+                    port,
+                    secret,
+                    env,
+                } => {
+                    apps_edit(
+                        &cli.server,
+                        &token,
+                        AppsEditArgs {
+                            name,
+                            image,
+                            domain,
+                            port,
+                            secret,
+                            env,
+                        },
+                    )
+                    .await?;
+                }
+                AppsCommands::Rm { name, force } => {
+                    apps_rm(&cli.server, &token, &name, force).await?;
                 }
             }
         }
