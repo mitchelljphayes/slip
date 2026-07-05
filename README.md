@@ -116,14 +116,16 @@ EOF
 ### 3. Set the webhook secret
 
 The webhook signing key is either the **global** `[auth].secret` from `slip.toml`
-or a **per-app** `[app] secret` in the app TOML. To set a per-app secret, edit
-the app config:
+or a **per-app** `[app] secret` in the app TOML. To set a per-app secret, add
+`secret` under `[app]` in the app config:
 
-```bash
-# Add a per-app webhook signing key to the app TOML
-sudo tee -a /etc/slip/apps/myapp.toml > /dev/null << 'EOF'
-secret = "your-hmac-key"
-EOF
+```toml
+[app]
+name = "myapp"
+image = "ghcr.io/you/myapp"
+secret = "your-hmac-key"   # overrides global [auth].secret for this app
+
+# ... rest of the app config unchanged
 ```
 
 > **`slip secrets set <app> SLIP_SECRET=...` does NOT affect webhook auth.**

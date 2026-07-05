@@ -248,9 +248,7 @@ curl -X POST http://localhost:2019/config/apps/tls/automation/policies \
   -H "Content-Type: application/json" \
   -d '{
     "subjects": ["deploy.yourdomain.com"],
-    "issuer": {
-      "module": "internal"
-    }
+    "issuers": [{ "module": "internal" }]
   }'
 ```
 
@@ -305,15 +303,16 @@ order (see `crates/slip-core/src/api.rs:1020`):
 > to do with HMAC signature verification. This is the root cause of the 401
 > errors documented in [field-report-poi-australia.md §3.1](field-report-poi-australia.md).
 
-To set a per-app webhook secret, add `secret = "your-hmac-key"` to the app's
+To set a per-app webhook secret, add `secret` under `[app]` in the app's
 TOML file:
 
-```bash
-sudo tee -a /etc/slip/apps/my-app.toml > /dev/null << 'EOF'
+```toml
+[app]
+name = "my-app"
+image = "ghcr.io/youruser/my-app"
+secret = "your-hmac-key"   # overrides global [auth].secret for this app
 
-# Per-app webhook signing key (overrides global [auth].secret for this app)
-secret = "your-hmac-key"
-EOF
+# ... rest of the app config unchanged
 ```
 
 > **Note:** The per-app `[app] secret` field works today but is **deprecated**
