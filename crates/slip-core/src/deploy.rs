@@ -284,8 +284,31 @@ pub async fn execute_deploy(state: Arc<AppState>, mut ctx: DeployContext) {
             // Inner function handled success/failure recording internally.
         }
         Err(_elapsed) => {
-            let msg = format!("deploy timed out after {}", format_duration(timeout_dur));
+            let msg = format!(
+                "[health_check_timeout] deploy timed out after {} (health check never passed)",
+                format_duration(timeout_dur)
+            );
             ctx.fail(&msg);
+
+            // SLIP-91: clean up the orphaned new container. The timeout killed
+            // execute_deploy_inner before its own cleanup paths could run, so the
+            // new (unhealthy) container is still running. Stop+remove it; leave the
+            // old container serving (it was never touched).
+            if let Some(ref id) = ctx.new_container_id {
+                tracing::warn!(
+                    container = %id,
+                    app = %ctx.app,
+                    "deploy timed out; cleaning up orphaned new container"
+                );
+                if let Err(e) = state.runtime.stop_and_remove(id).await {
+                    tracing::error!(
+                        container = %id,
+                        error = %e,
+                        "failed to clean up orphaned container after timeout"
+                    );
+                    // Don't fail the whole handler — the deploy is already failed.
+                }
+            }
 
             // Use `state` directly (NOT the borrowed `shared`) to avoid
             // holding the `'_` lifetime across the timeout boundary.
@@ -316,7 +339,10 @@ pub(crate) async fn execute_deploy_inner(
     let app_config = match shared.apps.read().await.get(&app_name) {
         Some(cfg) => cfg.clone(),
         None => {
-            ctx.fail(&format!("app '{}' not found in config", app_name));
+            ctx.fail(&format!(
+                "[app_not_found] app '{}' not found in config",
+                app_name
+            ));
             record_deploy(&shared, ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
@@ -345,7 +371,7 @@ pub(crate) async fn execute_deploy_inner(
         .pull_image(&ctx.image, &ctx.tag, shared.credentials.clone())
         .await
     {
-        ctx.fail(&format!("image pull failed: {e}"));
+        ctx.fail(&format!("[pull_failed] image pull failed: {e}"));
         record_deploy(&shared, ctx);
         set_app_failed(shared.app_states, &app_name);
         return;
@@ -366,7 +392,7 @@ pub(crate) async fn execute_deploy_inner(
             .await
         {
             ctx.fail(&format!(
-                "sidecar image pull failed for '{container_name}': {e}"
+                "[pull_failed] sidecar image pull failed for '{container_name}': {e}"
             ));
             record_deploy(&shared, ctx);
             set_app_failed(shared.app_states, &app_name);
@@ -388,7 +414,7 @@ pub(crate) async fn execute_deploy_inner(
                 Ok(repo_config) => {
                     if repo_config.app.name != app_name {
                         ctx.fail(&format!(
-                            "repo config app name '{}' does not match deploy app '{}'",
+                            "[config_mismatch] repo config app name '{}' does not match deploy app '{}'",
                             repo_config.app.name, app_name
                         ));
                         record_deploy(&shared, ctx);
@@ -398,7 +424,7 @@ pub(crate) async fn execute_deploy_inner(
                     match crate::merge::merge_config(&app_config, &repo_config) {
                         Ok(merged) => Some(merged),
                         Err(e) => {
-                            ctx.fail(&format!("config merge failed: {e}"));
+                            ctx.fail(&format!("[config_merge_failed] config merge failed: {e}"));
                             record_deploy(&shared, ctx);
                             set_app_failed(shared.app_states, &app_name);
                             return;
@@ -406,7 +432,9 @@ pub(crate) async fn execute_deploy_inner(
                     }
                 }
                 Err(e) => {
-                    ctx.fail(&format!("failed to parse repo config: {e}"));
+                    ctx.fail(&format!(
+                        "[config_parse_failed] failed to parse repo config: {e}"
+                    ));
                     record_deploy(&shared, ctx);
                     set_app_failed(shared.app_states, &app_name);
                     return;
@@ -425,7 +453,9 @@ pub(crate) async fn execute_deploy_inner(
             None
         }
         Err(e) => {
-            ctx.fail(&format!("failed to extract config from image: {e}"));
+            ctx.fail(&format!(
+                "[config_extract_failed] failed to extract config from image: {e}"
+            ));
             record_deploy(&shared, ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
@@ -456,7 +486,9 @@ pub(crate) async fn execute_deploy_inner(
             .is_some_and(|d| !d.is_empty());
         let has_port = effective_config.routing.port.is_some_and(|p| p > 0);
         if !(has_routes || (has_domain && has_port)) {
-            ctx.fail("HTTP app requires routing.domain+port or [[routing.routes]]");
+            ctx.fail(
+                "[routing_missing] HTTP app requires routing.domain+port or [[routing.routes]]",
+            );
             record_deploy(&shared, ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
@@ -532,7 +564,9 @@ pub(crate) async fn execute_deploy_inner(
             }
         }
         other => {
-            ctx.fail(&format!("unknown deploy strategy: {other}"));
+            ctx.fail(&format!(
+                "[unknown_strategy] unknown deploy strategy: {other}"
+            ));
             record_deploy(&shared, ctx);
             set_app_failed(shared.app_states, &app_name);
             return;
@@ -608,7 +642,9 @@ async fn execute_blue_green_deploy_container(
             // Workers: current_port stays None
         }
         Err(e) => {
-            ctx.fail(&format!("container start failed: {e}"));
+            ctx.fail(&format!(
+                "[container_start_failed] container start failed: {e}"
+            ));
             record_deploy(shared, ctx);
             set_app_failed(shared.app_states, app_name);
             return;
@@ -628,14 +664,16 @@ async fn execute_blue_green_deploy_container(
                 Ok(true) => {}
                 Ok(false) => {
                     tracing::error!(app = %app_name, container_id = %id, "worker container not running after start");
-                    ctx.fail("worker container exited during start");
+                    ctx.fail("[container_exited] worker container exited during start");
                     record_deploy(shared, ctx);
                     set_app_failed(shared.app_states, app_name);
                     return;
                 }
                 Err(e) => {
                     tracing::error!(app = %app_name, error = %e, "failed to verify worker container state");
-                    ctx.fail(&format!("worker container state check failed: {e}"));
+                    ctx.fail(&format!(
+                        "[container_state_failed] worker container state check failed: {e}"
+                    ));
                     record_deploy(shared, ctx);
                     set_app_failed(shared.app_states, app_name);
                     return;
@@ -646,7 +684,7 @@ async fn execute_blue_green_deploy_container(
         new_port = match ctx.new_port {
             Some(port) => port,
             None => {
-                ctx.fail("internal error: port not set after container start");
+                ctx.fail("[internal_error] internal error: port not set after container start");
                 record_deploy(shared, ctx);
                 set_app_failed(shared.app_states, app_name);
                 return;
@@ -658,7 +696,7 @@ async fn execute_blue_green_deploy_container(
             if let Some(ref id) = ctx.new_container_id {
                 let _ = runtime.stop_and_remove(id).await;
             }
-            ctx.fail(&format!("health check failed: {e}"));
+            ctx.fail(&format!("[health_check_failed] health check failed: {e}"));
             record_deploy(shared, ctx);
             set_app_failed(shared.app_states, app_name);
             return;
@@ -671,14 +709,16 @@ async fn execute_blue_green_deploy_container(
                 Ok(true) => {}
                 Ok(false) => {
                     tracing::error!(app = %app_name, container_id = %id, "container not running after health check");
-                    ctx.fail("container exited during health check");
+                    ctx.fail("[container_exited] container exited during health check");
                     record_deploy(shared, ctx);
                     set_app_failed(shared.app_states, app_name);
                     return;
                 }
                 Err(e) => {
                     tracing::error!(app = %app_name, error = %e, "failed to verify container state");
-                    ctx.fail(&format!("container state check failed: {e}"));
+                    ctx.fail(&format!(
+                        "[container_state_failed] container state check failed: {e}"
+                    ));
                     record_deploy(shared, ctx);
                     set_app_failed(shared.app_states, app_name);
                     return;
@@ -821,7 +861,9 @@ async fn execute_blue_green_deploy_pod(
     let manifest_in_image = match &merged_cfg.manifest {
         Some(p) => p.clone(),
         None => {
-            ctx.fail("pod deploy requires [app].manifest in repo config (slip.toml)");
+            ctx.fail(
+                "[manifest_missing] pod deploy requires [app].manifest in repo config (slip.toml)",
+            );
             record_deploy(shared, ctx);
             set_app_failed(shared.app_states, app_name);
             return;
@@ -836,14 +878,16 @@ async fn execute_blue_green_deploy_pod(
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
             ctx.fail(&format!(
-                "manifest '{manifest_in_image}' not found in image"
+                "[manifest_not_found] manifest '{manifest_in_image}' not found in image"
             ));
             record_deploy(shared, ctx);
             set_app_failed(shared.app_states, app_name);
             return;
         }
         Err(e) => {
-            ctx.fail(&format!("failed to extract manifest from image: {e}"));
+            ctx.fail(&format!(
+                "[manifest_extract_failed] failed to extract manifest from image: {e}"
+            ));
             record_deploy(shared, ctx);
             set_app_failed(shared.app_states, app_name);
             return;
@@ -870,7 +914,9 @@ async fn execute_blue_green_deploy_pod(
     let rendered_yaml = match crate::manifest::render_manifest(&manifest_bytes, &render_ctx) {
         Ok(yaml) => yaml,
         Err(e) => {
-            ctx.fail(&format!("failed to render manifest: {e}"));
+            ctx.fail(&format!(
+                "[manifest_render_failed] failed to render manifest: {e}"
+            ));
             record_deploy(shared, ctx);
             set_app_failed(shared.app_states, app_name);
             return;
@@ -880,14 +926,18 @@ async fn execute_blue_green_deploy_pod(
     // Write rendered manifest to storage dir.
     let manifests_dir = shared.config.storage.path.join("manifests");
     if let Err(e) = std::fs::create_dir_all(&manifests_dir) {
-        ctx.fail(&format!("failed to create manifests directory: {e}"));
+        ctx.fail(&format!(
+            "[manifest_dir_failed] failed to create manifests directory: {e}"
+        ));
         record_deploy(shared, ctx);
         set_app_failed(shared.app_states, app_name);
         return;
     }
     let manifest_path = manifests_dir.join(format!("{app_name}-{}.yaml", ctx.id));
     if let Err(e) = std::fs::write(&manifest_path, &rendered_yaml) {
-        ctx.fail(&format!("failed to write manifest file: {e}"));
+        ctx.fail(&format!(
+            "[manifest_write_failed] failed to write manifest file: {e}"
+        ));
         record_deploy(shared, ctx);
         set_app_failed(shared.app_states, app_name);
         return;
@@ -895,7 +945,7 @@ async fn execute_blue_green_deploy_pod(
 
     // Deploy the pod via `podman kube play`.
     if let Err(e) = runtime.deploy_pod(&manifest_path, &pod_name).await {
-        ctx.fail(&format!("pod deploy failed: {e}"));
+        ctx.fail(&format!("[pod_deploy_failed] pod deploy failed: {e}"));
         record_deploy(shared, ctx);
         set_app_failed(shared.app_states, app_name);
         return;
@@ -1042,7 +1092,7 @@ async fn execute_blue_green_deploy_pod(
             if let Err(te) = runtime.teardown_pod(&manifest_path).await {
                 tracing::warn!(app = app_name, error = %te, "failed to teardown pod after health check failure (non-fatal)");
             }
-            ctx.fail("health check failed for one or more HTTP containers");
+            ctx.fail("[health_check_failed] health check failed for one or more HTTP containers");
             record_deploy(shared, ctx);
             set_app_failed(shared.app_states, app_name);
             return;
@@ -1081,7 +1131,9 @@ async fn execute_blue_green_deploy_pod(
             if let Err(te) = runtime.teardown_pod(&manifest_path).await {
                 tracing::warn!(app = app_name, error = %te, "failed to teardown pod after caddy failure (non-fatal)");
             }
-            ctx.fail(&format!("caddy route update failed: {e}"));
+            ctx.fail(&format!(
+                "[route_update_failed] caddy route update failed: {e}"
+            ));
             record_deploy(shared, ctx);
             set_app_failed(shared.app_states, app_name);
             return;
@@ -1192,7 +1244,9 @@ async fn execute_recreate_deploy_container(
             "stopping old container (recreate)"
         );
         if let Err(e) = runtime.stop_container(old_id).await {
-            ctx.fail(&format!("failed to stop old container: {e}"));
+            ctx.fail(&format!(
+                "[container_stop_failed] failed to stop old container: {e}"
+            ));
             record_deploy(shared, ctx);
             set_app_failed(shared.app_states, app_name);
             return;
@@ -1512,7 +1566,7 @@ async fn rollback_recreate_container(
             }
 
             tracing::info!(app = app_name, "Tier 1 rollback succeeded");
-            ctx.fail("deploy failed, old container restarted (Tier 1 rollback)");
+            ctx.fail("[rollback_tier1] deploy failed, old container restarted (Tier 1 rollback)");
             record_deploy(shared, ctx);
             set_app_failed(shared.app_states, app_name);
             return;
@@ -1596,7 +1650,7 @@ async fn rollback_recreate_container(
                     }
 
                     tracing::info!(app = app_name, "Tier 2 rollback succeeded");
-                    ctx.fail("deploy failed, fallback from previous_tag (Tier 2 rollback)");
+                    ctx.fail("[rollback_tier2] deploy failed, fallback from previous_tag (Tier 2 rollback)");
                     record_deploy(shared, ctx);
                     set_app_failed(shared.app_states, app_name);
                     return;
@@ -1626,7 +1680,7 @@ async fn rollback_recreate_container(
         "App {} is DOWN. New container failed health check AND old container cannot be restarted. Manual intervention required.",
         app_name,
     );
-    ctx.fail("deploy failed, rollback failed — manual intervention required");
+    ctx.fail("[rollback_failed] deploy failed, rollback failed — manual intervention required");
     record_deploy(shared, ctx);
     set_app_failed(shared.app_states, app_name);
 }
@@ -1784,6 +1838,9 @@ mod tests {
         pull_ok: bool,
         /// If true, `pull_image` returns a future that never completes (for timeout tests).
         hung: bool,
+        /// If true, `container_is_running` returns a future that never completes
+        /// (for timeout tests after container start).
+        hung_container_check: bool,
         /// Container ID + port returned by `create_and_start`.
         container_id: String,
         container_port: u16,
@@ -1822,6 +1879,7 @@ mod tests {
             Self {
                 pull_ok: true,
                 hung: false,
+                hung_container_check: false,
                 container_id: "mock-container-id".to_string(),
                 container_port: 54321,
                 stop_count: Arc::new(AtomicU32::new(0)),
@@ -2079,6 +2137,15 @@ mod tests {
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<bool, RuntimeError>> + Send + 'a>,
         > {
+            if self.hung_container_check {
+                // Return a future that never completes (sleeps forever).
+                // Under `start_paused = true`, this will cause the timeout to fire
+                // after the container has been created.
+                return Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(u64::MAX)).await;
+                    Ok(true)
+                });
+            }
             // Mock containers are always running unless explicitly set otherwise
             Box::pin(async { Ok(true) })
         }
@@ -2256,15 +2323,23 @@ mod tests {
 
     struct MockHealth {
         ok: bool,
+        /// If true, `check` returns a future that never completes (for timeout tests).
+        hung: bool,
     }
 
     impl MockHealth {
         fn passing() -> Self {
-            Self { ok: true }
+            Self {
+                ok: true,
+                hung: false,
+            }
         }
 
         fn failing() -> Self {
-            Self { ok: false }
+            Self {
+                ok: false,
+                hung: false,
+            }
         }
     }
 
@@ -2275,6 +2350,14 @@ mod tests {
             _config: &'a HealthConfig,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), HealthError>> + Send + 'a>>
         {
+            if self.hung {
+                // Return a future that never completes (sleeps forever).
+                // Under `start_paused = true`, this will cause the timeout to fire.
+                return Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(u64::MAX)).await;
+                    Ok(())
+                });
+            }
             let result = if self.ok {
                 Ok(())
             } else {
@@ -4297,5 +4380,181 @@ container = "web"
             "fast deploy should complete: {:?}",
             recorded.error
         );
+    }
+
+    /// A deploy whose health check hangs (never returns) should time out, clean up
+    /// the orphaned new container, and record the deploy as Failed with a
+    /// health_check_timeout reason.
+    #[tokio::test(start_paused = true)]
+    async fn test_deploy_timeout_cleans_up_orphaned_container() {
+        let docker = MockDocker {
+            // Pull succeeds, create_and_start succeeds, but container_is_running
+            // hangs forever — simulating a container that never becomes healthy.
+            hung_container_check: true,
+            ..MockDocker::new()
+        };
+        let stop_count = docker.stop_count();
+        let call_log = docker.call_log();
+        let state = make_timeout_test_state(docker, 1);
+
+        // Acquire the deploy lock (simulates what the API handler does).
+        let lock = state
+            .deploy_locks
+            .entry("testapp".to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let guard = lock
+            .clone()
+            .try_lock_owned()
+            .expect("lock should be available");
+
+        let ctx = DeployContext::new(
+            "dep_timeout_cleanup001".to_string(),
+            "testapp".to_string(),
+            "ghcr.io/org/testapp".to_string(),
+            "v1.0.0".to_string(),
+            TriggerSource::Webhook,
+        );
+
+        execute_deploy(state.clone(), ctx).await;
+
+        // The deploy should be recorded as Failed with a health_check_timeout reason.
+        let recorded = state.deploys.get("testapp").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Failed);
+        assert!(
+            recorded
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("health_check_timeout"),
+            "error should contain 'health_check_timeout': {:?}",
+            recorded.error
+        );
+
+        // stop_and_remove should have been called exactly once (the orphaned new container).
+        assert_eq!(
+            stop_count.load(Ordering::SeqCst),
+            1,
+            "orphaned new container should be stopped and removed"
+        );
+
+        // The call log should show: pull_image, create_and_start, then stop_and_remove.
+        // No stop_and_remove for an old container (there was none).
+        {
+            let log = call_log.lock().unwrap();
+            let create_idx = log.iter().position(|s| s == "create_and_start");
+            let stop_remove_idx = log.iter().position(|s| s == "stop_and_remove");
+            assert!(
+                create_idx.is_some(),
+                "create_and_start should have been called"
+            );
+            assert!(
+                stop_remove_idx.is_some(),
+                "stop_and_remove should have been called for cleanup"
+            );
+            assert!(
+                create_idx.unwrap() < stop_remove_idx.unwrap(),
+                "stop_and_remove should come after create_and_start"
+            );
+        } // drop log guard before await
+
+        // App runtime state should be Failed.
+        let app_states = state.app_states.read().await;
+        if let Some(app_state) = app_states.get("testapp") {
+            assert_eq!(app_state.status, AppStatus::Failed);
+        }
+
+        // The lock guard should still be held (we haven't dropped it yet).
+        drop(guard);
+        let reacquired = lock.try_lock();
+        assert!(
+            reacquired.is_ok(),
+            "deploy lock should be re-acquirable after timeout"
+        );
+    }
+
+    /// A deploy that times out with an existing old container: the old container
+    /// should NOT be stopped — only the orphaned new container is cleaned up.
+    #[tokio::test(start_paused = true)]
+    async fn test_deploy_timeout_does_not_stop_old_container() {
+        let docker = MockDocker {
+            hung_container_check: true,
+            ..MockDocker::new()
+        };
+        let stop_count = docker.stop_count();
+        let call_log = docker.call_log();
+        let state = make_timeout_test_state(docker, 1);
+
+        // Pre-populate app state with an existing old container.
+        {
+            let mut states = state.app_states.write().await;
+            states.insert(
+                "testapp".to_string(),
+                AppRuntimeState {
+                    status: AppStatus::Running,
+                    current_tag: Some("v0.9.0".to_string()),
+                    current_container_id: Some("old-container-id".to_string()),
+                    current_port: Some(50000),
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Acquire the deploy lock.
+        let lock = state
+            .deploy_locks
+            .entry("testapp".to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let guard = lock
+            .clone()
+            .try_lock_owned()
+            .expect("lock should be available");
+
+        let ctx = DeployContext::new(
+            "dep_timeout_old001".to_string(),
+            "testapp".to_string(),
+            "ghcr.io/org/testapp".to_string(),
+            "v1.0.0".to_string(),
+            TriggerSource::Webhook,
+        );
+
+        execute_deploy(state.clone(), ctx).await;
+
+        // The deploy should be Failed.
+        let recorded = state.deploys.get("testapp").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Failed);
+
+        // stop_and_remove should have been called exactly once (the orphaned new container).
+        assert_eq!(
+            stop_count.load(Ordering::SeqCst),
+            1,
+            "only the orphaned new container should be stopped"
+        );
+
+        // Verify call ordering: create_and_start before stop_and_remove.
+        {
+            let log = call_log.lock().unwrap();
+            let create_idx = log.iter().position(|s| s == "create_and_start");
+            let stop_remove_idx = log.iter().position(|s| s == "stop_and_remove");
+            assert!(create_idx.is_some());
+            assert!(stop_remove_idx.is_some());
+            assert!(
+                create_idx.unwrap() < stop_remove_idx.unwrap(),
+                "stop_and_remove should come after create_and_start"
+            );
+        } // drop log guard before await
+
+        // The old container should still be current in app state.
+        let app_states = state.app_states.read().await;
+        let app = app_states.get("testapp").unwrap();
+        assert_eq!(
+            app.current_container_id.as_deref(),
+            Some("old-container-id"),
+            "old container should be preserved"
+        );
+        assert_eq!(app.status, AppStatus::Failed);
+
+        drop(guard);
     }
 }
