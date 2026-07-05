@@ -229,7 +229,7 @@ mod tests {
         RoutingConfig,
     };
     use crate::repo_config::{
-        RepoAppInfo, RepoConfig, RepoDefaults, RepoHealthConfig, RepoResourceConfig,
+        RemoteConfig, RepoAppInfo, RepoConfig, RepoDefaults, RepoHealthConfig, RepoResourceConfig,
         RepoRouteEntry, RepoRoutingConfig,
     };
 
@@ -278,6 +278,7 @@ mod tests {
             defaults: RepoDefaults::default(),
             preview: None,
             volumes: Vec::new(),
+            remote: RemoteConfig::default(),
         }
     }
 

@@ -21,6 +21,19 @@ pub struct RepoVolume {
     pub read_only: bool,
 }
 
+/// Laptop-side config: binds a repo to a slipd server + app.
+///
+/// Written by `slip link`; read by every laptop command to avoid
+/// `--server`/`--token`/app flags every time.
+/// The token is NEVER stored here — it stays in `SLIP_TOKEN` env / `--token`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RemoteConfig {
+    /// slipd management API URL, e.g. "https://deploy.example.com"
+    pub server: String,
+    /// App name this repo deploys as.
+    pub app: String,
+}
+
 /// Repo-side config extracted from `/slip/slip.toml` in the container image.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RepoConfig {
@@ -35,6 +48,9 @@ pub struct RepoConfig {
     /// Volume mount points the app needs.
     #[serde(default)]
     pub volumes: Vec<RepoVolume>,
+    /// Laptop-side remote binding (written by `slip link`).
+    #[serde(default)]
+    pub remote: RemoteConfig,
 }
 
 /// Basic application identity from the repo config.
@@ -646,6 +662,34 @@ kind = "worker"
 "#;
         let cfg = parse_repo_config(toml.as_bytes()).unwrap();
         assert_eq!(cfg.routing.kind, "worker");
+    }
+
+    // ── Remote config ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_repo_config_with_remote() {
+        let toml = r#"
+[app]
+name = "myapp"
+
+[remote]
+server = "https://deploy.example.com"
+app = "poi"
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        assert_eq!(cfg.remote.server, "https://deploy.example.com");
+        assert_eq!(cfg.remote.app, "poi");
+    }
+
+    #[test]
+    fn parse_repo_config_without_remote() {
+        let toml = r#"
+[app]
+name = "myapp"
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        assert!(cfg.remote.server.is_empty());
+        assert!(cfg.remote.app.is_empty());
     }
 
     #[test]

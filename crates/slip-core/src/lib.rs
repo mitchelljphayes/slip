@@ -37,7 +37,7 @@ pub use manifest::{ManifestError, RenderContext, render_manifest};
 pub use merge::{MergedConfig, MergedVolume, merge_config};
 pub use podman::PodmanBackend;
 pub use preview::{PersistedPreviewState, PreviewState};
-pub use repo_config::{PreviewConfig, RepoConfig, RepoVolume, parse_repo_config};
+pub use repo_config::{PreviewConfig, RemoteConfig, RepoConfig, RepoVolume, parse_repo_config};
 pub use runtime::{PodInfo, RegistryCredentials, RuntimeBackend};
 pub use secrets::SecretsStore;
 pub use state::{
