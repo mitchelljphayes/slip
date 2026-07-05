@@ -34,7 +34,19 @@ enum Commands {
     /// Link a local repo to a remote slipd server.
     Link,
     /// Manage deploy keys.
-    Key,
+    Key {
+        /// App name (required for now; will be inferred from slip.toml in future).
+        #[arg(value_name = "APP")]
+        app: Option<String>,
+
+        /// Rotate the deploy key (regenerates it).
+        #[arg(long)]
+        rotate: bool,
+
+        /// Run `gh secret set` with the new key (infers repo from git remote).
+        #[arg(long)]
+        gh: bool,
+    },
     /// Apply a slip.toml config (create or update an app).
     Apply,
     /// Trigger a deploy.
@@ -310,6 +322,19 @@ struct PreviewListItem {
 #[derive(Debug, Deserialize)]
 struct TeardownAllResponse {
     torn_down: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SetDeployKeyRequest {
+    rotate: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetDeployKeyResponse {
+    app: String,
+    key: Option<String>,
+    rotated: bool,
+    message: Option<String>,
 }
 
 // ─── HTTP client helpers ──────────────────────────────────────────────────────
@@ -754,6 +779,185 @@ async fn previews_teardown(
     Ok(())
 }
 
+// ─── Key command implementation ────────────────────────────────────────────────
+
+async fn key_command(
+    server: &str,
+    token: &str,
+    app: &str,
+    rotate: bool,
+    gh: bool,
+    json: bool,
+) -> Result<(), anyhow::Error> {
+    let client = create_client();
+    let url = format!("{server}/v1/apps/{app}/key");
+
+    let body = SetDeployKeyRequest { rotate };
+
+    let resp = match api_request(
+        &client,
+        reqwest::Method::PUT,
+        &url,
+        token,
+        Some(&serde_json::to_value(&body)?),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("{e}");
+            // Map known API errors to prescriptive messages.
+            if msg.contains("401") || msg.contains("403") {
+                output::fail(
+                    output::AUTH,
+                    "auth failed",
+                    "check your admin token (--token or SLIP_TOKEN)",
+                );
+            }
+            if msg.contains("404") {
+                output::fail(
+                    output::NOT_FOUND,
+                    &format!("app '{app}' not found"),
+                    "register it via POST /v1/apps or run `slip apply`",
+                );
+            }
+            // Network/connection error (the anyhow context message).
+            if msg.contains("HTTP request failed") {
+                output::fail(
+                    output::GENERIC,
+                    &format!(
+                        "can't reach slipd at {server} — is it running? did you `slip link` to the right server?"
+                    ),
+                    "",
+                );
+            }
+            // Generic API error.
+            output::fail(output::GENERIC, &msg, "");
+        }
+    };
+
+    let data: SetDeployKeyResponse = resp.json().await.context("failed to parse response")?;
+
+    if json {
+        let out = serde_json::json!({
+            "app": data.app,
+            "key": data.key,
+            "rotated": data.rotated,
+            "gh_secret_name": "SLIP_DEPLOY_SECRET",
+        });
+        println!("{out}");
+        return Ok(());
+    }
+
+    match data.key {
+        Some(key) => {
+            println!("Deploy key for {}:", data.app);
+            println!("  {key}");
+            println!();
+            println!("Add to GitHub Actions secrets:");
+            println!("  gh secret set SLIP_DEPLOY_SECRET --body '{key}'");
+
+            if rotate {
+                println!();
+                println!("⚠ CI will break until the GitHub secret is updated with the new key.");
+            }
+
+            if gh {
+                // Infer repo from git remote.
+                let output = std::process::Command::new("git")
+                    .args(["remote", "get-url", "origin"])
+                    .output()
+                    .context("failed to run `git remote get-url origin`")?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    output::fail(
+                        output::GENERIC,
+                        &format!("could not infer GitHub repo from git remote: {stderr}"),
+                        "run `gh secret set SLIP_DEPLOY_SECRET --body '<key>'` manually",
+                    );
+                }
+
+                let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                // Parse owner/repo from common remote URL formats.
+                let repo_slug = parse_gh_repo_slug(&remote_url).unwrap_or_else(|| {
+                    output::fail(
+                        output::GENERIC,
+                        &format!("could not parse GitHub repo from remote URL: {remote_url}"),
+                        "run `gh secret set SLIP_DEPLOY_SECRET --body '<key>'` manually",
+                    );
+                });
+
+                // Check if `gh` is installed.
+                let gh_check = std::process::Command::new("gh").arg("--version").output();
+                match gh_check {
+                    Ok(out) if out.status.success() => {}
+                    _ => {
+                        output::fail(
+                            output::GENERIC,
+                            "`gh` CLI is not installed or not in PATH",
+                            "install it from https://cli.github.com/ or run the `gh secret set` command manually",
+                        );
+                    }
+                }
+
+                let gh_status = std::process::Command::new("gh")
+                    .args([
+                        "secret",
+                        "set",
+                        "SLIP_DEPLOY_SECRET",
+                        "--body",
+                        &key,
+                        "--repo",
+                        &repo_slug,
+                    ])
+                    .status()
+                    .context("failed to run `gh secret set`")?;
+
+                if gh_status.success() {
+                    println!("✓ GitHub secret set for {repo_slug}");
+                } else {
+                    output::fail(
+                        output::GENERIC,
+                        "`gh secret set` failed",
+                        &format!(
+                            "run it manually: gh secret set SLIP_DEPLOY_SECRET --body '<key>' --repo {repo_slug}"
+                        ),
+                    );
+                }
+            }
+        }
+        None => {
+            let msg = data
+                .message
+                .as_deref()
+                .unwrap_or("deploy key already exists — pass --rotate to rotate it");
+            println!("{msg}");
+            // Exit 0: the command succeeded in telling the user the state.
+            // No key was returned (security: never echo an existing key).
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse `owner/repo` from a GitHub remote URL.
+///
+/// Supports:
+///   - git@github.com:owner/repo.git
+///   - https://github.com/owner/repo.git
+///   - https://github.com/owner/repo
+fn parse_gh_repo_slug(url: &str) -> Option<String> {
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        return Some(rest.to_string());
+    }
+    if let Some(rest) = url.strip_prefix("https://github.com/") {
+        return Some(rest.to_string());
+    }
+    None
+}
+
 // ─── Deprecation warning helper ────────────────────────────────────────────────
 
 fn deprecation_warning() {
@@ -776,8 +980,22 @@ async fn main() -> anyhow::Result<()> {
         Commands::Link => {
             output::not_implemented("link", cli.json);
         }
-        Commands::Key => {
-            output::not_implemented("key", cli.json);
+        Commands::Key { app, rotate, gh } => {
+            let token = cli.token.unwrap_or_else(|| {
+                output::fail(
+                    output::AUTH,
+                    "no admin token",
+                    "set --token or the SLIP_TOKEN env var",
+                );
+            });
+            let app = app.unwrap_or_else(|| {
+                output::fail(
+                    output::USAGE,
+                    "app name is required",
+                    "pass it as a positional argument: `slip key <app>`",
+                );
+            });
+            key_command(&cli.server, &token, &app, rotate, gh, cli.json).await?;
         }
         Commands::Apply => {
             output::not_implemented("apply", cli.json);
