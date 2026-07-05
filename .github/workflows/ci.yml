@@ -66,7 +66,14 @@ jobs:
           curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
           sudo apt-get update
           sudo apt-get install -y caddy
-      - run: cargo test -p slip-core --test caddy_contract -- --ignored
+      - name: Prepare Caddy for tests
+        run: |
+          # The apt package starts a caddy systemd service that holds :80/:443.
+          # Stop it so the test-spawned Caddy can bind those ports.
+          sudo systemctl stop caddy || true
+          # Allow the unprivileged test process to bind privileged ports.
+          sudo setcap 'cap_net_bind_service=+ep' "$(command -v caddy)"
+      - run: cargo test -p slip-core --test caddy_contract -- --ignored --test-threads=1
 
   e2e:
     name: End-to-End Smoke Test
@@ -83,6 +90,13 @@ jobs:
           curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
           sudo apt-get update
           sudo apt-get install -y caddy
+      - name: Prepare Caddy for tests
+        run: |
+          # The apt package starts a caddy systemd service that holds :80/:443.
+          # Stop it so the test-spawned Caddy can bind those ports.
+          sudo systemctl stop caddy || true
+          # Allow the unprivileged test process to bind privileged ports.
+          sudo setcap 'cap_net_bind_service=+ep' "$(command -v caddy)"
       - name: Start Caddy
         run: |
           caddy run --config <(echo '{"admin":{"listen":"127.0.0.1:2019"}}') &
