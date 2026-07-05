@@ -140,8 +140,12 @@ async fn main() -> anyhow::Result<()> {
         Ok(()) => {}
         Err(slip_core::CaddyError::ListenerConflict { server, listener }) => {
             // SLIP-88: Listener conflict is a configuration error, not a transient
-            // failure. Exit with code 0 so systemd's Restart=on-failure does NOT
-            // restart — the user must fix their Caddyfile and restart slipd manually.
+            // failure. Exit with code 78 (EX_CONFIG — sysexits.h) so systemd's
+            // Restart=on-failure does NOT restart (the unit sets
+            // RestartPreventExitStatus=78). The user must fix their Caddyfile and
+            // restart slipd manually. Using a distinct non-zero code (rather than
+            // exit(0)) keeps the exit status semantically honest: a config error
+            // is a failure, not a success.
             tracing::error!(
                 server = %server,
                 listener = %listener,
@@ -149,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
                  Remove site blocks from the Caddyfile — use [deploy] for the webhook \
                  and 'slip services expose' / static routes for other hosts."
             );
-            std::process::exit(0);
+            std::process::exit(78);
         }
         Err(e) => {
             tracing::error!(error = %e, "failed to bootstrap Caddy");
