@@ -25,6 +25,9 @@ GitHub Actions → signed webhook → slipd → pull → health check → swap r
 - **Secrets management** — per-app secret store with restrictive file permissions
 - **Per-container health** — mixed HTTP + worker containers in a single pod
 - **Structured logging** — JSON logs via `tracing`
+- **`slip init`** — 🚧 WIP (currently a stub; see [v1.0 roadmap](https://linear.app/mitchelljphayes/project/slip-v1-0-roadmap-3b6e6e0b0b0b))
+- **`slip status`** — 🚧 WIP (currently a stub; see [v1.0 roadmap](https://linear.app/mitchelljphayes/project/slip-v1-0-roadmap-3b6e6e0b0b0b))
+- **`slip logs`** — 🚧 WIP (currently a stub; see [v1.0 roadmap](https://linear.app/mitchelljphayes/project/slip-v1-0-roadmap-3b6e6e0b0b0b))
 
 ## Install
 
@@ -58,7 +61,7 @@ listen = "127.0.0.1:7890"
 backend = "auto"          # auto-detects Podman or Docker
 
 [auth]
-secret = "${SLIP_SECRET}"  # global HMAC secret (per-app secrets override it)
+secret = "${SLIP_SECRET}"  # global HMAC fallback; per-app [app] secret overrides it
 
 [registry]
 # ghcr_token = "${GHCR_TOKEN}"   # optional: token for pulling private images
@@ -72,8 +75,10 @@ EOF
 ```
 
 > The `[auth]` and `[registry]` sections are **required** (even if `registry` is
-> empty). `[auth].secret` is the fallback webhook secret; per-app secrets
-> (`slip secrets set <app> SLIP_SECRET=...`) override it.
+> empty). `[auth].secret` is the fallback webhook secret; a per-app `[app] secret`
+> in the app TOML overrides it. **`slip secrets set <app> SLIP_SECRET=...` does
+> NOT affect webhook auth** — it injects the value as a container env var only.
+> See [getting-started.md §6](docs/getting-started.md) for the full distinction.
 
 ### 2. Create an app config
 
@@ -110,10 +115,22 @@ EOF
 
 ### 3. Set the webhook secret
 
-```bash
-# slip secrets set <app> KEY=VALUE  (the management API needs the global token)
-sudo slip secrets set myapp SLIP_SECRET=your-hmac-secret --token "$SLIP_SECRET"
+The webhook signing key is either the **global** `[auth].secret` from `slip.toml`
+or a **per-app** `[app] secret` in the app TOML. To set a per-app secret, add
+`secret` under `[app]` in the app config:
+
+```toml
+[app]
+name = "myapp"
+image = "ghcr.io/you/myapp"
+secret = "your-hmac-key"   # overrides global [auth].secret for this app
+
+# ... rest of the app config unchanged
 ```
+
+> **`slip secrets set <app> SLIP_SECRET=...` does NOT affect webhook auth.**
+> That command injects the value as a container environment variable only.
+> See [getting-started.md §6](docs/getting-started.md) for the full distinction.
 
 ### 4. Start the daemon
 
