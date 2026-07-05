@@ -723,6 +723,42 @@ pub fn load_config(path: &Path) -> Result<(SlipConfig, HashMap<String, AppConfig
     Ok((slip_cfg, apps))
 }
 
+// ─── [app] secret migration ────────────────────────────────────────────────────
+
+/// Migrate deprecated `[app] secret` values from TOML into the secrets store.
+///
+/// For each app that has `app.secret` set, the value is written to the secrets
+/// store under the reserved `__deploy_key` name.  A deprecation warning is
+/// emitted.  The TOML field is then cleared so subsequent writes don't re-migrate.
+///
+/// This is called once at daemon startup.  The TOML field remains readable as
+/// a fallback during the migration window.
+pub fn migrate_app_secrets(
+    apps: &mut HashMap<String, AppConfig>,
+    secrets_store: &crate::secrets::SecretsStore,
+) {
+    for (name, app_cfg) in apps.iter_mut() {
+        if let Some(ref secret) = app_cfg.app.secret {
+            // Only migrate if no deploy key already exists in the store.
+            if secrets_store.get_deploy_key(name).ok().flatten().is_none() {
+                if let Err(e) = secrets_store.set(name, crate::secrets::DEPLOY_KEY_NAME, secret) {
+                    tracing::warn!(
+                        app = %name,
+                        error = %e,
+                        "failed to migrate [app] secret to secrets store"
+                    );
+                } else {
+                    tracing::warn!(
+                        app = %name,
+                        "migrated deprecated [app] secret to secrets store — remove the `secret` field from apps/{}.toml",
+                        name
+                    );
+                }
+            }
+        }
+    }
+}
+
 // ─── Config write-back functions ──────────────────────────────────────────────
 
 /// Write an app configuration to disk atomically.

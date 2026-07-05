@@ -3,6 +3,9 @@
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
+use tracing::warn;
+
+use crate::secrets::SecretsStore;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -42,21 +45,61 @@ pub fn compute_signature(body: &[u8], secret: &str) -> String {
     hex::encode(result)
 }
 
-/// Resolve the HMAC secret for a given app.
-/// Uses per-app secret if set, otherwise falls back to global secret.
-pub fn resolve_secret<'a>(app_secret: Option<&'a str>, global_secret: &'a str) -> &'a str {
-    app_secret.unwrap_or(global_secret)
+/// Resolve the HMAC secret for a given app, returning an owned String.
+///
+/// Resolution order:
+/// 1. Per-app deploy key from the secrets store (if present)
+/// 2. `[app] secret` from the app TOML (deprecated — migration fallback)
+/// 3. Global `[auth].secret` (backward compat)
+///
+/// When the global secret is used for an app deploy, a warning is logged so
+/// operators can migrate to per-app deploy keys.
+pub fn resolve_secret(
+    app_secret: Option<&str>,
+    global_secret: &str,
+    secrets_store: &SecretsStore,
+    app_name: &str,
+) -> String {
+    // 1. Check the secrets store for a deploy key.
+    if let Ok(Some(deploy_key)) = secrets_store.get_deploy_key(app_name) {
+        return deploy_key;
+    }
+
+    // 2. Check the deprecated [app] secret from TOML.
+    if let Some(secret) = app_secret {
+        warn!(
+            app = %app_name,
+            "app uses deprecated [app] secret from TOML — migrate to per-app deploy key via PUT /v1/apps/{}/key",
+            app_name
+        );
+        return secret.to_string();
+    }
+
+    // 3. Fall back to global secret.
+    warn!(
+        app = %app_name,
+        "app deploy authenticated with global [auth].secret — set a per-app deploy key via PUT /v1/apps/{}/key",
+        app_name
+    );
+    global_secret.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     const SECRET: &str = "test-secret";
     const BODY: &[u8] = b"hello world";
 
     fn make_header(sig: &str) -> String {
         format!("sha256={}", sig)
+    }
+
+    fn test_store() -> (TempDir, SecretsStore) {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretsStore::new(tmp.path().join("secrets")).unwrap();
+        (tmp, store)
     }
 
     #[test]
@@ -103,15 +146,25 @@ mod tests {
     }
 
     #[test]
-    fn resolve_secret_uses_app_secret_when_present() {
-        assert_eq!(
-            resolve_secret(Some("app-secret"), "global-secret"),
-            "app-secret"
-        );
+    fn resolve_secret_uses_deploy_key_when_present() {
+        let (_tmp, store) = test_store();
+        store.set_deploy_key("testapp").unwrap();
+        let key = store.get_deploy_key("testapp").unwrap().unwrap();
+        let result = resolve_secret(Some("app-secret"), "global-secret", &store, "testapp");
+        assert_eq!(result, key);
+    }
+
+    #[test]
+    fn resolve_secret_uses_app_secret_when_no_deploy_key() {
+        let (_tmp, store) = test_store();
+        let result = resolve_secret(Some("app-secret"), "global-secret", &store, "testapp");
+        assert_eq!(result, "app-secret");
     }
 
     #[test]
     fn resolve_secret_falls_back_to_global() {
-        assert_eq!(resolve_secret(None, "global-secret"), "global-secret");
+        let (_tmp, store) = test_store();
+        let result = resolve_secret(None, "global-secret", &store, "testapp");
+        assert_eq!(result, "global-secret");
     }
 }

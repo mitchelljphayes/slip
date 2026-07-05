@@ -66,5 +66,8 @@ regex = "1"
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 rusqlite_migration = "1"
 
+# Crypto RNG (for deploy key generation)
+getrandom = "0.2"
+
 # Shared crate
 slip-core = { path = "crates/slip-core" }

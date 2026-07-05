@@ -403,6 +403,10 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
             "/v1/apps/{name}/secrets/{key}",
             axum::routing::delete(handle_remove_secret),
         )
+        .route(
+            "/v1/apps/{name}/key",
+            axum::routing::put(handle_set_deploy_key),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             management_auth,
@@ -503,9 +507,14 @@ async fn verify_preview_auth(
             .cloned()
             .ok_or_else(|| AppError::NotFound(format!("unknown app: {app}")))?;
 
-        let secret = resolve_secret(app_cfg.app.secret.as_deref(), &state.config.auth.secret);
+        let secret = resolve_secret(
+            app_cfg.app.secret.as_deref(),
+            &state.config.auth.secret,
+            &state.secrets_store,
+            app,
+        );
 
-        if verify_signature(sig_header, hmac_body.as_bytes(), secret) {
+        if verify_signature(sig_header, hmac_body.as_bytes(), &secret) {
             return Ok(());
         }
 
@@ -976,6 +985,100 @@ async fn handle_remove_secret(
     Ok((StatusCode::OK, Json(serde_json::json!({"status": "ok"}))))
 }
 
+// ─── Deploy key handler ────────────────────────────────────────────────────────
+
+/// Request body for `PUT /v1/apps/{name}/key`.
+#[derive(Debug, Deserialize)]
+pub struct SetDeployKeyRequest {
+    /// If `true`, rotates the key even if one already exists.
+    /// If `false` (default), only creates a key if none exists.
+    #[serde(default)]
+    pub rotate: bool,
+}
+
+/// Response for `PUT /v1/apps/{name}/key`.
+#[derive(Debug, Serialize)]
+pub struct SetDeployKeyResponse {
+    pub app: String,
+    /// The deploy key. Appears only in this response — never in logs, TOML,
+    /// or GET responses.
+    pub key: String,
+    /// Whether the key was rotated (true) or newly created (false).
+    pub rotated: bool,
+}
+
+/// `PUT /v1/apps/{name}/key` — Generate or rotate a per-app deploy key.
+///
+/// The key is stored in the secrets store (not in app TOML) with 0o600 perms.
+/// It is returned **once** in the response body.  The caller is responsible
+/// for saving it (e.g. into CI secrets).
+///
+/// Admin-token gated (via the management auth middleware).
+async fn handle_set_deploy_key(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<SetDeployKeyRequest>,
+) -> Result<(StatusCode, Json<SetDeployKeyResponse>), AppError> {
+    // Verify app exists
+    {
+        let apps = state.apps.read().await;
+        if !apps.contains_key(&name) {
+            return Err(AppError::NotFound(format!("app '{}' not found", name)));
+        }
+    }
+
+    // Check if a deploy key already exists.
+    let existing = state
+        .secrets_store
+        .get_deploy_key(&name)
+        .map_err(|e| AppError::Internal(format!("failed to read deploy key: {e}")))?;
+
+    let rotated = match existing {
+        Some(_) if req.rotate => {
+            // Rotate: generate a new key, replacing the old one.
+            true
+        }
+        Some(_) => {
+            // Key exists but rotate not requested — return existing key.
+            false
+        }
+        None => {
+            // No existing key — create one.
+            false
+        }
+    };
+
+    let key = if rotated {
+        // Generate a new key (overwrites the old one).
+        state
+            .secrets_store
+            .set_deploy_key(&name)
+            .map_err(|e| AppError::Internal(format!("failed to set deploy key: {e}")))?
+    } else if let Some(existing_key) = existing {
+        existing_key
+    } else {
+        state
+            .secrets_store
+            .set_deploy_key(&name)
+            .map_err(|e| AppError::Internal(format!("failed to set deploy key: {e}")))?
+    };
+
+    info!(
+        app = %name,
+        rotated = rotated,
+        "deploy key set"
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(SetDeployKeyResponse {
+            app: name,
+            key,
+            rotated,
+        }),
+    ))
+}
+
 // ─── Deploy handler ───────────────────────────────────────────────────────────
 
 /// `POST /v1/deploy`
@@ -1016,11 +1119,16 @@ async fn handle_deploy(
         .cloned()
         .ok_or_else(|| AppError::NotFound(format!("unknown app: {}", request.app)))?;
 
-    // 5. Resolve HMAC secret.
-    let secret = resolve_secret(app_cfg.app.secret.as_deref(), &state.config.auth.secret);
+    // 5. Resolve HMAC secret (deploy key → app TOML → global fallback).
+    let secret = resolve_secret(
+        app_cfg.app.secret.as_deref(),
+        &state.config.auth.secret,
+        &state.secrets_store,
+        &request.app,
+    );
 
     // 6. Verify HMAC signature.
-    if !verify_signature(sig_header, &body, secret) {
+    if !verify_signature(sig_header, &body, &secret) {
         warn!(app = %request.app, "deploy rejected: invalid signature");
         return Err(AppError::Unauthorized("invalid signature".to_string()));
     }

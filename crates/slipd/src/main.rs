@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Load configuration ───────────────────────────────────────────────────
-    let (slip_config, apps) = load_config(config_path).map_err(|e| {
+    let (slip_config, mut apps) = load_config(config_path).map_err(|e| {
         tracing::error!(error = %e, "failed to load configuration");
         anyhow::anyhow!("config error: {e}")
     })?;
@@ -251,6 +251,11 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!(error = %e, "failed to initialize secrets store");
             anyhow::anyhow!("secrets store error: {e}")
         })?;
+
+    // ── Migrate deprecated [app] secret from TOML to secrets store ──────────
+    // This runs once at daemon startup.  The TOML field remains readable as a
+    // fallback during the migration window.
+    slip_core::config::migrate_app_secrets(&mut apps, &secrets_store);
 
     let state = Arc::new(AppState {
         config: slip_config,
