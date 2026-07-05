@@ -2,6 +2,11 @@
 
 This guide walks through setting up slip on a Linux VPS (e.g. Arakeen) to deploy your first app.
 
+> **Note:** This guide describes the current manual setup process. The target UX
+> (one-command `slip init`, per-app deploy keys, slip-owned webhook ingress) is
+> tracked in the [v1.0 roadmap project](https://linear.app/mitchelljphayes/project/slip-v1-0-roadmap-3b6e6e0b0b0b).
+> The interim steps below will be replaced as those features ship.
+
 ## Prerequisites
 
 You need on the server:
@@ -85,7 +90,7 @@ listen = "127.0.0.1:7890"
 backend = "auto"          # "auto" | "docker" | "podman"
 
 [auth]
-secret = "${SLIP_SECRET}"  # global HMAC fallback; per-app secrets override it
+secret = "${SLIP_SECRET}"  # global HMAC fallback; per-app [app] secret overrides it
 
 [registry]
 # ghcr_token = "${GHCR_TOKEN}"   # optional: token for pulling private images
@@ -204,44 +209,71 @@ EOF
 
 ## 5. Configure Caddy to proxy the webhook endpoint
 
-slip listens on localhost. To receive webhooks from CI over the public internet, add a Caddy reverse proxy:
+slip listens on localhost. To receive webhooks from CI over the public internet, add a Caddy reverse proxy.
+
+> **⚠️ WARNING — Caddyfile site blocks are incompatible with slipd on Caddy ≥ 2.11**
+>
+> slipd creates a Caddy server named `slip` listening on `:443`. Any Caddyfile site block
+> (`deploy.yourdomain.com { … }`) adapts into a *separate* server (e.g. `srv0`) also on
+> `:443`. Caddy ≥ 2.11 rejects two servers claiming the same listener:
+> `listener address repeated: tcp/:443 (already claimed by server 'slip')`. This causes
+> slipd's bootstrap to fail and the daemon to **crash-loop** (`Restart=on-failure`).
+>
+> **Do not add the deploy webhook route to your Caddyfile.** Use the admin API instead
+> (see below). A permanent fix is tracked in [SLIP-87](https://linear.app/mitchelljphayes/issue/SLIP-87)
+> — slipd will own the webhook route itself, making this interim pattern unnecessary.
+
+### Interim pattern: add the route via Caddy's admin API
+
+Use `curl` to add a single route into slipd's existing `slip` server, with a non-`slip-`
+`@id` so slipd's own reconciliation never deletes it:
 
 ```bash
-sudo tee /etc/caddy/slip-proxy.json > /dev/null << 'EOF'
-{
-  "apps": {
-    "http": {
-      "servers": {
-        "slip": {
-          "listen": [":443"],
-          "routes": [
-            {
-              "match": [{"host": ["deploy.yourdomain.com"]}],
-              "handle": [{
-                "handler": "reverse_proxy",
-                "upstreams": [{"dial": "127.0.0.1:7890"}]
-              }]
-            }
-          ]
-        }
-      }
+# 1. Add the reverse-proxy route
+curl -X POST http://localhost:2019/config/apps/http/servers/slip/routes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "@id": "manual-deploy-webhook",
+    "match": [{"host": ["deploy.yourdomain.com"]}],
+    "handle": [{
+      "handler": "reverse_proxy",
+      "upstreams": [{"dial": "127.0.0.1:7890"}]
+    }]
+  }'
+
+# 2. Add a TLS automation policy (required for tailnet-only / non-public hosts)
+#    For a public host with a real domain, Caddy's default ACME issuer works.
+#    For a tailnet-only host (grey-cloud DNS → Tailscale IP), use the internal CA:
+curl -X POST http://localhost:2019/config/apps/tls/automation/policies \
+  -H "Content-Type: application/json" \
+  -d '{
+    "subjects": ["deploy.yourdomain.com"],
+    "issuer": {
+      "module": "internal"
     }
-  }
-}
-EOF
+  }'
 ```
 
-Or simpler — add it to your Caddyfile:
+> **Why two steps?** The route tells Caddy where to send traffic; the TLS policy tells
+> Caddy *how to get a certificate* for that host. Without an explicit policy, Caddy
+> falls back to public ACME (HTTP-01 / TLS-ALPN-01), which **cannot validate a
+> tailnet-only IP** — the TLS handshake fails with `tlsv1 alert internal error` and
+> the webhook caller's `--insecure` flag can't help because the server aborts before
+> cert verification. The `internal` issuer uses Caddy's self-signed local CA, which
+> matches the `--insecure` intent and works on any network.
+>
+> **Persistence:** Admin-API routes are lost on Caddy restart. If you restart Caddy,
+> re-run the two `curl` commands above (or script them into a oneshot systemd service
+> that runs after `caddy.service`). This is another reason SLIP-87 (slipd owning the
+> webhook route) is the permanent fix.
 
-```
-deploy.yourdomain.com {
-    reverse_proxy 127.0.0.1:7890
-}
-```
+### Verify the route
 
 ```bash
-sudo systemctl reload caddy
+curl -s http://localhost:2019/config/apps/http/servers/slip/routes | python3 -m json.tool
 ```
+
+You should see your `manual-deploy-webhook` route alongside slipd's `slip-<app>-<n>` routes.
 
 ## 6. Set up secrets
 
@@ -249,11 +281,53 @@ The CLI subcommand is `slip secrets` (plural). It calls slipd's management API,
 which requires the global token (`[auth].secret`). The form is
 `slip secrets set <app> KEY=VALUE [KEY=VALUE ...]`.
 
+### Two separate secret systems
+
+It is critical to understand that slip has **two independent secret stores**,
+and confusing them is the most common cause of 401 errors:
+
+| Store | Set via | Purpose |
+|-------|---------|---------|
+| **App TOML `[app] secret`** | Edit `/etc/slip/apps/<name>.toml` | **Webhook HMAC signing** — the key used to verify `X-Slip-Signature` on deploy requests |
+| **Secrets store** | `slip secrets set <app> KEY=VALUE` | **Container env injection** — values are written to files under `/var/lib/slip/secrets/` and injected as environment variables at deploy time |
+
+### Webhook auth: how the HMAC secret is resolved
+
+When slipd receives a deploy webhook, it resolves the HMAC signing key in this
+order (see `crates/slip-core/src/api.rs:1020`):
+
+1. **Per-app `[app] secret`** in the app TOML — if set, this is used.
+2. **Global `[auth].secret`** from `slip.toml` — fallback if no per-app secret.
+
+> **`slip secrets set <app> SLIP_SECRET=…` does NOT affect webhook auth.**
+> That command writes to the *env-injection* store. The value is injected into
+> the container as an environment variable named `SLIP_SECRET` — it has nothing
+> to do with HMAC signature verification. This is the root cause of the 401
+> errors documented in [field-report-poi-australia.md §3.1](field-report-poi-australia.md).
+
+To set a per-app webhook secret, add `secret = "your-hmac-key"` to the app's
+TOML file:
+
+```bash
+sudo tee -a /etc/slip/apps/my-app.toml > /dev/null << 'EOF'
+
+# Per-app webhook signing key (overrides global [auth].secret for this app)
+secret = "your-hmac-key"
+EOF
+```
+
+> **Note:** The per-app `[app] secret` field works today but is **deprecated**
+> pending [SLIP-89](https://linear.app/mitchelljphayes/issue/SLIP-89) (per-app
+> deploy keys). The long-term design is a dedicated `slip keys create <app>`
+> command that generates and manages deploy keys separately from the app config.
+
+### App secrets (env injection)
+
+Use `slip secrets set` for values your app needs at runtime — database URLs,
+API tokens, etc. These are **not** used for webhook auth:
+
 ```bash
 TOKEN="your-global-auth-secret"   # the [auth].secret from slip.toml
-
-# Set the webhook signing secret (used to verify CI webhooks)
-sudo slip secrets set my-app SLIP_SECRET=your-hmac-secret-here --token "$TOKEN"
 
 # Set app secrets (injected as env vars at deploy time) — multiple at once
 sudo slip secrets set my-app \
@@ -380,6 +454,6 @@ Your slip-deployed containers can then reach `postgres:5432` by name. See [docs/
 - **Health check fails** — verify your app's `/health` endpoint works inside the container
 - **Caddy route not created** — check `sudo journalctl -u slipd | grep caddy`, ensure Caddy admin API is on `:2019`
 - **Permission denied on Podman socket** — ensure the `slip` user is in the `podman` group, or use Docker's `/var/run/docker.sock`
-- **Webhook 403** — verify the HMAC signature matches; the secret set via `slip secrets set <app> SLIP_SECRET=...` must match what CI uses
+- **Webhook 401** — verify the HMAC signature matches. The signing key is either the **global** `[auth].secret` from `slip.toml` or the **per-app** `[app] secret` from the app TOML. `slip secrets set <app> SLIP_SECRET=...` does **not** affect webhook auth — it injects the value as a container env var only. See §6 for the full distinction.
 - **`missing field 'auth'` / `'registry'` / `'health'`** — those sections are required; see steps 3-4
 - **`unrecognized subcommand 'secret'`** — the command is `slip secrets` (plural)
