@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use assert_fs::fixture::PathChild;
 use predicates::prelude::*;
 
 // ─── Help / usage ──────────────────────────────────────────────────────────────
@@ -55,15 +56,261 @@ fn status_json_emits_valid_json() {
         .stdout(predicate::str::contains(r#""command":"status all apps""#));
 }
 
+// ─── Init command ────────────────────────────────────────────────────────────────
+
 #[test]
-fn init_stub_exits_nonzero() {
+fn init_help_lists_flags() {
     let mut cmd = Command::cargo_bin("slip").unwrap();
-    let assert = cmd.arg("init").assert();
+    let assert = cmd.args(["init", "--help"]).assert();
+
+    assert
+        .success()
+        .code(output::OK)
+        .stdout(predicate::str::contains("--name"))
+        .stdout(predicate::str::contains("--image"))
+        .stdout(predicate::str::contains("--force"))
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
+fn init_in_tempdir_writes_three_files() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "init",
+            "--name",
+            "testapp",
+            "--image",
+            "ghcr.io/test/testapp",
+        ])
+        .current_dir(tmp.path())
+        .assert();
+
+    assert.success().code(output::OK);
+
+    // Check all three files exist
+    assert!(tmp.child("slip.toml").exists());
+    assert!(tmp.child(".github/workflows/deploy.yml").exists());
+    assert!(tmp.child("AGENTS.md").exists());
+
+    // Verify slip.toml content
+    let slip_toml = std::fs::read_to_string(tmp.child("slip.toml").path()).unwrap();
+    assert!(slip_toml.contains(r#"name = "testapp""#));
+    assert!(slip_toml.contains(r#"strategy = "blue-green""#));
+    // Health guidance should steer away from /
+    assert!(slip_toml.contains(r#"Do NOT use path = "/""#));
+    assert!(slip_toml.contains(r#"path = "/healthz""#));
+    // Commented needs examples
+    assert!(slip_toml.contains(r#"[needs.db]"#));
+    assert!(slip_toml.contains(r#"[needs.storage]"#));
+    assert!(slip_toml.contains(r#"[needs.cache]"#));
+
+    // Verify deploy.yml content
+    let deploy_yml =
+        std::fs::read_to_string(tmp.child(".github/workflows/deploy.yml").path()).unwrap();
+    assert!(deploy_yml.contains(r#"APP: "testapp""#));
+    assert!(deploy_yml.contains(r#"IMAGE: "ghcr.io/test/testapp""#));
+    assert!(deploy_yml.contains(r#"X-Slip-Signature"#));
+    assert!(deploy_yml.contains(r#"SLIP_DEPLOY_SECRET"#));
+    assert!(deploy_yml.contains(r#"SLIP_DEPLOY_URL"#));
+    assert!(deploy_yml.contains(r#"TS_AUTHKEY"#));
+
+    // Verify AGENTS.md content
+    let agents_md = std::fs::read_to_string(tmp.child("AGENTS.md").path()).unwrap();
+    assert!(agents_md.contains("## slip deploy contract"));
+    assert!(agents_md.contains("POST /v1/deploy"));
+    assert!(agents_md.contains("X-Slip-Signature"));
+    assert!(agents_md.contains("blue-green"));
+    assert!(agents_md.contains("GET /v1/deploys/{id}"));
+
+    tmp.close().unwrap();
+}
+
+#[test]
+fn init_without_force_refuses_to_clobber() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+
+    // First run
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    cmd.args([
+        "init",
+        "--name",
+        "testapp",
+        "--image",
+        "ghcr.io/test/testapp",
+    ])
+    .current_dir(tmp.path())
+    .assert()
+    .success();
+
+    // Second run without --force
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "init",
+            "--name",
+            "testapp",
+            "--image",
+            "ghcr.io/test/testapp",
+        ])
+        .current_dir(tmp.path())
+        .assert();
 
     assert
         .failure()
         .code(output::GENERIC)
-        .stderr(predicate::str::contains("not yet implemented"));
+        .stderr(predicate::str::contains("already exist"));
+
+    tmp.close().unwrap();
+}
+
+#[test]
+fn init_with_force_overwrites() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+
+    // First run
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    cmd.args([
+        "init",
+        "--name",
+        "testapp",
+        "--image",
+        "ghcr.io/test/testapp",
+    ])
+    .current_dir(tmp.path())
+    .assert()
+    .success();
+
+    // Second run with --force
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "init",
+            "--name",
+            "testapp",
+            "--image",
+            "ghcr.io/test/testapp",
+            "--force",
+        ])
+        .current_dir(tmp.path())
+        .assert();
+
+    assert.success().code(output::OK);
+
+    tmp.close().unwrap();
+}
+
+#[test]
+fn init_json_output_shape() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let result = cmd
+        .args([
+            "init",
+            "--name",
+            "testapp",
+            "--image",
+            "ghcr.io/test/testapp",
+            "--json",
+        ])
+        .current_dir(tmp.path())
+        .assert()
+        .success()
+        .code(output::OK);
+
+    let stdout = String::from_utf8(result.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(parsed["status"], "ok");
+    assert_eq!(parsed["app"], "testapp");
+    assert_eq!(parsed["image"], "ghcr.io/test/testapp");
+    let files = parsed["files_written"].as_array().unwrap();
+    assert_eq!(files.len(), 3);
+
+    tmp.close().unwrap();
+}
+
+#[test]
+fn init_json_existing_files_reports_status_exists() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+
+    // First run
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    cmd.args([
+        "init",
+        "--name",
+        "testapp",
+        "--image",
+        "ghcr.io/test/testapp",
+    ])
+    .current_dir(tmp.path())
+    .assert()
+    .success();
+
+    // Second run with --json (no --force)
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let result = cmd
+        .args([
+            "init",
+            "--name",
+            "testapp",
+            "--image",
+            "ghcr.io/test/testapp",
+            "--json",
+        ])
+        .current_dir(tmp.path())
+        .assert()
+        .failure()
+        .code(output::GENERIC);
+
+    let stdout = String::from_utf8(result.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(parsed["status"], "exists");
+    assert!(!parsed["files"].as_array().unwrap().is_empty());
+
+    tmp.close().unwrap();
+}
+
+#[test]
+fn init_scaffolded_slip_toml_passes_validate() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+
+    // Run init
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    cmd.args([
+        "init",
+        "--name",
+        "testapp",
+        "--image",
+        "ghcr.io/test/testapp",
+    ])
+    .current_dir(tmp.path())
+    .assert()
+    .success();
+
+    // Parse the generated slip.toml with slip_core's parser
+    let content = std::fs::read_to_string(tmp.child("slip.toml").path()).unwrap();
+    let cfg = slip_core::parse_repo_config(content.as_bytes()).unwrap();
+
+    assert_eq!(cfg.app.name, "testapp");
+    assert_eq!(cfg.app.kind, "container");
+    // Health path should be None (commented out in template)
+    assert!(cfg.health.path.is_none());
+    // Routing
+    assert_eq!(cfg.routing.port, Some(3000));
+    // Resources
+    let resources = cfg.defaults.resources.as_ref().unwrap();
+    assert_eq!(resources.memory.as_deref(), Some("512m"));
+    assert_eq!(resources.cpus.as_deref(), Some("1.0"));
+
+    // Verify the template also has the header comment
+    assert!(content.contains("slip config — managed by you"));
+
+    tmp.close().unwrap();
 }
 
 #[test]

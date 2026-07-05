@@ -30,7 +30,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize slip on this machine (repo scaffold).
-    Init,
+    Init {
+        /// App name (defaults to directory name or git remote org/repo).
+        #[arg(long)]
+        name: Option<String>,
+        /// Container image (defaults to ghcr.io/<org>/<name> from git remote).
+        #[arg(long)]
+        image: Option<String>,
+        /// Overwrite existing files without prompting.
+        #[arg(long)]
+        force: bool,
+    },
     /// Link a local repo to a remote slipd server.
     Link {
         /// slipd server URL (required).
@@ -1137,6 +1147,210 @@ async fn link_command(
     Ok(())
 }
 
+// ─── Init command implementation ──────────────────────────────────────────────
+
+/// Infer the app name from: --name flag > git remote origin org/repo > dir name.
+fn infer_name(explicit: Option<String>) -> String {
+    if let Some(name) = explicit {
+        return name;
+    }
+    // Try git remote origin
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+        && output.status.success()
+    {
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(slug) = parse_gh_repo_slug(&url) {
+            // slug is "org/repo" — use the repo part
+            if let Some(repo) = slug.split('/').nth(1) {
+                return repo.to_string();
+            }
+        }
+    }
+    // Fall back to current directory name
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "myapp".to_string())
+}
+
+/// Infer the image from: --image flag > ghcr.io/<org>/<name> from git remote > ghcr.io/<dir-name>.
+fn infer_image(explicit: Option<String>, name: &str) -> String {
+    if let Some(image) = explicit {
+        return image;
+    }
+    // Try git remote origin for org
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+        && output.status.success()
+    {
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(slug) = parse_gh_repo_slug(&url) {
+            // slug is "org/repo"
+            if let Some(org) = slug.split('/').next() {
+                return format!("ghcr.io/{org}/{name}");
+            }
+        }
+    }
+    format!("ghcr.io/{name}")
+}
+
+/// Files that `slip init` generates.
+const INIT_FILES: &[&str] = &["slip.toml", ".github/workflows/deploy.yml", "AGENTS.md"];
+
+/// Check which files already exist (for idempotent re-run).
+fn check_existing_files() -> Vec<String> {
+    let mut existing = Vec::new();
+    for f in INIT_FILES {
+        if std::path::Path::new(f).exists() {
+            existing.push(f.to_string());
+        }
+    }
+    existing
+}
+
+/// Render the slip.toml template with the given name and image.
+fn render_slip_toml(name: &str, image: &str) -> String {
+    let template = include_str!("../templates/slip.toml");
+    template.replace("{NAME}", name).replace("{IMAGE}", image)
+}
+
+/// Render the deploy.yml template with the given name and image.
+fn render_deploy_yml(name: &str, image: &str) -> String {
+    let template = include_str!("../templates/deploy.yml");
+    template.replace("{NAME}", name).replace("{IMAGE}", image)
+}
+
+/// Render the AGENTS.md section template.
+fn render_agents_md() -> String {
+    include_str!("../templates/AGENTS.md").to_string()
+}
+
+/// Write a file, creating parent directories as needed.
+fn write_file(path: &str, content: &str) -> Result<(), anyhow::Error> {
+    let p = std::path::Path::new(path);
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory: {}", parent.display()))?;
+    }
+    std::fs::write(p, content).with_context(|| format!("failed to write: {path}"))?;
+    Ok(())
+}
+
+fn init_command(name: Option<String>, image: Option<String>, force: bool, json: bool) -> ! {
+    let app_name = infer_name(name);
+
+    // Warn if no git remote was found
+    let has_remote = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !has_remote {
+        eprintln!(
+            "warning: no git remote 'origin' found — using directory name for image inference"
+        );
+    }
+
+    let image_name = infer_image(image, &app_name);
+
+    // Check for existing files
+    let existing = check_existing_files();
+    if !existing.is_empty() && !force {
+        if json {
+            let out = serde_json::json!({
+                "status": "exists",
+                "files": existing,
+                "app": app_name,
+                "image": image_name,
+            });
+            println!("{out}");
+        } else {
+            eprintln!("error: the following files already exist:");
+            for f in &existing {
+                eprintln!("  {f}");
+            }
+            eprintln!("  → use --force to overwrite");
+        }
+        std::process::exit(output::GENERIC);
+    }
+
+    // Render and write files
+    let slip_toml = render_slip_toml(&app_name, &image_name);
+    let deploy_yml = render_deploy_yml(&app_name, &image_name);
+    let agents_md = render_agents_md();
+
+    let mut files_written = Vec::new();
+
+    if let Err(e) = write_file("slip.toml", &slip_toml) {
+        output::fail(
+            output::GENERIC,
+            &format!("failed to write slip.toml: {e}"),
+            "",
+        );
+    }
+    files_written.push("slip.toml".to_string());
+
+    if let Err(e) = write_file(".github/workflows/deploy.yml", &deploy_yml) {
+        output::fail(
+            output::GENERIC,
+            &format!("failed to write .github/workflows/deploy.yml: {e}"),
+            "",
+        );
+    }
+    files_written.push(".github/workflows/deploy.yml".to_string());
+
+    // AGENTS.md: append section or create file
+    let agents_path = std::path::Path::new("AGENTS.md");
+    let final_agents = if agents_path.exists() {
+        let existing_content = std::fs::read_to_string(agents_path).unwrap_or_default();
+        // Check if the slip section already exists
+        if existing_content.contains("## slip deploy contract") {
+            existing_content
+        } else {
+            format!("{}\n\n{}", existing_content.trim_end(), agents_md)
+        }
+    } else {
+        agents_md.clone()
+    };
+    if let Err(e) = write_file("AGENTS.md", &final_agents) {
+        output::fail(
+            output::GENERIC,
+            &format!("failed to write AGENTS.md: {e}"),
+            "",
+        );
+    }
+    files_written.push("AGENTS.md".to_string());
+
+    if json {
+        let out = serde_json::json!({
+            "status": "ok",
+            "files_written": files_written,
+            "app": app_name,
+            "image": image_name,
+        });
+        println!("{out}");
+    } else {
+        println!("✓ Initialized slip project '{}'", app_name);
+        println!("  image: {}", image_name);
+        for f in &files_written {
+            println!("  created: {f}");
+        }
+        println!();
+        println!("Next steps:");
+        println!("  1. Edit slip.toml — set your domain, health check path, and resources");
+        println!(
+            "  2. Run `slip link --server <URL> --app {app_name}` to bind this repo to a slipd server"
+        );
+        println!("  3. Run `slip key --gh` to generate a deploy key and set it as a GitHub secret");
+        println!("  4. Push to main to trigger your first deploy");
+    }
+
+    std::process::exit(output::OK);
+}
+
 // ─── Main entry point ──────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -1147,9 +1361,9 @@ async fn main() -> anyhow::Result<()> {
     let server = resolve_server(&cli.server);
 
     match cli.command {
-        // ── Stubs (Phase 2) ────────────────────────────────────────────────
-        Commands::Init => {
-            output::not_implemented("init", cli.json);
+        // ── Init ───────────────────────────────────────────────────────────
+        Commands::Init { name, image, force } => {
+            init_command(name, image, force, cli.json);
         }
         Commands::Link {
             server: link_server,
