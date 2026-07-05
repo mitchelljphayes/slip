@@ -1,0 +1,46 @@
+# slip config — managed by you; run `slip link` to bind to a server, `slip apply` to deploy
+# See https://github.com/slip/ (docs) for the full reference.
+
+[app]
+name = "{NAME}"
+kind = "container"
+
+[routing]
+# Edit this to your real domain, e.g. "myapp.example.com"
+domain = "{NAME}.example.com"
+port = 3000
+
+[health]
+# IMPORTANT: Do NOT use path = "/" for your health check.
+# The root endpoint (/) typically returns HTTP 200 even when the database
+# or other dependencies are down, which means a blue-green swap could
+# route traffic to a broken container.
+#
+# Instead, implement a dedicated readiness endpoint (e.g. /healthz or /ready)
+# that exercises your DB/ORM initialization and other critical dependencies.
+# Uncomment and adjust the path below once your app has a real readiness check:
+# path = "/healthz"
+# interval = "10s"
+# timeout = "5s"
+# retries = 3
+# start_period = "15s"
+
+[deploy]
+# Blue-green deploys: overlapping replicas share one database.
+# See docs/blue-green-contract.md (planned, SLIP-113) for the full contract.
+strategy = "blue-green"
+
+[defaults.resources]
+memory = "512m"
+cpus = "1.0"
+
+# ── Service dependencies (uncomment as needed) ──────────────────────────────
+#
+# [needs.db]
+# type = "postgres"     # → DATABASE_URL
+#
+# [needs.storage]
+# type = "s3"           # → S3_ENDPOINT, S3_REGION, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
+#
+# [needs.cache]
+# type = "kv"           # → REDIS_URL
