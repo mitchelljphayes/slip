@@ -35,47 +35,43 @@ gh pr merge <N> --squash --delete-branch
 
 # 7. Reconcile the workspace — ORDER MATTERS (see below)
 git fetch origin
-but status                                      # refresh state FIRST (may render an error; that's fine)
-but unapply slip-<ticket>-<short-desc>          # remove the integrated branch from the workspace
-but pull                                        # integrates the new base
+but pull                                        # EXPECTED to fail ("Chosen resolutions…") — this rebuilds the stack state
+but unapply slip-<ticket>-<short-desc>          # now succeeds; removes the integrated branch
+but pull                                        # fast-forwards the base cleanly
 git remote prune origin
 ```
 
 ### ⚠️ Post-squash reconciliation — the order matters
 
 We squash-merge PRs (clean main history). Because a squash commit is a new
-commit (the branch tip is never an ancestor of main), GitButler relies on its
-own integration detection, and the CLI needs a specific sequence to reconcile:
+commit (the branch tip is never an ancestor of main), the GitButler CLI can't
+auto-archive the integrated branch, and needs this exact sequence (validated
+empirically on PR #41, after the naive orders all failed on PRs #30–40):
 
 1. `git fetch origin` — get the squash commit
-2. `but status` — **this refreshes GitButler's state cache.** Skipping it is
-   what breaks the next steps. It may render an error like
-   "Could not find branch CLI id '' in IdMap" — that's cosmetic; continue.
-3. `but unapply <branch>` — removes the integrated branch from the workspace
+2. `but pull` — **expect it to FAIL** with
+   `Error during integration: Chosen resolutions do not match quantity of applied virtual branches`.
+   This failure is load-bearing: the pull attempt rebuilds the internal stack
+   state so the next step can find the branch. (Running `but unapply` before
+   this fails with "not found in any applied stack".)
+3. `but unapply <branch>` — now succeeds ("Unapplied stack with branches …")
 4. `but pull` — fast-forwards the base cleanly
 5. `git remote prune origin` — clear the deleted remote ref
 
-Observed empirically: with the `but status` refresh in between, the sequence
-reconciles cleanly. Running `but unapply` immediately after the fetch (no
-status refresh) fails with "not found in any applied stack" while `but pull`
-still sees the branch — a stale-cache inconsistency that then requires the
-recovery below.
+Cosmetic errors from `but status` during this dance ("Could not find branch
+CLI id '' in IdMap") clear themselves once the next branch is created.
 
-### Recovery: `but pull` blocked on an integrated branch
+### Recovery: if the sequence above still doesn't reconcile
 
-If `but pull` blocks with
-`Error during integration: Chosen resolutions do not match quantity of applied virtual branches`:
+Last resort (should not be needed if the order above is followed):
 
-1. `but status` then retry `but unapply <branch>` and `but pull`
-2. If still blocked: edit `.git/gitbutler/virtual_branches.toml`, find the
-   branch's `[branches.<uuid>]` block, set `in_workspace = true` →
-   `in_workspace = false`
-3. `but pull` (now fast-forwards)
-4. `git remote prune origin`
-5. If `but status` shows "Could not find branch CLI id '' in IdMap", it's
-   cosmetic stale metadata — creating the next branch (`but branch new …`)
-   clears it. The GitButler GUI handles this integration dialog natively, so
-   reconciling from the GUI is also always an option.
+1. Edit `.git/gitbutler/virtual_branches.toml`, find the branch's
+   `[branches.<uuid>]` block, set `in_workspace = true` → `in_workspace = false`
+2. `but pull` (now fast-forwards)
+3. `git remote prune origin`
+
+The GitButler GUI handles this integration dialog natively, so reconciling
+from the GUI is also always an option.
 
 ### Hard rules
 
