@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+  # Run on all pull requests regardless of base branch so stacked PRs
+  # (whose base is another feature branch, not main) still get CI.
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,4 +49,71 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
+
+  caddy-contract:
+    name: Caddy Contract Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Caddy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
+          curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+          curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+          sudo apt-get update
+          sudo apt-get install -y caddy
+      - name: Prepare Caddy for tests
+        run: |
+          # The apt package starts a caddy systemd service that holds :80/:443.
+          # Stop it so the test-spawned Caddy can bind those ports.
+          sudo systemctl stop caddy || true
+          # Allow the unprivileged test process to bind privileged ports.
+          sudo setcap 'cap_net_bind_service=+ep' "$(command -v caddy)"
+      - run: cargo test -p slip-core --test caddy_contract -- --ignored --test-threads=1
+
+  e2e:
+    name: End-to-End Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Caddy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
+          curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+          curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+          sudo apt-get update
+          sudo apt-get install -y caddy
+      - name: Prepare Caddy for tests
+        run: |
+          # The apt package starts a caddy systemd service that holds :80/:443.
+          # Stop it so the test-spawned Caddy can bind those ports.
+          sudo systemctl stop caddy || true
+          # Allow the unprivileged test process to bind privileged ports.
+          sudo setcap 'cap_net_bind_service=+ep' "$(command -v caddy)"
+      - name: Start Caddy
+        run: |
+          caddy run --config <(echo '{"admin":{"listen":"127.0.0.1:2019"}}') &
+          for i in $(seq 1 30); do
+            if curl -s http://127.0.0.1:2019/config/ >/dev/null 2>&1; then
+              echo "Caddy is ready"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "Caddy did not start within 30s"
+              exit 1
+            fi
+            sleep 1
+          done
+      - run: cargo build --release --bin slipd
+      - name: Run smoke test
+        run: SLIP_BIN=./target/release/slipd ./scripts/smoke-test.sh
+        env:
+          SLIP_SECRET: test-secret

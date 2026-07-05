@@ -64,9 +64,9 @@ json_get() {
     local json="$1"
     local key="$2"
     if command -v jq &>/dev/null; then
-        echo "$json" | jq -r "$key // empty"
+        echo "$json" | jq -r ".$key // empty"
     else
-        echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get($key,''))" 2>/dev/null || echo ""
+        echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('$key',''))" 2>/dev/null || echo ""
     fi
 }
 
@@ -107,7 +107,7 @@ poll_deploy() {
         local response
         response=$(curl -s "http://localhost:7890/v1/deploys/$deploy_id")
         local status
-        status=$(json_get "$response" "'.status'")
+        status=$(json_get "$response" "status")
         
         printf "  [%3ds] %s\r" "$elapsed" "$status"
         
@@ -119,7 +119,7 @@ poll_deploy() {
                 ;;
             failed)
                 local error
-                error=$(json_get "$response" "'.error'")
+                error=$(json_get "$response" "error")
                 echo ""
                 echo "FAIL: deploy failed: $error"
                 return 1
@@ -196,7 +196,7 @@ fi
 
 # ── Start slipd ─────────────────────────────────────────────────────────────────
 echo ">>> Starting slipd..."
-"$SLIP_BIN" --config "$CONFIG_DIR/slip.toml" &
+"$SLIP_BIN" --config "$CONFIG_DIR" &
 SLIPD_PID=$!
 echo "slipd PID: $SLIPD_PID"
 
@@ -231,7 +231,7 @@ if [ "$HTTP_CODE" != "202" ]; then
 fi
 echo "PASS: deploy accepted (202)"
 
-DEPLOY_ID=$(json_get "$BODY" "'.deploy_id'")
+DEPLOY_ID=$(json_get "$BODY" "deploy_id")
 if [ -z "$DEPLOY_ID" ]; then
     echo "FAIL: could not extract deploy_id"
     exit 1
@@ -264,7 +264,7 @@ if [ "$HTTP_CODE" != "202" ]; then
 fi
 echo "PASS: deploy accepted (202)"
 
-DEPLOY_ID=$(json_get "$BODY" "'.deploy_id'")
+DEPLOY_ID=$(json_get "$BODY" "deploy_id")
 echo "Deploy ID: $DEPLOY_ID"
 
 poll_deploy "$DEPLOY_ID" || exit 1
@@ -296,7 +296,7 @@ if [ "$HTTP_CODE" != "202" ]; then
 fi
 echo "PASS: deploy accepted (202)"
 
-DEPLOY_ID=$(json_get "$BODY" "'.deploy_id'")
+DEPLOY_ID=$(json_get "$BODY" "deploy_id")
 echo "Deploy ID: $DEPLOY_ID"
 
 # This should fail

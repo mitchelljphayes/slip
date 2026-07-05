@@ -318,6 +318,7 @@ pub struct VolumeConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
     pub app: AppInfo,
+    #[serde(default)]
     pub routing: RoutingConfig,
     pub health: HealthConfig,
     pub deploy: DeployConfig,
@@ -364,7 +365,7 @@ pub struct RouteEntry {
 /// For worker apps (kind = "worker"), all fields are absent.
 ///
 /// When `routes` is non-empty, it takes precedence over `domain`/`port`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RoutingConfig {
     #[serde(default)]
     pub domain: Option<String>,

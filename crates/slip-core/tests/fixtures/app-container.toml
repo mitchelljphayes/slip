@@ -1,0 +1,22 @@
+[app]
+name = "my-app"
+image = "ghcr.io/youruser/my-app"
+
+[routing]
+domain = "myapp.yourdomain.com"
+port = 8080
+
+[health]
+path = "/health"
+interval = "2s"
+timeout = "5s"
+retries = 5
+start_period = "10s"
+
+[deploy]
+strategy = "blue-green"
+drain_timeout = "30s"
+
+[resources]
+memory = "512m"
+cpus = "1.0"
