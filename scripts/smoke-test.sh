@@ -196,7 +196,7 @@ fi
 
 # ── Start slipd ─────────────────────────────────────────────────────────────────
 echo ">>> Starting slipd..."
-"$SLIP_BIN" --config "$CONFIG_DIR/slip.toml" &
+"$SLIP_BIN" --config "$CONFIG_DIR" &
 SLIPD_PID=$!
 echo "slipd PID: $SLIPD_PID"
 
