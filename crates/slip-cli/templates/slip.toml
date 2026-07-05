@@ -4,6 +4,7 @@
 [app]
 name = "{NAME}"
 kind = "container"
+image = "{IMAGE}"
 
 [routing]
 # Edit this to your real domain, e.g. "myapp.example.com"

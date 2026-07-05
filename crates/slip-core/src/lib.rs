@@ -4,6 +4,7 @@ pub mod caddy;
 pub mod config;
 pub mod db;
 pub mod deploy;
+pub mod diff;
 pub mod docker;
 pub mod error;
 pub mod health;
@@ -18,7 +19,9 @@ pub mod state;
 pub mod validate;
 
 // Re-exports for convenience
-pub use api::{AppState, DeployRequest, DeployResponse, PreviewRequestInfo, build_router};
+pub use api::{
+    AppResponse, AppState, DeployRequest, DeployResponse, PreviewRequestInfo, build_router,
+};
 pub use caddy::{CaddyClient, ReverseProxy, RouteInfo};
 pub use config::{
     AppConfig, AppInfo, AppPreviewConfig, CaddyConfig, CaddyTlsConfig, DeployConfig, EnvFileConfig,
@@ -37,7 +40,9 @@ pub use manifest::{ManifestError, RenderContext, render_manifest};
 pub use merge::{MergedConfig, MergedVolume, merge_config};
 pub use podman::PodmanBackend;
 pub use preview::{PersistedPreviewState, PreviewState};
-pub use repo_config::{PreviewConfig, RemoteConfig, RepoConfig, RepoVolume, parse_repo_config};
+pub use repo_config::{
+    PreviewConfig, RemoteConfig, RepoConfig, RepoDeployConfig, RepoVolume, parse_repo_config,
+};
 pub use runtime::{PodInfo, RegistryCredentials, RuntimeBackend};
 pub use secrets::SecretsStore;
 pub use state::{

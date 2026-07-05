@@ -20,8 +20,11 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 toml = { workspace = true }
+json-patch = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"
 assert_fs = "1"
 predicates = "3"
+axum = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

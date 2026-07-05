@@ -65,7 +65,16 @@ enum Commands {
         gh: bool,
     },
     /// Apply a slip.toml config (create or update an app).
-    Apply,
+    Apply {
+        /// App name (defaults to [remote].app from slip.toml).
+        app: Option<String>,
+        /// Show what would change without applying (exit 0 = no changes, 1 = changes).
+        #[arg(long)]
+        dry_run: bool,
+        /// Show environment variable values in the diff (redacted by default).
+        #[arg(long)]
+        no_redact: bool,
+    },
     /// Trigger a deploy.
     Deploy {
         /// App name.
@@ -84,6 +93,12 @@ enum Commands {
         /// Max time to wait when --wait is set (e.g. "10m", "300s"). Default: 10 minutes.
         #[arg(long)]
         wait_timeout: Option<String>,
+        /// Apply slip.toml config before deploying (default: on).
+        #[arg(long, default_value_t = true, overrides_with = "no_apply")]
+        apply: bool,
+        /// Skip applying slip.toml config before deploying.
+        #[arg(long)]
+        no_apply: bool,
     },
     /// Show app or daemon status.
     Status {
@@ -1296,12 +1311,16 @@ fn resolve_app(explicit: Option<String>) -> String {
 }
 
 /// Resolve the token: `--token` flag > `SLIP_TOKEN` env > error.
+///
+/// The error message mentions `--no-apply` as a remedy because `slip deploy`
+/// now requires the admin token by default (for `--apply`). For commands that
+/// don't have `--no-apply`, the mention is harmless.
 fn resolve_token(cli_token: Option<String>) -> String {
     cli_token.unwrap_or_else(|| {
         output::fail(
             output::AUTH,
             "no admin token",
-            "set --token or the SLIP_TOKEN env var",
+            "set --token or the SLIP_TOKEN env var, or use --no-apply to skip config application",
         );
     })
 }
@@ -1410,6 +1429,291 @@ async fn link_command(
             app,
             status_data.version,
         );
+    }
+
+    Ok(())
+}
+
+// ─── Apply command implementation ─────────────────────────────────────────────
+
+/// Apply a slip.toml config: validate, fetch server state, diff, and push.
+async fn apply_command(
+    server: &str,
+    token: &str,
+    app: &str,
+    dry_run: bool,
+    no_redact: bool,
+    json: bool,
+) -> Result<(), anyhow::Error> {
+    let client = create_client();
+
+    // 1. Read slip.toml
+    let content = match std::fs::read_to_string("slip.toml") {
+        Ok(c) => c,
+        Err(e) => {
+            let exit_code = if dry_run {
+                output::DRY_RUN_FAILURE
+            } else {
+                output::GENERIC
+            };
+            output::fail(
+                exit_code,
+                &format!("failed to read slip.toml: {e}"),
+                "run `slip init` to create one, or ensure you're in the repo root",
+            );
+        }
+    };
+
+    // 2. Parse and validate
+    let base_dir = std::path::Path::new(".").to_path_buf();
+    let (config, result) = slip_core::validate::parse_and_validate(&content, &base_dir, false);
+
+    // Print warnings
+    for warning in &result.warnings {
+        if json {
+            let w = serde_json::json!({"warning": warning});
+            eprintln!("{w}");
+        } else {
+            eprintln!("⚠ {warning}");
+        }
+    }
+
+    if !result.is_valid() {
+        if json {
+            println!("{}", serde_json::to_string(&result).unwrap());
+        } else {
+            for error in &result.errors {
+                eprintln!("✗ {error}");
+            }
+        }
+        let exit_code = if dry_run {
+            output::DRY_RUN_FAILURE
+        } else {
+            output::GENERIC
+        };
+        std::process::exit(exit_code);
+    }
+
+    let repo_config = config.expect("valid config should be present");
+
+    // 3. GET /v1/apps/{app} — use reqwest directly to distinguish status codes
+    let get_url = format!("{server}/v1/apps/{app}");
+    let get_resp = client
+        .get(&get_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .context("HTTP request failed")?;
+
+    let status = get_resp.status();
+
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        output::fail(
+            output::AUTH,
+            "authentication failed — invalid or expired token",
+            "check your --token flag or SLIP_TOKEN env var",
+        );
+    }
+
+    if status == reqwest::StatusCode::NOT_FOUND {
+        // 4. App doesn't exist — create it
+        if dry_run {
+            let out = slip_core::diff::ApplyDiff {
+                schema: "slip.apply.diff/v1".to_string(),
+                app: app.to_string(),
+                changed: true,
+                ops: vec![],
+                create: Some(true),
+                message: Some(format!("would create new app '{app}'")),
+                status: None,
+            };
+            if json {
+                println!("{}", serde_json::to_string(&out).unwrap());
+            } else {
+                println!("{}", out.message.as_deref().unwrap_or(""));
+            }
+            std::process::exit(output::CHANGES_PRESENT);
+        }
+
+        let create_payload =
+            slip_core::diff::build_create_payload(&repo_config).unwrap_or_else(|e| {
+                let exit_code = if dry_run {
+                    output::DRY_RUN_FAILURE
+                } else {
+                    output::GENERIC
+                };
+                output::fail(
+                    exit_code,
+                    &e,
+                    "add the missing field(s) to slip.toml, or register the app first via the API",
+                );
+            });
+
+        let create_url = format!("{server}/v1/apps");
+        let create_resp = client
+            .post(&create_url)
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&create_payload)
+            .send()
+            .await
+            .context("HTTP request failed")?;
+
+        if create_resp.status() == reqwest::StatusCode::CONFLICT {
+            // TOCTOU: app was created between our GET and POST — re-fetch and proceed as update
+            let re_get_resp = client
+                .get(&get_url)
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await
+                .context("HTTP request failed")?;
+            if !re_get_resp.status().is_success() {
+                let status_code = re_get_resp.status();
+                let text = re_get_resp.text().await.unwrap_or_default();
+                anyhow::bail!("API error ({}): {}", status_code, text);
+            }
+            let body_bytes = re_get_resp
+                .bytes()
+                .await
+                .context("failed to read response body")?;
+            let server_response: slip_core::api::AppResponse =
+                serde_json::from_slice(&body_bytes).context("failed to parse server response")?;
+
+            let diff = slip_core::diff::compute_diff(&repo_config, &server_response)
+                .context("failed to compute diff")?;
+            if !diff.changed {
+                if json {
+                    println!("{}", serde_json::to_string(&diff).unwrap());
+                } else {
+                    println!("✓ up to date");
+                }
+                return Ok(());
+            }
+            // Fall through to apply the diff below
+            return apply_diff(&client, server, token, app, &diff, &repo_config, json).await;
+        } else if !create_resp.status().is_success() {
+            let status_code = create_resp.status();
+            let text = create_resp.text().await.unwrap_or_default();
+            if status_code == reqwest::StatusCode::UNAUTHORIZED {
+                output::fail(output::AUTH, "authentication failed", "check your token");
+            }
+            anyhow::bail!("API error ({}): {}", status_code, text);
+        } else {
+            let out = slip_core::diff::ApplyDiff {
+                schema: "slip.apply.diff/v1".to_string(),
+                app: app.to_string(),
+                changed: false,
+                ops: vec![],
+                create: None,
+                message: None,
+                status: Some("created".to_string()),
+            };
+            if json {
+                println!("{}", serde_json::to_string(&out).unwrap());
+            } else {
+                println!("+ created new app '{app}'");
+            }
+            return Ok(());
+        }
+    }
+
+    // 5. Parse server response
+    let body_bytes = get_resp
+        .bytes()
+        .await
+        .context("failed to read response body")?;
+    let server_response: slip_core::api::AppResponse =
+        serde_json::from_slice(&body_bytes).context("failed to parse server response")?;
+
+    // 6. Compute diff
+    let diff = slip_core::diff::compute_diff(&repo_config, &server_response)
+        .context("failed to compute diff")?;
+
+    if !diff.changed {
+        if json {
+            println!("{}", serde_json::to_string(&diff).unwrap());
+        } else {
+            println!("✓ up to date");
+        }
+        return Ok(());
+    }
+
+    // 7. Dry-run: render diff and exit
+    if dry_run {
+        let display_diff = if !no_redact { diff.redacted() } else { diff };
+        if json {
+            println!("{}", serde_json::to_string(&display_diff).unwrap());
+        } else {
+            println!(
+                "{}",
+                slip_core::diff::render_human_diff(&display_diff, false)
+            );
+        }
+        std::process::exit(output::CHANGES_PRESENT);
+    }
+
+    // 8. Apply: print diff summary, then PATCH
+    apply_diff(&client, server, token, app, &diff, &repo_config, json).await
+}
+
+/// Apply a computed diff via PATCH.
+async fn apply_diff(
+    client: &reqwest::Client,
+    server: &str,
+    token: &str,
+    app: &str,
+    diff: &slip_core::diff::ApplyDiff,
+    repo_config: &slip_core::RepoConfig,
+    json: bool,
+) -> Result<(), anyhow::Error> {
+    if json {
+        println!("{}", serde_json::to_string(&diff.redacted()).unwrap());
+    } else {
+        println!("{}", slip_core::diff::render_human_diff(diff, true));
+    }
+
+    let update_payload = slip_core::diff::build_update_payload(repo_config);
+    let patch_url = format!("{server}/v1/apps/{app}");
+    let patch_resp = client
+        .patch(&patch_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&update_payload)
+        .send()
+        .await
+        .context("HTTP request failed")?;
+
+    if !patch_resp.status().is_success() {
+        let status_code = patch_resp.status();
+        let text = patch_resp.text().await.unwrap_or_default();
+        match status_code {
+            reqwest::StatusCode::UNAUTHORIZED => {
+                output::fail(output::AUTH, "authentication failed", "check your token");
+            }
+            reqwest::StatusCode::NOT_FOUND => {
+                output::fail(
+                    output::NOT_FOUND,
+                    &format!("app '{app}' not found"),
+                    "it may have been deleted; run `slip apply` again to recreate it",
+                );
+            }
+            _ => {
+                anyhow::bail!("API error ({}): {}", status_code, text);
+            }
+        }
+    }
+
+    let out = slip_core::diff::ApplyDiff {
+        schema: "slip.apply.diff/v1".to_string(),
+        app: app.to_string(),
+        changed: false,
+        ops: vec![],
+        create: None,
+        message: None,
+        status: Some("applied".to_string()),
+    };
+    if json {
+        println!("{}", serde_json::to_string(&out).unwrap());
+    } else {
+        println!("✓ applied");
     }
 
     Ok(())
@@ -1671,8 +1975,14 @@ async fn main() -> anyhow::Result<()> {
             let app = resolve_app(app);
             key_command(&server, &token, &app, rotate, gh, cli.json).await?;
         }
-        Commands::Apply => {
-            output::not_implemented("apply", cli.json);
+        Commands::Apply {
+            app,
+            dry_run,
+            no_redact,
+        } => {
+            let token = resolve_token(cli.token);
+            let app = resolve_app(app);
+            apply_command(&server, &token, &app, dry_run, no_redact, cli.json).await?;
         }
         Commands::Status { app } => {
             let target = match app {
@@ -1721,7 +2031,15 @@ async fn main() -> anyhow::Result<()> {
             secret,
             wait,
             wait_timeout,
+            apply,
+            no_apply,
         } => {
+            let effective_apply = apply && !no_apply;
+            if effective_apply {
+                let token = resolve_token(cli.token);
+                let app_name = resolve_app(Some(app.clone()));
+                apply_command(&server, &token, &app_name, false, false, cli.json).await?;
+            }
             deploy(
                 &server,
                 &app,
