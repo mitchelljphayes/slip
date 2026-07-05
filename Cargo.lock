@@ -1880,6 +1880,7 @@ dependencies = [
  "serde_json",
  "slip-core",
  "tokio",
+ "toml",
  "tracing",
 ]
 

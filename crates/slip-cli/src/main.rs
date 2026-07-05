@@ -11,9 +11,9 @@ mod output;
 #[derive(Parser)]
 #[command(name = "slip", version, about)]
 struct Cli {
-    /// slipd server URL.
-    #[arg(long, default_value = "http://localhost:7890", global = true)]
-    server: String,
+    /// slipd server URL (default: http://localhost:7890, or [remote].server from slip.toml).
+    #[arg(long, global = true)]
+    server: Option<String>,
 
     /// Bearer token for management API (or set SLIP_TOKEN env var).
     #[arg(long, global = true)]
@@ -32,7 +32,14 @@ enum Commands {
     /// Initialize slip on this machine (repo scaffold).
     Init,
     /// Link a local repo to a remote slipd server.
-    Link,
+    Link {
+        /// slipd server URL (required).
+        #[arg(long)]
+        server: String,
+        /// App name (defaults to [app].name in slip.toml).
+        #[arg(long)]
+        app: Option<String>,
+    },
     /// Manage deploy keys.
     Key {
         /// App name (required for now; will be inferred from slip.toml in future).
@@ -966,42 +973,236 @@ fn deprecation_warning() {
     );
 }
 
+// ─── Remote resolution helpers ────────────────────────────────────────────────
+
+/// Read `[remote]` from the repo's `slip.toml` (best-effort).
+///
+/// Returns `None` if the file doesn't exist or can't be parsed.
+fn resolve_remote() -> Option<slip_core::RemoteConfig> {
+    let content = std::fs::read_to_string("slip.toml").ok()?;
+    let value: toml::Value = content.parse().ok()?;
+    let remote = value.get("remote")?;
+    let server = remote.get("server")?.as_str()?.to_string();
+    let app = remote.get("app")?.as_str()?.to_string();
+    Some(slip_core::RemoteConfig { server, app })
+}
+
+/// Resolve the server URL: explicit `--server` flag > `[remote].server` > default.
+fn resolve_server(cli_server: &Option<String>) -> String {
+    if let Some(s) = cli_server {
+        return s.clone();
+    }
+    if let Some(remote) = resolve_remote()
+        && !remote.server.is_empty()
+    {
+        return remote.server;
+    }
+    "http://localhost:7890".to_string()
+}
+
+/// Resolve the app name: explicit arg > `[remote].app` > error.
+fn resolve_app(explicit: Option<String>) -> String {
+    if let Some(app) = explicit {
+        return app;
+    }
+    if let Some(remote) = resolve_remote()
+        && !remote.app.is_empty()
+    {
+        return remote.app;
+    }
+    output::fail(
+        output::USAGE,
+        "no app name",
+        "pass it as a positional argument, set [app].name in slip.toml, or run `slip link --server <URL> --app <name>`",
+    );
+}
+
+/// Resolve the token: `--token` flag > `SLIP_TOKEN` env > error.
+fn resolve_token(cli_token: Option<String>) -> String {
+    cli_token.unwrap_or_else(|| {
+        output::fail(
+            output::AUTH,
+            "no admin token",
+            "set --token or the SLIP_TOKEN env var",
+        );
+    })
+}
+
+// ─── Link command implementation ───────────────────────────────────────────────
+
+/// Response from `GET /v1/status`.
+#[derive(Debug, Deserialize)]
+struct StatusResponse {
+    version: String,
+}
+
+async fn link_command(
+    server: &str,
+    app: &str,
+    token: &str,
+    json: bool,
+) -> Result<(), anyhow::Error> {
+    let client = create_client();
+    let url = format!("{server}/v1/status");
+
+    let resp = match client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            if e.is_connect() || e.is_timeout() {
+                output::fail(
+                    output::GENERIC,
+                    &format!("can't reach slipd at {server} — is it running?"),
+                    "",
+                );
+            }
+            anyhow::bail!("HTTP request failed: {e}");
+        }
+    };
+
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+        || resp.status() == reqwest::StatusCode::FORBIDDEN
+    {
+        output::fail(
+            output::AUTH,
+            "auth failed",
+            "check your admin token (--token or SLIP_TOKEN)",
+        );
+    }
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("API error ({}): {}", status, text);
+    }
+
+    let status_data: StatusResponse = resp
+        .json()
+        .await
+        .context("failed to parse status response")?;
+
+    // Write [remote] to slip.toml using toml::Value round-trip to preserve existing content.
+    let path = std::path::Path::new("slip.toml");
+    let mut doc: toml::Value = if path.exists() {
+        let content = std::fs::read_to_string(path).context("failed to read slip.toml")?;
+        content
+            .parse::<toml::Value>()
+            .unwrap_or(toml::Value::Table(toml::map::Map::new()))
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+
+    // Build the remote table
+    let mut remote_table = toml::map::Map::new();
+    remote_table.insert(
+        "server".to_string(),
+        toml::Value::String(server.to_string()),
+    );
+    remote_table.insert("app".to_string(), toml::Value::String(app.to_string()));
+
+    doc.as_table_mut()
+        .expect("doc is a table")
+        .insert("remote".to_string(), toml::Value::Table(remote_table));
+
+    let output = toml::to_string(&doc).context("failed to serialize slip.toml")?;
+    std::fs::write(path, &output).context("failed to write slip.toml")?;
+
+    let action = if path.exists() { "updated" } else { "created" };
+
+    if json {
+        let out = serde_json::json!({
+            "server": server,
+            "app": app,
+            "slipd_version": status_data.version,
+            "slip_toml": action,
+        });
+        println!("{out}");
+    } else {
+        println!(
+            "Linked {} → {} (app: {}, slipd {})",
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                .unwrap_or_else(|| ".".to_string()),
+            server,
+            app,
+            status_data.version,
+        );
+    }
+
+    Ok(())
+}
+
 // ─── Main entry point ──────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Resolve server from flag > [remote] > default.
+    let server = resolve_server(&cli.server);
+
     match cli.command {
         // ── Stubs (Phase 2) ────────────────────────────────────────────────
         Commands::Init => {
             output::not_implemented("init", cli.json);
         }
-        Commands::Link => {
-            output::not_implemented("link", cli.json);
+        Commands::Link {
+            server: link_server,
+            app: link_app,
+        } => {
+            let token = resolve_token(cli.token);
+
+            // Resolve app: --app flag > [app].name from slip.toml > error.
+            let app = match link_app {
+                Some(a) => a,
+                None => {
+                    // Try reading [app].name from slip.toml
+                    let content = std::fs::read_to_string("slip.toml").ok();
+                    let app_name = content
+                        .as_ref()
+                        .and_then(|c| c.parse::<toml::Value>().ok())
+                        .and_then(|v| {
+                            v.get("app")
+                                .and_then(|a| a.get("name"))
+                                .and_then(|n| n.as_str().map(|s| s.to_string()))
+                        });
+                    match app_name {
+                        Some(name) if !name.is_empty() => name,
+                        _ => output::fail(
+                            output::USAGE,
+                            "no app name",
+                            "pass --app or set [app].name in slip.toml",
+                        ),
+                    }
+                }
+            };
+
+            link_command(&link_server, &app, &token, cli.json).await?;
         }
         Commands::Key { app, rotate, gh } => {
-            let token = cli.token.unwrap_or_else(|| {
-                output::fail(
-                    output::AUTH,
-                    "no admin token",
-                    "set --token or the SLIP_TOKEN env var",
-                );
-            });
-            let app = app.unwrap_or_else(|| {
-                output::fail(
-                    output::USAGE,
-                    "app name is required",
-                    "pass it as a positional argument: `slip key <app>`",
-                );
-            });
-            key_command(&cli.server, &token, &app, rotate, gh, cli.json).await?;
+            let token = resolve_token(cli.token);
+            let app = resolve_app(app);
+            key_command(&server, &token, &app, rotate, gh, cli.json).await?;
         }
         Commands::Apply => {
             output::not_implemented("apply", cli.json);
         }
         Commands::Status { app } => {
-            let target = app.as_deref().unwrap_or("all apps");
+            let target = match app {
+                Some(a) => a,
+                None => {
+                    // Try [remote].app as a fallback
+                    resolve_remote()
+                        .filter(|r| !r.app.is_empty())
+                        .map(|r| r.app)
+                        .unwrap_or_else(|| "all apps".to_string())
+                }
+            };
             output::not_implemented(&format!("status {target}"), cli.json);
         }
         Commands::Logs { app, since } => {
@@ -1037,13 +1238,11 @@ async fn main() -> anyhow::Result<()> {
             image,
             secret,
         } => {
-            deploy(&cli.server, &app, &tag, image, secret).await?;
+            deploy(&server, &app, &tag, image, secret).await?;
         }
         Commands::Rollback { app, to } => {
-            let token = cli.token.context(
-                "SLIP_TOKEN is required for rollback. Set --token or SLIP_TOKEN env var.",
-            )?;
-            rollback(&cli.server, &token, &app, to).await?;
+            let token = resolve_token(cli.token);
+            rollback(&server, &token, &app, to).await?;
         }
         Commands::Validate { path, strict } => {
             let content = match std::fs::read_to_string(&path) {
@@ -1100,31 +1299,27 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Secrets(command) => {
-            let token = cli.token.context(
-                "SLIP_TOKEN is required for secrets commands. Set --token or SLIP_TOKEN env var.",
-            )?;
+            let token = resolve_token(cli.token);
             match command {
                 SecretsCommands::List { app } => {
-                    secrets_list(&cli.server, &token, &app).await?;
+                    secrets_list(&server, &token, &app).await?;
                 }
                 SecretsCommands::Set { app, pairs } => {
-                    secrets_set(&cli.server, &token, &app, pairs).await?;
+                    secrets_set(&server, &token, &app, pairs).await?;
                 }
                 SecretsCommands::Rm { app, key } => {
-                    secrets_rm(&cli.server, &token, &app, &key).await?;
+                    secrets_rm(&server, &token, &app, &key).await?;
                 }
             }
         }
         Commands::Previews(command) => {
-            let token = cli.token.context(
-                "SLIP_TOKEN is required for previews commands. Set --token or SLIP_TOKEN env var.",
-            )?;
+            let token = resolve_token(cli.token);
             match command {
                 PreviewsCommands::List { app } => {
-                    previews_list(&cli.server, &token, &app).await?;
+                    previews_list(&server, &token, &app).await?;
                 }
                 PreviewsCommands::Teardown { app, preview, all } => {
-                    previews_teardown(&cli.server, &token, &app, preview, all).await?;
+                    previews_teardown(&server, &token, &app, preview, all).await?;
                 }
             }
         }
@@ -1132,12 +1327,10 @@ async fn main() -> anyhow::Result<()> {
         // ── Deprecated aliases ──────────────────────────────────────────────
         Commands::Apps(command) => {
             deprecation_warning();
-            let token = cli.token.context(
-                "SLIP_TOKEN is required for apps commands. Set --token or SLIP_TOKEN env var.",
-            )?;
+            let token = resolve_token(cli.token);
             match command {
                 AppsCommands::List => {
-                    apps_list(&cli.server, &token).await?;
+                    apps_list(&server, &token).await?;
                 }
                 AppsCommands::Add {
                     name,
@@ -1148,7 +1341,7 @@ async fn main() -> anyhow::Result<()> {
                     env,
                 } => {
                     apps_add(
-                        &cli.server,
+                        &server,
                         &token,
                         AppsAddArgs {
                             name,
@@ -1170,7 +1363,7 @@ async fn main() -> anyhow::Result<()> {
                     env,
                 } => {
                     apps_edit(
-                        &cli.server,
+                        &server,
                         &token,
                         AppsEditArgs {
                             name,
@@ -1184,7 +1377,7 @@ async fn main() -> anyhow::Result<()> {
                     .await?;
                 }
                 AppsCommands::Rm { name, force } => {
-                    apps_rm(&cli.server, &token, &name, force).await?;
+                    apps_rm(&server, &token, &name, force).await?;
                 }
             }
         }

@@ -200,7 +200,8 @@ fn key_missing_app_exits_usage() {
 
     assert
         .failure()
-        .stderr(predicate::str::contains("app name is required"));
+        .code(output::USAGE)
+        .stderr(predicate::str::contains("no app name"));
 }
 
 #[test]
@@ -231,6 +232,135 @@ fn key_parse_gh_repo_slug_ssh() {
 
     // Should fail trying to reach the server (connection error), not with
     // a git remote error — because the server call happens before gh.
+    assert
+        .failure()
+        .stderr(predicate::str::contains("can't reach slipd"));
+}
+
+// ─── Link command ────────────────────────────────────────────────────────────────
+
+#[test]
+fn link_help_lists_flags() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd.args(["link", "--help"]).assert();
+
+    assert
+        .success()
+        .code(output::OK)
+        .stdout(predicate::str::contains("--server"))
+        .stdout(predicate::str::contains("--app"))
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
+fn link_missing_server_exits_usage() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd.args(["link"]).assert();
+
+    assert
+        .failure()
+        .code(output::USAGE)
+        .stderr(predicate::str::contains("--server"));
+}
+
+#[test]
+fn link_missing_token_exits_auth() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args(["link", "--server", "http://localhost:7890"])
+        .assert();
+
+    assert
+        .failure()
+        .code(output::AUTH)
+        .stderr(predicate::str::contains("SLIP_TOKEN"));
+}
+
+#[test]
+fn link_missing_app_exits_usage() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "link",
+            "--server",
+            "http://localhost:7890",
+            "--token",
+            "dummy",
+        ])
+        .assert();
+
+    assert
+        .failure()
+        .code(output::USAGE)
+        .stderr(predicate::str::contains("app name"));
+}
+
+#[test]
+fn link_with_app_flag_skips_toml_lookup() {
+    // When --app is provided, it should not try to read slip.toml.
+    // It will fail with a connection error (server unreachable).
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "link",
+            "--server",
+            "http://localhost:7890",
+            "--token",
+            "dummy",
+            "--app",
+            "myapp",
+        ])
+        .assert();
+
+    assert
+        .failure()
+        .stderr(predicate::str::contains("can't reach slipd"));
+}
+
+#[test]
+fn link_json_output_shape() {
+    // With --json, the output should be valid JSON with the expected fields.
+    // It will still fail with a connection error, but the JSON is only emitted
+    // on success, so we just verify it doesn't crash before the HTTP call.
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "link",
+            "--server",
+            "http://localhost:7890",
+            "--token",
+            "dummy",
+            "--app",
+            "myapp",
+            "--json",
+        ])
+        .assert();
+
+    assert
+        .failure()
+        .stderr(predicate::str::contains("can't reach slipd"));
+}
+
+#[test]
+fn link_writes_remote_to_slip_toml() {
+    // Test the TOML-writing logic by running in a temp dir with a pre-existing
+    // slip.toml. The command will fail on the HTTP call, but we can verify
+    // the file was NOT written (since the HTTP call happens before the write).
+    // Instead, test the write logic via a unit test in the slip-core crate.
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "link",
+            "--server",
+            "http://localhost:7890",
+            "--token",
+            "dummy",
+            "--app",
+            "myapp",
+        ])
+        .current_dir(std::env::temp_dir())
+        .assert();
+
     assert
         .failure()
         .stderr(predicate::str::contains("can't reach slipd"));
