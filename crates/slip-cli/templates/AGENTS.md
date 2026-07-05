@@ -36,4 +36,4 @@ The deploy strategy is **blue-green** (configured in `slip.toml` under `[deploy]
 
 ### Deploy status API
 
-Poll `GET /v1/deploys/{id}` to check deploy progress. Returns a JSON object with a `status` field. Terminal states: `succeeded`, `failed`, `rolled_back`. See SLIP-98 for the full wait-mode contract.
+Poll `GET /v1/deploys/{id}` to check deploy progress. Returns a JSON object with a `status` field. Terminal states: `completed`, `failed`. See SLIP-98 for the full wait-mode contract.

@@ -78,6 +78,12 @@ enum Commands {
         /// App secret for HMAC signing (or set SLIP_SECRET env var).
         #[arg(long)]
         secret: Option<String>,
+        /// Wait for the deploy to reach a terminal state (completed/failed).
+        #[arg(long)]
+        wait: bool,
+        /// Max time to wait when --wait is set (e.g. "10m", "300s"). Default: 10 minutes.
+        #[arg(long)]
+        wait_timeout: Option<String>,
     },
     /// Show app or daemon status.
     Status {
@@ -316,6 +322,18 @@ struct DeployResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct DeployStatusResponse {
+    deploy_id: String,
+    app: String,
+    tag: String,
+    status: String,
+    started_at: String,
+    finished_at: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SecretsListResponse {
     secrets: Vec<String>,
 }
@@ -535,12 +553,86 @@ async fn apps_rm(server: &str, token: &str, name: &str, force: bool) -> Result<(
     Ok(())
 }
 
+/// Parse a duration string like "10m", "300s", "5m30s" into a Duration.
+fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    if s.is_empty() {
+        return Err("empty duration string".to_string());
+    }
+    let mut total_secs: u64 = 0;
+    let mut current: u64 = 0;
+    for ch in s.chars() {
+        match ch {
+            '0'..='9' => {
+                current = current
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add((ch as u8 - b'0') as u64))
+                    .ok_or_else(|| "overflow in duration".to_string())?;
+            }
+            's' => {
+                total_secs = total_secs
+                    .checked_add(current)
+                    .ok_or_else(|| "overflow in duration".to_string())?;
+                current = 0;
+            }
+            'm' => {
+                total_secs = total_secs
+                    .checked_add(
+                        current
+                            .checked_mul(60)
+                            .ok_or_else(|| "overflow in duration".to_string())?,
+                    )
+                    .ok_or_else(|| "overflow in duration".to_string())?;
+                current = 0;
+            }
+            'h' => {
+                total_secs = total_secs
+                    .checked_add(
+                        current
+                            .checked_mul(3600)
+                            .ok_or_else(|| "overflow in duration".to_string())?,
+                    )
+                    .ok_or_else(|| "overflow in duration".to_string())?;
+                current = 0;
+            }
+            _ => {
+                return Err(format!(
+                    "unexpected character '{ch}' in duration, expected digits followed by s/m/h"
+                ));
+            }
+        }
+    }
+    if current > 0 {
+        return Err("duration must have a unit suffix (s, m, or h)".to_string());
+    }
+    Ok(std::time::Duration::from_secs(total_secs))
+}
+
+/// Determine the exit code for a deploy status string.
+/// Returns -1 if the status is not terminal (still in progress).
+#[allow(dead_code)]
+fn deploy_wait_exit_code(status: &str) -> i32 {
+    match status {
+        "completed" => output::OK,
+        "failed" => output::DEPLOY_FAILED,
+        _ => -1, // not terminal
+    }
+}
+
+/// Terminal deploy statuses.
+fn is_terminal_deploy_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed")
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn deploy(
     server: &str,
     app: &str,
     tag: &str,
     images: Vec<(String, String)>,
     secret: Option<String>,
+    wait: bool,
+    wait_timeout: Option<String>,
+    json: bool,
 ) -> Result<(), anyhow::Error> {
     let client = create_client();
 
@@ -588,12 +680,188 @@ async fn deploy(
     }
 
     let deploy_resp: DeployResponse = resp.json().await.context("failed to parse response")?;
-    println!(
-        "✓ Deploy accepted for '{}' → tag '{}' (deploy_id: {})",
-        deploy_resp.app, deploy_resp.tag, deploy_resp.deploy_id
-    );
 
-    Ok(())
+    if !wait {
+        // Fire-and-forget: backwards compatible behavior.
+        println!(
+            "✓ Deploy accepted for '{}' → tag '{}' (deploy_id: {})",
+            deploy_resp.app, deploy_resp.tag, deploy_resp.deploy_id
+        );
+        return Ok(());
+    }
+
+    // ── Wait mode: poll until terminal ────────────────────────────────────
+    let deploy_id = &deploy_resp.deploy_id;
+    let status_url = format!("{server}/v1/deploys/{deploy_id}");
+
+    // Resolve timeout.
+    let timeout_dur = match wait_timeout {
+        Some(ref t) => parse_duration(t).unwrap_or_else(|e| {
+            output::fail(
+                output::USAGE,
+                &format!("invalid --wait-timeout: {e}"),
+                "use e.g. 10m, 300s, 5m",
+            );
+        }),
+        None => std::time::Duration::from_secs(600), // 10 minutes default
+    };
+
+    let poll_interval = std::time::Duration::from_secs(2);
+    let start = std::time::Instant::now();
+    let mut last_status = String::new();
+
+    if json {
+        // Emit initial accepted event.
+        let event = serde_json::json!({
+            "event": "accepted",
+            "deploy_id": deploy_id,
+            "app": deploy_resp.app,
+            "tag": deploy_resp.tag,
+        });
+        println!("{event}");
+    } else {
+        println!(
+            "Deploy accepted for '{}' → tag '{}' (deploy_id: {}), waiting for completion...",
+            deploy_resp.app, deploy_resp.tag, deploy_id
+        );
+    }
+
+    loop {
+        // Check timeout.
+        if start.elapsed() >= timeout_dur {
+            if json {
+                let event = serde_json::json!({
+                    "event": "timeout",
+                    "deploy_id": deploy_id,
+                    "timeout_secs": timeout_dur.as_secs(),
+                });
+                println!("{event}");
+            } else {
+                eprintln!(
+                    "error: deploy did not reach terminal state within {}s",
+                    timeout_dur.as_secs()
+                );
+            }
+            std::process::exit(output::TIMEOUT);
+        }
+
+        // Poll the status endpoint with retries.
+        let poll_resp = match client.get(&status_url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // Retry up to 3 times with backoff.
+                let mut last_err = e;
+                let mut success = false;
+                let mut resp = None;
+                for attempt in 1..=3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await;
+                    match client.get(&status_url).send().await {
+                        Ok(r) => {
+                            success = true;
+                            resp = Some(r);
+                            break;
+                        }
+                        Err(e2) => {
+                            last_err = e2;
+                        }
+                    }
+                }
+                if !success {
+                    if json {
+                        let event = serde_json::json!({
+                            "event": "error",
+                            "deploy_id": deploy_id,
+                            "error": format!("lost contact with slipd: {last_err}"),
+                        });
+                        println!("{event}");
+                    } else {
+                        eprintln!("error: lost contact with slipd: {last_err}");
+                    }
+                    std::process::exit(output::GENERIC);
+                }
+                resp.unwrap()
+            }
+        };
+
+        if !poll_resp.status().is_success() {
+            // Non-200 from status endpoint — retry after a short delay.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
+
+        let status_resp: DeployStatusResponse = match poll_resp.json().await {
+            Ok(s) => s,
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+
+        let current_status = &status_resp.status;
+
+        // Print progress on status change.
+        if *current_status != last_status {
+            if json {
+                let mut event = serde_json::json!({
+                    "event": "status_change",
+                    "deploy_id": deploy_id,
+                    "status": current_status,
+                });
+                if let Some(ref err) = status_resp.error {
+                    event["error"] = serde_json::Value::String(err.clone());
+                }
+                println!("{event}");
+            } else {
+                println!("  deploy {deploy_id}: {current_status}...");
+            }
+            last_status = current_status.clone();
+        }
+
+        // Check for terminal state.
+        if is_terminal_deploy_status(current_status) {
+            if current_status == "completed" {
+                if json {
+                    let event = serde_json::json!({
+                        "event": "completed",
+                        "deploy_id": deploy_id,
+                        "app": status_resp.app,
+                        "tag": status_resp.tag,
+                        "status": "completed",
+                        "started_at": status_resp.started_at,
+                        "finished_at": status_resp.finished_at,
+                    });
+                    println!("{event}");
+                } else {
+                    println!("✓ Deploy {deploy_id} completed successfully");
+                }
+                std::process::exit(output::OK);
+            } else {
+                // failed
+                let reason = status_resp
+                    .error
+                    .unwrap_or_else(|| "unknown error".to_string());
+                if json {
+                    let event = serde_json::json!({
+                        "event": "failed",
+                        "deploy_id": deploy_id,
+                        "app": status_resp.app,
+                        "tag": status_resp.tag,
+                        "status": "failed",
+                        "error": reason,
+                        "started_at": status_resp.started_at,
+                        "finished_at": status_resp.finished_at,
+                    });
+                    println!("{event}");
+                } else {
+                    eprintln!("✗ Deploy {deploy_id} failed: {reason}");
+                }
+                std::process::exit(output::DEPLOY_FAILED);
+            }
+        }
+
+        // Wait before next poll.
+        tokio::time::sleep(poll_interval).await;
+    }
 }
 
 async fn rollback(
@@ -1451,8 +1719,20 @@ async fn main() -> anyhow::Result<()> {
             tag,
             image,
             secret,
+            wait,
+            wait_timeout,
         } => {
-            deploy(&server, &app, &tag, image, secret).await?;
+            deploy(
+                &server,
+                &app,
+                &tag,
+                image,
+                secret,
+                wait,
+                wait_timeout,
+                cli.json,
+            )
+            .await?;
         }
         Commands::Rollback { app, to } => {
             let token = resolve_token(cli.token);
@@ -1598,4 +1878,89 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+// ─── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deploy_wait_exit_code_completed() {
+        assert_eq!(deploy_wait_exit_code("completed"), output::OK);
+    }
+
+    #[test]
+    fn test_deploy_wait_exit_code_failed() {
+        assert_eq!(deploy_wait_exit_code("failed"), output::DEPLOY_FAILED);
+    }
+
+    #[test]
+    fn test_deploy_wait_exit_code_in_progress() {
+        assert_eq!(deploy_wait_exit_code("accepted"), -1);
+        assert_eq!(deploy_wait_exit_code("pulling"), -1);
+        assert_eq!(deploy_wait_exit_code("starting"), -1);
+        assert_eq!(deploy_wait_exit_code("health_checking"), -1);
+        assert_eq!(deploy_wait_exit_code("switching"), -1);
+        assert_eq!(deploy_wait_exit_code("configuring"), -1);
+        assert_eq!(deploy_wait_exit_code("stopping_old"), -1);
+        assert_eq!(deploy_wait_exit_code("removing_route"), -1);
+        assert_eq!(deploy_wait_exit_code("restarting_old"), -1);
+    }
+
+    #[test]
+    fn test_is_terminal_deploy_status() {
+        assert!(is_terminal_deploy_status("completed"));
+        assert!(is_terminal_deploy_status("failed"));
+        assert!(!is_terminal_deploy_status("accepted"));
+        assert!(!is_terminal_deploy_status("pulling"));
+        assert!(!is_terminal_deploy_status("starting"));
+        assert!(!is_terminal_deploy_status("health_checking"));
+        assert!(!is_terminal_deploy_status("switching"));
+        assert!(!is_terminal_deploy_status("configuring"));
+        assert!(!is_terminal_deploy_status("stopping_old"));
+        assert!(!is_terminal_deploy_status("removing_route"));
+        assert!(!is_terminal_deploy_status("restarting_old"));
+        assert!(!is_terminal_deploy_status("unknown"));
+    }
+
+    #[test]
+    fn test_parse_duration_seconds() {
+        let d = parse_duration("30s").unwrap();
+        assert_eq!(d.as_secs(), 30);
+    }
+
+    #[test]
+    fn test_parse_duration_minutes() {
+        let d = parse_duration("10m").unwrap();
+        assert_eq!(d.as_secs(), 600);
+    }
+
+    #[test]
+    fn test_parse_duration_hours() {
+        let d = parse_duration("2h").unwrap();
+        assert_eq!(d.as_secs(), 7200);
+    }
+
+    #[test]
+    fn test_parse_duration_combined() {
+        let d = parse_duration("5m30s").unwrap();
+        assert_eq!(d.as_secs(), 330);
+    }
+
+    #[test]
+    fn test_parse_duration_invalid_no_unit() {
+        assert!(parse_duration("30").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_invalid_char() {
+        assert!(parse_duration("10x").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_empty() {
+        assert!(parse_duration("").is_err());
+    }
 }

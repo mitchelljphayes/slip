@@ -95,8 +95,8 @@ jobs:
             STATUS=$(curl -sS "${SLIP_DEPLOY_URL}/v1/deploys/${DEPLOY_ID}" --insecure | jq -r '.status // "unknown"')
             echo "  [${i}/60] status: ${STATUS}"
             case "$STATUS" in
-              succeeded|completed) echo "✓ Deploy succeeded"; exit 0 ;;
-              failed|rolled_back)  echo "✗ Deploy failed (status: ${STATUS})"; exit 1 ;;
+              completed) echo "✓ Deploy completed"; exit 0 ;;
+              failed)    echo "✗ Deploy failed"; exit 1 ;;
               *) sleep 5 ;;
             esac
           done
