@@ -403,6 +403,10 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
             "/v1/apps/{name}/secrets/{key}",
             axum::routing::delete(handle_remove_secret),
         )
+        .route(
+            "/v1/apps/{name}/key",
+            axum::routing::put(handle_set_deploy_key),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             management_auth,
@@ -503,9 +507,14 @@ async fn verify_preview_auth(
             .cloned()
             .ok_or_else(|| AppError::NotFound(format!("unknown app: {app}")))?;
 
-        let secret = resolve_secret(app_cfg.app.secret.as_deref(), &state.config.auth.secret);
+        let secret = resolve_secret(
+            app_cfg.app.secret.as_deref(),
+            &state.config.auth.secret,
+            &state.secrets_store,
+            app,
+        );
 
-        if verify_signature(sig_header, hmac_body.as_bytes(), secret) {
+        if verify_signature(sig_header, hmac_body.as_bytes(), &secret) {
             return Ok(());
         }
 
@@ -976,6 +985,102 @@ async fn handle_remove_secret(
     Ok((StatusCode::OK, Json(serde_json::json!({"status": "ok"}))))
 }
 
+// ─── Deploy key handler ────────────────────────────────────────────────────────
+
+/// Request body for `PUT /v1/apps/{name}/key`.
+#[derive(Debug, Deserialize)]
+pub struct SetDeployKeyRequest {
+    /// If `true`, rotates the key even if one already exists.
+    /// If `false` (default), only creates a key if none exists.
+    #[serde(default)]
+    pub rotate: bool,
+}
+
+/// Response for `PUT /v1/apps/{name}/key`.
+#[derive(Debug, Serialize)]
+pub struct SetDeployKeyResponse {
+    pub app: String,
+    /// The deploy key. Present only when a new key was generated (create or
+    /// rotate).  `None` when an existing key was left untouched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Whether the key was rotated (true) or newly created (false).
+    pub rotated: bool,
+    /// Human-readable message about what happened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// `PUT /v1/apps/{name}/key` — Generate or rotate a per-app deploy key.
+///
+/// The key is stored in the secrets store (not in app TOML) with 0o600 perms.
+/// It is returned **once** in the response body.  The caller is responsible
+/// for saving it (e.g. into CI secrets).
+///
+/// Admin-token gated (via the management auth middleware).
+async fn handle_set_deploy_key(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<SetDeployKeyRequest>,
+) -> Result<(StatusCode, Json<SetDeployKeyResponse>), AppError> {
+    // Verify app exists
+    {
+        let apps = state.apps.read().await;
+        if !apps.contains_key(&name) {
+            return Err(AppError::NotFound(format!("app '{}' not found", name)));
+        }
+    }
+
+    // Check if a deploy key already exists.
+    let existing = state
+        .secrets_store
+        .get_deploy_key(&name)
+        .map_err(|e| AppError::Internal(format!("failed to read deploy key: {e}")))?;
+
+    let (key, rotated, message) = match existing {
+        Some(_) if req.rotate => {
+            // Rotate: generate a new key, replacing the old one.
+            let new_key = state
+                .secrets_store
+                .set_deploy_key(&name)
+                .map_err(|e| AppError::Internal(format!("failed to set deploy key: {e}")))?;
+            (Some(new_key), true, None)
+        }
+        Some(_) => {
+            // Key exists but rotate not requested — do not reveal the key.
+            (
+                None,
+                false,
+                Some("deploy key already exists — pass rotate=true to rotate it".to_string()),
+            )
+        }
+        None => {
+            // No existing key — create one.
+            let new_key = state
+                .secrets_store
+                .set_deploy_key(&name)
+                .map_err(|e| AppError::Internal(format!("failed to set deploy key: {e}")))?;
+            (Some(new_key), false, None)
+        }
+    };
+
+    info!(
+        app = %name,
+        rotated = rotated,
+        "deploy key set"
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(SetDeployKeyResponse {
+            app: name,
+            key,
+            rotated,
+            message,
+        }),
+    ))
+}
+
 // ─── Deploy handler ───────────────────────────────────────────────────────────
 
 /// `POST /v1/deploy`
@@ -1016,11 +1121,16 @@ async fn handle_deploy(
         .cloned()
         .ok_or_else(|| AppError::NotFound(format!("unknown app: {}", request.app)))?;
 
-    // 5. Resolve HMAC secret.
-    let secret = resolve_secret(app_cfg.app.secret.as_deref(), &state.config.auth.secret);
+    // 5. Resolve HMAC secret (deploy key → app TOML → global fallback).
+    let secret = resolve_secret(
+        app_cfg.app.secret.as_deref(),
+        &state.config.auth.secret,
+        &state.secrets_store,
+        &request.app,
+    );
 
     // 6. Verify HMAC signature.
-    if !verify_signature(sig_header, &body, secret) {
+    if !verify_signature(sig_header, &body, &secret) {
         warn!(app = %request.app, "deploy rejected: invalid signature");
         return Err(AppError::Unauthorized("invalid signature".to_string()));
     }
@@ -3839,6 +3949,158 @@ mod tests {
             .method("GET")
             .uri("/v1/previews/nonexistent/some-preview")
             .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Deploy key tests ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_set_deploy_key_create_returns_key() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        // Create a deploy key (no existing key).
+        let body = serde_json::json!({}).to_string();
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/apps/{}/key", APP_NAME))
+            .header("Content-Type", "application/json")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["app"], APP_NAME);
+        assert_eq!(payload["rotated"], false);
+        assert!(payload["key"].is_string(), "key must be present on create");
+        assert!(payload.get("message").is_none(), "no message on create");
+        let first_key = payload["key"].as_str().unwrap().to_string();
+        assert_eq!(first_key.len(), 64, "deploy key must be 64 hex chars");
+    }
+
+    #[tokio::test]
+    async fn test_set_deploy_key_existing_no_rotate_returns_no_key() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        // First call: create a key.
+        let body = serde_json::json!({}).to_string();
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/apps/{}/key", APP_NAME))
+            .header("Content-Type", "application/json")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Second call: same app, no rotate — must NOT return the key.
+        let body = serde_json::json!({}).to_string();
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/apps/{}/key", APP_NAME))
+            .header("Content-Type", "application/json")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["app"], APP_NAME);
+        assert_eq!(payload["rotated"], false);
+        assert!(
+            payload.get("key").is_none() || payload["key"].is_null(),
+            "key must NOT be present when existing key is not rotated"
+        );
+        assert!(
+            payload["message"].is_string(),
+            "message should explain why no key was returned"
+        );
+        assert!(
+            payload["message"]
+                .as_str()
+                .unwrap()
+                .contains("already exists"),
+            "message should mention key already exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_deploy_key_rotate_returns_new_key() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        // First call: create a key.
+        let body = serde_json::json!({}).to_string();
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/apps/{}/key", APP_NAME))
+            .header("Content-Type", "application/json")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let first_key = payload["key"].as_str().unwrap().to_string();
+
+        // Second call: rotate=true — must return a NEW key.
+        let body = serde_json::json!({"rotate": true}).to_string();
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/apps/{}/key", APP_NAME))
+            .header("Content-Type", "application/json")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["app"], APP_NAME);
+        assert_eq!(payload["rotated"], true);
+        assert!(payload["key"].is_string(), "key must be present on rotate");
+        let second_key = payload["key"].as_str().unwrap().to_string();
+        assert_eq!(second_key.len(), 64, "deploy key must be 64 hex chars");
+        assert_ne!(
+            first_key, second_key,
+            "rotated key must differ from original"
+        );
+        assert!(payload.get("message").is_none(), "no message on rotate");
+    }
+
+    #[tokio::test]
+    async fn test_set_deploy_key_unknown_app_returns_404() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({}).to_string();
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/v1/apps/nonexistent/key")
+            .header("Content-Type", "application/json")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::from(body))
             .unwrap();
 
         let response = app.oneshot(request).await.unwrap();

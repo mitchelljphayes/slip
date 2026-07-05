@@ -10,6 +10,13 @@ use std::path::PathBuf;
 
 use crate::error::ConfigError;
 
+/// Reserved key name for the per-app deploy key.
+///
+/// Stored in the secrets store (not in app TOML) with the same 0o600 perms
+/// as any other secret.  The `__` prefix ensures it is filtered from `list()`
+/// responses so it never leaks via `GET /v1/apps/{name}/secrets`.
+pub const DEPLOY_KEY_NAME: &str = "__deploy_key";
+
 // ─── Secret key validation ──────────────────────────────────────────────────────
 
 /// Validate a secret key name.
@@ -135,6 +142,9 @@ impl SecretsStore {
     ///
     /// Returns an empty vec if the app has no secrets directory.
     /// **Never returns secret values.**
+    ///
+    /// Internal/reserved keys (prefixed with `__`) are filtered out so they
+    /// never appear in API responses.
     pub fn list(&self, app_name: &str) -> Result<Vec<String>, ConfigError> {
         let dir = self.base_path.join(app_name);
         if !dir.is_dir() {
@@ -150,7 +160,8 @@ impl SecretsStore {
                 let entry = entry.ok()?;
                 let name = entry.file_name().to_string_lossy().to_string();
                 // Skip dotfiles (e.g. temp files during writes)
-                if name.starts_with('.') {
+                // Skip internal/reserved keys (prefixed with `__`)
+                if name.starts_with('.') || name.starts_with("__") {
                     None
                 } else {
                     Some(name)
@@ -160,6 +171,30 @@ impl SecretsStore {
 
         keys.sort();
         Ok(keys)
+    }
+
+    /// Get the deploy key for an app, if one exists.
+    pub fn get_deploy_key(&self, app_name: &str) -> Result<Option<String>, ConfigError> {
+        self.get(app_name, DEPLOY_KEY_NAME)
+    }
+
+    /// Set (or rotate) the deploy key for an app.
+    ///
+    /// Returns the newly generated key.
+    pub fn set_deploy_key(&self, app_name: &str) -> Result<String, ConfigError> {
+        // Generate 32 random bytes → 64-char hex string.
+        let mut buf = [0u8; 32];
+        getrandom::getrandom(&mut buf)
+            .map_err(|e| ConfigError::Internal(format!("failed to generate deploy key: {e}")))?;
+        let key = hex::encode(buf);
+
+        self.set(app_name, DEPLOY_KEY_NAME, &key)?;
+        Ok(key)
+    }
+
+    /// Remove the deploy key for an app.
+    pub fn remove_deploy_key(&self, app_name: &str) -> Result<bool, ConfigError> {
+        self.remove(app_name, DEPLOY_KEY_NAME)
     }
 
     /// Remove a single secret by key.
