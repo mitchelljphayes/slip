@@ -83,7 +83,7 @@ enum Commands {
     /// Manage the slipd server.
     #[command(subcommand)]
     Server(ServerCommands),
-    /// Manage preview deployments.
+    /// Manage registered services (postgres, s3, kv, registry).
     #[command(subcommand)]
     Services(ServicesCommands),
     /// Manage application secrets.
