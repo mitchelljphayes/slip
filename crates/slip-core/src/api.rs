@@ -153,6 +153,12 @@ pub struct CreateAppRequest {
     pub health: Option<crate::config::HealthConfig>,
     pub deploy: Option<crate::config::DeployConfig>,
     pub preview: Option<crate::config::AppPreviewConfig>,
+    /// Volume mounts for the app.
+    #[serde(default)]
+    pub volumes: Option<Vec<crate::config::VolumeConfig>>,
+    /// Multi-route entries.
+    #[serde(default)]
+    pub routes: Option<Vec<crate::config::RouteEntry>>,
 }
 
 fn default_app_port() -> u16 {
@@ -172,6 +178,12 @@ pub struct UpdateAppRequest {
     pub health: Option<crate::config::HealthConfig>,
     pub deploy: Option<crate::config::DeployConfig>,
     pub preview: Option<crate::config::AppPreviewConfig>,
+    /// Volume mounts for the app.
+    #[serde(default)]
+    pub volumes: Option<Vec<crate::config::VolumeConfig>>,
+    /// Multi-route entries.
+    #[serde(default)]
+    pub routes: Option<Vec<crate::config::RouteEntry>>,
 }
 
 /// Request body for `POST /v1/apps/{name}/rollback`.
@@ -240,6 +252,10 @@ pub struct AppResponse {
     pub deploy: crate::config::DeployConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<crate::config::AppPreviewConfig>,
+    #[serde(default)]
+    pub volumes: Vec<crate::config::VolumeConfig>,
+    #[serde(default)]
+    pub routes: Vec<crate::config::RouteEntry>,
 }
 
 impl From<&AppConfig> for AppResponse {
@@ -257,6 +273,8 @@ impl From<&AppConfig> for AppResponse {
             health: cfg.health.clone(),
             deploy: cfg.deploy.clone(),
             preview: cfg.preview.clone(),
+            volumes: cfg.volumes.clone(),
+            routes: cfg.routing.routes.clone(),
         }
     }
 }
@@ -576,7 +594,7 @@ async fn handle_create_app(
         routing: crate::config::RoutingConfig {
             domain: Some(req.domain),
             port: Some(req.port),
-            routes: vec![],
+            routes: req.routes.unwrap_or_default(),
         },
         health: req.health.unwrap_or_default(),
         deploy: req.deploy.unwrap_or_default(),
@@ -585,7 +603,7 @@ async fn handle_create_app(
         resources: req.resources.unwrap_or_default(),
         network: req.network.unwrap_or_default(),
         preview: req.preview,
-        volumes: Vec::new(),
+        volumes: req.volumes.unwrap_or_default(),
     };
 
     // Check for conflicts and insert atomically (TOCTOU fix)
@@ -689,6 +707,12 @@ async fn handle_update_app(
         }
         if let Some(preview) = req.preview {
             updated.preview = Some(preview);
+        }
+        if let Some(volumes) = req.volumes {
+            updated.volumes = volumes;
+        }
+        if let Some(routes) = req.routes {
+            updated.routing.routes = routes;
         }
 
         apps.insert(name.clone(), updated.clone());
@@ -4427,5 +4451,172 @@ path = "/tmp/slip-test"
             "error should be prescriptive: {}",
             payload.error
         );
+    }
+
+    // ── Regression: poi health-path drift ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_health_path_patch_persists() {
+        // Regression for the poi health-path drift: create with path="/",
+        // PATCH to "/api/healthz", GET asserts new path persisted.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_dir = tmp.path().to_path_buf();
+
+        let slip_toml = r#"
+[server]
+listen = "0.0.0.0:7890"
+[caddy]
+admin_api = "http://localhost:2019"
+[auth]
+secret = "test-secret"
+[registry]
+[storage]
+path = "/tmp/slip-test"
+"#;
+        std::fs::write(config_dir.join("slip.toml"), slip_toml).unwrap();
+
+        let secrets_tmp = tempfile::tempdir().expect("tempdir for secrets");
+        let secrets_path = secrets_tmp.path().to_path_buf();
+        Box::leak(Box::new(secrets_tmp));
+
+        let state = Arc::new(AppState {
+            config: test_slip_config(),
+            apps: RwLock::new(HashMap::new()),
+            config_dir: config_dir.clone(),
+            deploy_locks: DashMap::new(),
+            runtime: Arc::new(
+                DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            ),
+            caddy: CaddyClient::new("http://127.0.0.1:19999".to_string()),
+            health: HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
+            db: Db::open_in_memory().unwrap(),
+            started_at: Utc::now(),
+            preview_states: Arc::new(DashMap::new()),
+            preview_locks: DashMap::new(),
+            secrets_store: SecretsStore::new(secrets_path).unwrap(),
+        });
+
+        let app = build_router(state.clone());
+
+        // Create app with health.path="/"
+        let create_body = serde_json::json!({
+            "name": "poi",
+            "image": "ghcr.io/org/poi:latest",
+            "domain": "poi.example.com",
+            "port": 8080,
+            "health": {"path": "/"}
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/apps")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create_body).unwrap()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // PATCH health.path to "/api/healthz"
+        let patch_body = serde_json::json!({
+            "health": {"path": "/api/healthz"}
+        });
+        let request = Request::builder()
+            .method("PATCH")
+            .uri("/v1/apps/poi")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&patch_body).unwrap()))
+            .unwrap();
+        let app2 = build_router(state.clone());
+        let response = app2.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // GET asserts new path persisted
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/apps/poi")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+        let app3 = build_router(state.clone());
+        let response = app3.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: AppResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            payload.health.path.as_deref(),
+            Some("/api/healthz"),
+            "health path should be updated"
+        );
+    }
+
+    // ── Regression: env removal on PATCH ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_env_removal_on_patch() {
+        // Create with {OLD_KEY, KEPT_KEY}, PATCH env {KEPT_KEY}, GET asserts OLD_KEY gone.
+        let state = create_test_state();
+        let app = build_router(state.clone());
+
+        let create_body = serde_json::json!({
+            "name": "envtest",
+            "image": "ghcr.io/org/envtest:latest",
+            "domain": "envtest.example.com",
+            "port": 8080,
+            "env": {"OLD_KEY": "old_val", "KEPT_KEY": "kept_val"}
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/apps")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create_body).unwrap()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // PATCH with only KEPT_KEY (full-replace semantics)
+        let patch_body = serde_json::json!({
+            "env": {"KEPT_KEY": "kept_val"}
+        });
+        let request = Request::builder()
+            .method("PATCH")
+            .uri("/v1/apps/envtest")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&patch_body).unwrap()))
+            .unwrap();
+        let app2 = build_router(state.clone());
+        let response = app2.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // GET asserts OLD_KEY gone
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/apps/envtest")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+        let app3 = build_router(state.clone());
+        let response = app3.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: AppResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            !payload.env.contains_key("OLD_KEY"),
+            "OLD_KEY should be removed by full-replace PATCH"
+        );
+        assert_eq!(
+            payload.env.get("KEPT_KEY").map(|s| s.as_str()),
+            Some("kept_val"),
+            "KEPT_KEY should remain"
+        );
+        assert_eq!(payload.env.len(), 1, "only KEPT_KEY should remain");
     }
 }

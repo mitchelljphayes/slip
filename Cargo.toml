@@ -69,5 +69,8 @@ rusqlite_migration = "1"
 # Crypto RNG (for deploy key generation)
 getrandom = "0.2"
 
+# JSON diff/patch (RFC 6902) for `slip apply`
+json-patch = { version = "4", features = ["diff"] }
+
 # Shared crate
 slip-core = { path = "crates/slip-core" }

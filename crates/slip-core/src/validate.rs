@@ -10,6 +10,7 @@
 
 use std::path::Path;
 
+use serde::Serialize;
 use serde_yaml::Value;
 
 use crate::repo_config::{PreviewConfig, RepoConfig, parse_repo_config};
@@ -17,7 +18,8 @@ use crate::repo_config::{PreviewConfig, RepoConfig, parse_repo_config};
 // ─── Error Types ──────────────────────────────────────────────────────────────
 
 /// Errors that can occur during validation.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error, Serialize)]
+#[serde(tag = "type")]
 pub enum ValidationError {
     /// TOML parse error with location information.
     #[error("TOML parse error at line {line}, column {column}: {message}")]
@@ -75,7 +77,7 @@ pub enum ValidationError {
 // ─── Validation Result ────────────────────────────────────────────────────────
 
 /// Accumulated validation results (errors and warnings).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ValidationResult {
     /// Validation errors (cause validation to fail).
     pub errors: Vec<ValidationError>,

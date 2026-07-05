@@ -272,12 +272,15 @@ mod tests {
                 name: name.to_string(),
                 kind: "container".to_string(),
                 manifest: None,
+                image: None,
             },
             health: RepoHealthConfig::default(),
             routing: RepoRoutingConfig::default(),
             defaults: RepoDefaults::default(),
             preview: None,
             volumes: Vec::new(),
+            env: HashMap::new(),
+            deploy: None,
             remote: RemoteConfig::default(),
         }
     }

@@ -4,6 +4,7 @@
 //! health check settings, routing port, resource defaults, and preview configuration.
 //! The server config describes **where it runs**: domain, secrets, resource overrides.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -48,6 +49,12 @@ pub struct RepoConfig {
     /// Volume mount points the app needs.
     #[serde(default)]
     pub volumes: Vec<RepoVolume>,
+    /// Environment variables to push to the server (full-replace semantics).
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Deploy configuration (strategy, drain timeout, etc.).
+    #[serde(default)]
+    pub deploy: Option<RepoDeployConfig>,
     /// Laptop-side remote binding (written by `slip link`).
     #[serde(default)]
     pub remote: RemoteConfig,
@@ -62,6 +69,8 @@ pub struct RepoAppInfo {
     pub kind: String,
     /// Path to Kubernetes Pod YAML manifest (for pod mode).
     pub manifest: Option<String>,
+    /// Container image (e.g. "ghcr.io/org/app"). Required for create-on-first-apply.
+    pub image: Option<String>,
 }
 
 fn default_app_kind() -> String {
@@ -129,6 +138,9 @@ pub struct RepoRoutingConfig {
     /// When non-empty, takes precedence over `port`/`container`.
     #[serde(default)]
     pub routes: Vec<RepoRouteEntry>,
+    /// Domain/hostname for the app (e.g. "myapp.example.com").
+    /// Written by `slip init` template; used by `slip apply` for create-on-first-apply.
+    pub domain: Option<String>,
 }
 
 impl Default for RepoRoutingConfig {
@@ -138,6 +150,7 @@ impl Default for RepoRoutingConfig {
             container: None,
             kind: default_route_kind(),
             routes: Vec::new(),
+            domain: None,
         }
     }
 }
@@ -175,6 +188,21 @@ pub struct RepoDefaults {
 pub struct RepoResourceConfig {
     pub memory: Option<String>,
     pub cpus: Option<String>,
+}
+
+/// Deploy configuration from the repo config.
+///
+/// Mirrors the server-side `DeployConfig` for the pushable subset.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RepoDeployConfig {
+    /// Deployment strategy: "blue-green" (default) or "rolling".
+    pub strategy: Option<String>,
+    /// Max time to wait for connections to drain before cutting over.
+    #[serde(default, with = "option_duration_serde")]
+    pub drain_timeout: Option<Duration>,
+    /// Max time to wait for the deploy to complete.
+    #[serde(default, with = "option_duration_serde")]
+    pub timeout: Option<Duration>,
 }
 
 /// Preview environment configuration.
@@ -690,6 +718,47 @@ name = "myapp"
         let cfg = parse_repo_config(toml.as_bytes()).unwrap();
         assert!(cfg.remote.server.is_empty());
         assert!(cfg.remote.app.is_empty());
+    }
+
+    // ── Env and Deploy config ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_repo_config_with_env_and_deploy() {
+        let toml = r#"
+[app]
+name = "myapp"
+
+[env]
+DATABASE_URL = "postgres://localhost/mydb"
+LOG_LEVEL = "debug"
+
+[deploy]
+strategy = "blue-green"
+drain_timeout = "30s"
+timeout = "5m"
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        assert_eq!(
+            cfg.env.get("DATABASE_URL").unwrap(),
+            "postgres://localhost/mydb"
+        );
+        assert_eq!(cfg.env.get("LOG_LEVEL").unwrap(), "debug");
+        assert_eq!(cfg.env.len(), 2);
+        let deploy = cfg.deploy.as_ref().unwrap();
+        assert_eq!(deploy.strategy.as_deref(), Some("blue-green"));
+        assert_eq!(deploy.drain_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(deploy.timeout, Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn parse_repo_config_without_env_and_deploy() {
+        let toml = r#"
+[app]
+name = "myapp"
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        assert!(cfg.env.is_empty());
+        assert!(cfg.deploy.is_none());
     }
 
     #[test]

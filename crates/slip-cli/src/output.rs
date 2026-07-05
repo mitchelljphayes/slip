@@ -12,6 +12,12 @@ pub const NOT_FOUND: i32 = 4;
 pub const DEPLOY_FAILED: i32 = 5;
 pub const TIMEOUT: i32 = 6;
 
+/// `slip apply --dry-run`: diff found (kubectl convention — changes present).
+pub const CHANGES_PRESENT: i32 = 1;
+
+/// `slip apply --dry-run`: generic error during dry-run (1 is taken by CHANGES_PRESENT).
+pub const DRY_RUN_FAILURE: i32 = 7;
+
 /// JSON output for unimplemented commands (Phase 2 stubs).
 #[derive(Debug, Serialize)]
 pub struct NotImplemented {
