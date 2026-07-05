@@ -613,6 +613,83 @@ fn link_writes_remote_to_slip_toml() {
         .stderr(predicate::str::contains("can't reach slipd"));
 }
 
+// ─── Deploy command ──────────────────────────────────────────────────────────────
+
+#[test]
+fn deploy_help_shows_wait_flags() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd.args(["deploy", "--help"]).assert();
+
+    assert
+        .success()
+        .code(output::OK)
+        .stdout(predicate::str::contains("--wait"))
+        .stdout(predicate::str::contains("--wait-timeout"));
+}
+
+#[test]
+fn deploy_without_wait_fire_and_forget_connection_error() {
+    // Without --wait, the command should fire-and-forget.
+    // It will fail with a connection error (no server running).
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args(["deploy", "myapp", "v1", "--secret", "dummy-secret"])
+        .assert();
+
+    assert
+        .failure()
+        .stderr(predicate::str::contains("not yet implemented").not())
+        .stderr(
+            predicate::str::contains("HTTP request failed")
+                .or(predicate::str::contains("can't reach")),
+        );
+}
+
+#[test]
+fn deploy_with_wait_connection_error() {
+    // With --wait, the command should still fail with a connection error
+    // (the deploy POST itself fails, not the poll loop).
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "deploy",
+            "myapp",
+            "v1",
+            "--secret",
+            "dummy-secret",
+            "--wait",
+        ])
+        .assert();
+
+    assert
+        .failure()
+        .stderr(predicate::str::contains("not yet implemented").not())
+        .stderr(
+            predicate::str::contains("HTTP request failed")
+                .or(predicate::str::contains("can't reach")),
+        );
+}
+
+#[test]
+fn deploy_json_without_wait_connection_error() {
+    // --json without --wait should still fire-and-forget and fail with connection error.
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "deploy",
+            "myapp",
+            "v1",
+            "--secret",
+            "dummy-secret",
+            "--json",
+        ])
+        .assert();
+
+    assert
+        .failure()
+        .stderr(predicate::str::contains("not yet implemented").not());
+}
+
 mod output {
     pub const OK: i32 = 0;
     pub const GENERIC: i32 = 1;
@@ -620,4 +697,8 @@ mod output {
     pub const AUTH: i32 = 3;
     #[allow(dead_code)]
     pub const NOT_FOUND: i32 = 4;
+    #[allow(dead_code)]
+    pub const DEPLOY_FAILED: i32 = 5;
+    #[allow(dead_code)]
+    pub const TIMEOUT: i32 = 6;
 }
