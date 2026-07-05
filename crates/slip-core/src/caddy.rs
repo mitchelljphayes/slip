@@ -151,6 +151,15 @@ impl CaddyClient {
     /// may not exist yet (`config/apps/http/servers`), this reads the full
     /// config, merges the slip server block in, and atomically reloads it via
     /// `POST /load` — preserving any existing config (e.g. `admin`).
+    ///
+    /// ## Conflict detection (SLIP-88)
+    ///
+    /// Before merging, this method scans the existing config for any HTTP server
+    /// (other than `slip`) that already claims `:443` (or whatever the `slip`
+    /// server listens on). If found, it returns
+    /// [`CaddyError::ListenerConflict`] — a prescriptive error that names the
+    /// conflicting server and the remedy — instead of crash-looping on a
+    /// rejected `POST /load`.
     pub async fn bootstrap(&self) -> Result<(), CaddyError> {
         // Fetch the current full config.
         let cfg_url = format!("{}/config/", self.base_url);
@@ -164,6 +173,27 @@ impl CaddyClient {
         // If the slip server block already exists, nothing to do.
         if config.pointer("/apps/http/servers/slip").is_some() {
             return Ok(());
+        }
+
+        // ── SLIP-88: Detect listener conflict before POST /load ──────────────
+        let slip_listener = ":443";
+        if let Some(servers) = config
+            .pointer("/apps/http/servers")
+            .and_then(|v| v.as_object())
+        {
+            for (name, server) in servers {
+                if name == "slip" {
+                    continue;
+                }
+                if let Some(listen) = server.get("listen").and_then(|v| v.as_array())
+                    && listen.iter().any(|l| l.as_str() == Some(slip_listener))
+                {
+                    return Err(CaddyError::ListenerConflict {
+                        server: name.clone(),
+                        listener: slip_listener.to_string(),
+                    });
+                }
+            }
         }
 
         // Ensure we have an object to build on (fresh Caddy may return `null`).
@@ -217,6 +247,131 @@ impl CaddyClient {
                 "POST {load_url} returned {status}: {text}"
             )))
         }
+    }
+
+    /// Register the deploy-webhook route and TLS policy in Caddy (SLIP-87).
+    ///
+    /// When `domain` is set, this method:
+    /// 1. Creates a route with `@id = "slip-deploy-webhook"` that reverse-proxies
+    ///    `<domain>` → `<upstream_addr>` (the slipd listen address).
+    /// 2. Adds a TLS automation policy for `<domain>` using the configured
+    ///    strategy (default: `"internal"` → Caddy local CA, self-signed).
+    ///
+    /// The route is slip-owned: it uses the `slip-*` @id prefix and is
+    /// re-applied on every reconcile pass. It is NOT deleted by `remove_routes`
+    /// (which targets `slip-{app_name}-{index}` — the deploy-webhook id is
+    /// `slip-deploy-webhook`, no numeric suffix).
+    ///
+    /// When `domain` is `None`, this is a no-op (backwards compatible).
+    ///
+    /// # Arguments
+    ///
+    /// * `domain` - The deploy webhook domain (e.g. `"deploy.example.com"`).
+    ///   Pass `None` to skip (no `[deploy]` section in config).
+    /// * `tls_strategy` - TLS strategy string (`"internal"`, etc.).
+    /// * `upstream_addr` - The slipd listen address (e.g. `"127.0.0.1:7890"`).
+    pub async fn bootstrap_deploy(
+        &self,
+        domain: Option<&str>,
+        tls_strategy: &str,
+        upstream_addr: &str,
+    ) -> Result<(), CaddyError> {
+        let domain = match domain {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+
+        // ── 1. Register the deploy-webhook route ─────────────────────────────
+        let route_id = "slip-deploy-webhook";
+        let route_body = json!({
+            "@id": route_id,
+            "match": [{"host": [domain]}],
+            "handle": [{
+                "handler": "subroute",
+                "routes": [{
+                    "handle": [{
+                        "handler": "reverse_proxy",
+                        "upstreams": [{"dial": upstream_addr}]
+                    }]
+                }]
+            }],
+            "terminal": true
+        });
+
+        // Try to update an existing route via @id.
+        let patch_url = format!("{}/id/{route_id}", self.base_url);
+        let patch_resp = self
+            .client
+            .patch(&patch_url)
+            .json(&route_body)
+            .send()
+            .await?;
+        if !patch_resp.status().is_success() {
+            // Route didn't exist — append it.
+            let post_url = format!("{}/config/apps/http/servers/slip/routes", self.base_url);
+            let post_resp = self.client.post(&post_url).json(&route_body).send().await?;
+            if !post_resp.status().is_success() {
+                let status = post_resp.status();
+                let text = post_resp.text().await.unwrap_or_default();
+                return Err(CaddyError::RouteUpdateFailed(format!(
+                    "POST {post_url} returned {status}: {text}"
+                )));
+            }
+        }
+
+        // ── 2. Register the TLS automation policy ────────────────────────────
+        if tls_strategy == "internal" {
+            // Check if a policy with matching subjects already exists (idempotency)
+            let policies_url = format!("{}/config/apps/tls/automation/policies", self.base_url);
+            let resp = self.client.get(&policies_url).send().await?;
+
+            let mut already_exists = false;
+            if resp.status().is_success() {
+                let policies: Vec<serde_json::Value> = resp.json().await.unwrap_or_default();
+                for policy in policies {
+                    if let Some(subjects) = policy.get("subjects").and_then(|s| s.as_array())
+                        && subjects.iter().any(|s| s.as_str() == Some(domain))
+                    {
+                        already_exists = true;
+                        break;
+                    }
+                }
+            }
+
+            if !already_exists {
+                // Build the TLS policy with internal (self-signed) issuer.
+                // NOTE: "issuers" is PLURAL and an ARRAY — the singular form
+                // "issuer" silently fails in Caddy.
+                let policy = json!({
+                    "subjects": [domain],
+                    "issuers": [{"module": "internal"}]
+                });
+
+                // Ensure the parent TLS automation path exists.
+                let automation_url = format!("{}/config/apps/tls/automation", self.base_url);
+                let automation_body = json!({"policies": []});
+                let _ = self
+                    .client
+                    .post(&automation_url)
+                    .json(&automation_body)
+                    .send()
+                    .await;
+
+                // Append the policy.
+                let post_url = format!("{}/config/apps/tls/automation/policies", self.base_url);
+                let post_resp = self.client.post(&post_url).json(&policy).send().await?;
+                if !post_resp.status().is_success() {
+                    let status = post_resp.status();
+                    let text = post_resp.text().await.unwrap_or_default();
+                    return Err(CaddyError::TlsConfigFailed(format!(
+                        "POST {post_url} returned {status}: {text}"
+                    )));
+                }
+            }
+        }
+        // Future strategies (acme, cloudflare-dns01, tailscale) land in SLIP-104.
+
+        Ok(())
     }
 
     /// Create or update the reverse-proxy route for an app.
@@ -583,6 +738,30 @@ mod tests {
             arr.push(body);
         }
         StatusCode::OK
+    }
+
+    /// Mock `GET /config/` that returns a config with a conflicting server on :443.
+    async fn mock_get_config_with_conflict() -> (StatusCode, axum::Json<serde_json::Value>) {
+        (
+            StatusCode::OK,
+            axum::Json(json!({
+                "admin": {"listen": "localhost:2019"},
+                "apps": {
+                    "http": {
+                        "servers": {
+                            "srv0": {
+                                "listen": [":443"],
+                                "routes": [{
+                                    "@id": "caddyfile-route",
+                                    "match": [{"host": ["other.example.com"]}],
+                                    "handle": [{"handler": "subroute", "routes": []}]
+                                }]
+                            }
+                        }
+                    }
+                }
+            })),
+        )
     }
 
     async fn mock_add_tls_policy_fail(
@@ -1181,6 +1360,273 @@ mod tests {
         assert!(
             matches!(err, CaddyError::TlsConfigFailed(_)),
             "error should be TlsConfigFailed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SLIP-88: Listener conflict detection tests
+    // -----------------------------------------------------------------------
+
+    /// Mock Caddy that returns a config with a conflicting server on :443.
+    async fn start_mock_caddy_with_conflict() -> u16 {
+        let app = Router::new()
+            .route("/config/", get(mock_get_config_with_conflict))
+            .route(
+                "/load",
+                post(|axum::Json(_body): axum::Json<serde_json::Value>| async {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        port
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_detects_listener_conflict() {
+        let port = start_mock_caddy_with_conflict().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+
+        let result = client.bootstrap().await;
+        assert!(
+            result.is_err(),
+            "bootstrap should fail on listener conflict"
+        );
+
+        let err = result.unwrap_err();
+        match &err {
+            CaddyError::ListenerConflict { server, listener } => {
+                assert_eq!(server, "srv0", "should name the conflicting server");
+                assert_eq!(listener, ":443", "should name the conflicting listener");
+            }
+            other => panic!("expected ListenerConflict, got: {other}"),
+        }
+
+        // Verify the error message is prescriptive
+        let msg = err.to_string();
+        assert!(
+            msg.contains("srv0"),
+            "error should name the conflicting server"
+        );
+        assert!(
+            msg.contains(":443"),
+            "error should name the conflicting listener"
+        );
+        assert!(
+            msg.contains("Caddyfile"),
+            "error should mention Caddyfile as the source"
+        );
+        assert!(
+            msg.contains("[deploy]"),
+            "error should mention [deploy] as the remedy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_no_conflict_when_slip_server_exists() {
+        // When the slip server already exists, bootstrap should be a no-op
+        // even if other servers are present (they coexist).
+        let state: MockState = Arc::new(Mutex::new(HashMap::new()));
+        state.lock().await.insert(
+            "__server__".to_string(),
+            json!({"listen": [":443"], "routes": []}),
+        );
+
+        let app = Router::new()
+            .route("/config/", get(mock_get_config))
+            .route("/load", post(mock_load_config))
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        client
+            .bootstrap()
+            .await
+            .expect("bootstrap should succeed when slip server exists");
+    }
+
+    // -----------------------------------------------------------------------
+    // SLIP-87: Deploy-webhook bootstrap tests
+    // -----------------------------------------------------------------------
+
+    /// Mock Caddy that supports deploy-webhook bootstrap (route + TLS policy).
+    async fn start_mock_caddy_for_deploy() -> (u16, MockState) {
+        let state: MockState = Arc::new(Mutex::new(HashMap::new()));
+        let app = Router::new()
+            .route("/config/", get(mock_get_config))
+            .route("/load", post(mock_load_config))
+            .route(
+                "/config/apps/http/servers/slip",
+                get(mock_get_server).post(mock_create_server),
+            )
+            .route(
+                "/config/apps/http/servers/slip/routes",
+                post(mock_add_route),
+            )
+            .route("/id/{id}", patch(mock_patch_route))
+            .route(
+                "/config/apps/tls/automation/policies",
+                get(mock_get_tls_policies).post(mock_add_tls_policy),
+            )
+            .route(
+                "/config/apps/tls/automation",
+                post(|axum::Json(_body): axum::Json<serde_json::Value>| async { StatusCode::OK }),
+            )
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, state)
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_deploy_creates_route_and_tls_policy() {
+        let (port, state) = start_mock_caddy_for_deploy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+
+        // First bootstrap the slip server.
+        client.bootstrap().await.expect("bootstrap should succeed");
+
+        // Now bootstrap the deploy webhook.
+        client
+            .bootstrap_deploy(Some("deploy.example.com"), "internal", "127.0.0.1:7890")
+            .await
+            .expect("bootstrap_deploy should succeed");
+
+        let map = state.lock().await;
+
+        // Verify the route was created with the correct @id.
+        assert!(
+            map.contains_key("slip-deploy-webhook"),
+            "deploy-webhook route should exist"
+        );
+        let route = &map["slip-deploy-webhook"];
+        assert_eq!(
+            route["@id"], "slip-deploy-webhook",
+            "@id should be slip-deploy-webhook"
+        );
+        // Verify the upstream dial address.
+        let dial = route["handle"][0]["routes"][0]["handle"][0]["upstreams"][0]["dial"]
+            .as_str()
+            .unwrap_or("");
+        assert_eq!(
+            dial, "127.0.0.1:7890",
+            "should proxy to slipd listen address"
+        );
+
+        // Verify the TLS policy was created with issuers (plural!) and internal module.
+        let policies = map
+            .get("__tls_policies__")
+            .expect("TLS policies should exist");
+        let arr = policies.as_array().expect("policies should be an array");
+        assert_eq!(arr.len(), 1, "should have one TLS policy");
+        let policy = &arr[0];
+        assert_eq!(
+            policy["subjects"][0].as_str(),
+            Some("deploy.example.com"),
+            "subject should be the deploy domain"
+        );
+        // CRITICAL: issuers is PLURAL and an ARRAY — the singular form silently fails.
+        assert!(
+            policy.get("issuers").is_some(),
+            "policy should have 'issuers' (plural, array)"
+        );
+        assert!(
+            policy.get("issuer").is_none(),
+            "policy should NOT have 'issuer' (singular) — that silently fails"
+        );
+        assert_eq!(
+            policy["issuers"][0]["module"].as_str(),
+            Some("internal"),
+            "issuer module should be 'internal' (Caddy local CA)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_deploy_no_domain_is_noop() {
+        let (port, state) = start_mock_caddy_for_deploy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+
+        client.bootstrap().await.expect("bootstrap should succeed");
+
+        // No domain → no-op.
+        client
+            .bootstrap_deploy(None, "internal", "127.0.0.1:7890")
+            .await
+            .expect("bootstrap_deploy with None domain should be a no-op");
+
+        let map = state.lock().await;
+        assert!(
+            !map.contains_key("slip-deploy-webhook"),
+            "no route should be created when domain is None"
+        );
+        assert!(
+            map.get("__tls_policies__").is_none(),
+            "no TLS policy should be created when domain is None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_deploy_updates_existing_route() {
+        let (port, state) = start_mock_caddy_for_deploy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+
+        client.bootstrap().await.expect("bootstrap should succeed");
+
+        // First call creates the route.
+        client
+            .bootstrap_deploy(Some("deploy.example.com"), "internal", "127.0.0.1:7890")
+            .await
+            .expect("first bootstrap_deploy should succeed");
+
+        // Second call with different upstream should update it.
+        client
+            .bootstrap_deploy(Some("deploy.example.com"), "internal", "127.0.0.1:7891")
+            .await
+            .expect("second bootstrap_deploy should succeed");
+
+        let map = state.lock().await;
+        let route = &map["slip-deploy-webhook"];
+        let dial = route["handle"][0]["routes"][0]["handle"][0]["upstreams"][0]["dial"]
+            .as_str()
+            .unwrap_or("");
+        assert_eq!(dial, "127.0.0.1:7891", "should update the upstream address");
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_deploy_tls_policy_is_idempotent() {
+        let (port, state) = start_mock_caddy_for_deploy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+
+        client.bootstrap().await.expect("bootstrap should succeed");
+
+        // First call creates route + TLS policy.
+        client
+            .bootstrap_deploy(Some("deploy.example.com"), "internal", "127.0.0.1:7890")
+            .await
+            .expect("first bootstrap_deploy should succeed");
+
+        // Second call should not create a duplicate TLS policy.
+        client
+            .bootstrap_deploy(Some("deploy.example.com"), "internal", "127.0.0.1:7890")
+            .await
+            .expect("second bootstrap_deploy should succeed");
+
+        let map = state.lock().await;
+        let policies = map
+            .get("__tls_policies__")
+            .expect("TLS policies should exist");
+        let arr = policies.as_array().expect("policies should be an array");
+        assert_eq!(
+            arr.len(),
+            1,
+            "should still have exactly one TLS policy (no duplicates)"
         );
     }
 }
