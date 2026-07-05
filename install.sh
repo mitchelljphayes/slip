@@ -202,6 +202,9 @@ Group=$SERVICE_USER
 ExecStart=$PREFIX/bin/slipd --config $CONFIG_DIR
 Restart=on-failure
 RestartSec=5
+# SLIP-88: a Caddy :443 listener conflict is a config error (exit 78 / EX_CONFIG),
+# not a transient failure — don't crash-loop; let the user fix the Caddyfile.
+RestartPreventExitStatus=78
 Environment="RUST_LOG=info"
 
 # Hardening

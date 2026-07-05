@@ -157,6 +157,10 @@ fn default_network_name() -> String {
     "slip".to_owned()
 }
 
+fn default_deploy_tls() -> String {
+    "internal".to_owned()
+}
+
 fn default_env() -> HashMap<String, String> {
     HashMap::new()
 }
@@ -195,6 +199,9 @@ pub struct ServerPreviewConfig {
 ///
 /// Provides defaults for all deployments on this daemon.
 /// Apps may override the timeout via [`DeployConfig::timeout`].
+///
+/// The `domain` and `tls` fields control the deploy-webhook ingress that slipd
+/// registers in Caddy on startup (see [`CaddyClient::bootstrap_deploy`]).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerDeployConfig {
     /// Maximum time a production deploy is allowed to run before being killed.
@@ -203,6 +210,19 @@ pub struct ServerDeployConfig {
     /// Maximum time a preview deploy is allowed to run before being killed.
     #[serde(default = "default_deploy_timeout", with = "duration_serde")]
     pub preview_timeout: Duration,
+    /// Public domain for the deploy webhook (e.g. "deploy.example.com").
+    ///
+    /// When set, slipd registers a Caddy route + TLS policy on bootstrap.
+    /// When absent, no deploy-webhook route is created (backwards compatible).
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// TLS strategy for the deploy webhook domain.
+    ///
+    /// Defaults to `"internal"` (Caddy local CA, self-signed — works on
+    /// tailnet-only hosts with `--insecure` callers). Other strategies
+    /// (e.g. `"acme"`, `"cloudflare-dns01"`) land in a follow-up ticket.
+    #[serde(default = "default_deploy_tls")]
+    pub tls: String,
 }
 
 impl Default for ServerDeployConfig {
@@ -210,6 +230,8 @@ impl Default for ServerDeployConfig {
         Self {
             timeout: default_deploy_timeout(),
             preview_timeout: default_deploy_timeout(),
+            domain: None,
+            tls: default_deploy_tls(),
         }
     }
 }

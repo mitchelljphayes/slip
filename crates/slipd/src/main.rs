@@ -136,10 +136,30 @@ async fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("network error: {e}")
     })?;
 
-    caddy.bootstrap().await.map_err(|e| {
-        tracing::error!(error = %e, "failed to bootstrap Caddy");
-        anyhow::anyhow!("Caddy bootstrap error: {e}")
-    })?;
+    match caddy.bootstrap().await {
+        Ok(()) => {}
+        Err(slip_core::CaddyError::ListenerConflict { server, listener }) => {
+            // SLIP-88: Listener conflict is a configuration error, not a transient
+            // failure. Exit with code 78 (EX_CONFIG — sysexits.h) so systemd's
+            // Restart=on-failure does NOT restart (the unit sets
+            // RestartPreventExitStatus=78). The user must fix their Caddyfile and
+            // restart slipd manually. Using a distinct non-zero code (rather than
+            // exit(0)) keeps the exit status semantically honest: a config error
+            // is a failure, not a success.
+            tracing::error!(
+                server = %server,
+                listener = %listener,
+                "Caddyfile site block conflicts with slip's server. \
+                 Remove site blocks from the Caddyfile — use [deploy] for the webhook \
+                 and 'slip services expose' / static routes for other hosts."
+            );
+            std::process::exit(78);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to bootstrap Caddy");
+            return Err(anyhow::anyhow!("Caddy bootstrap error: {e}"));
+        }
+    }
 
     // ── Configure TLS for preview wildcard certificates ────────────────────────
     if let (Some(preview_config), Some(tls_config)) = (&slip_config.preview, &slip_config.caddy.tls)
@@ -164,6 +184,29 @@ async fn main() -> anyhow::Result<()> {
             "preview deployments configured but no TLS config found; \
              preview domains will use Caddy's default HTTP-01 challenge"
         );
+    }
+
+    // ── SLIP-87: Bootstrap deploy-webhook ingress ─────────────────────────────
+    if let Some(deploy_cfg) = &slip_config.deploy {
+        let upstream = slip_config.server.listen.to_string();
+        match caddy
+            .bootstrap_deploy(deploy_cfg.domain.as_deref(), &deploy_cfg.tls, &upstream)
+            .await
+        {
+            Ok(()) => {
+                if let Some(ref domain) = deploy_cfg.domain {
+                    tracing::info!(
+                        domain = %domain,
+                        tls = %deploy_cfg.tls,
+                        "configured deploy-webhook ingress"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to bootstrap deploy-webhook ingress");
+                return Err(anyhow::anyhow!("deploy-webhook bootstrap error: {e}"));
+            }
+        }
     }
 
     tracing::info!("infrastructure bootstrap complete");

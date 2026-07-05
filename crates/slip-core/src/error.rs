@@ -58,6 +58,10 @@ pub enum ConfigError {
         strategy: String,
         valid: Vec<&'static str>,
     },
+
+    /// Internal error (e.g. crypto RNG failure).
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 /// Errors that can occur during container health checking.
@@ -80,6 +84,15 @@ pub enum CaddyError {
     Unreachable { url: String, source: reqwest::Error },
     #[error("caddy TLS configuration failed: {0}")]
     TlsConfigFailed(String),
+    /// Another Caddy server (from a Caddyfile) already claims the listener
+    /// that slip's `slip` server needs. This is a fatal configuration error.
+    #[error(
+        "Caddy server '{server}' (from your Caddyfile) already claims {listener}. \
+         slip owns {listener} via its 'slip' server. \
+         Remove site blocks from the Caddyfile — use [deploy] for the webhook \
+         and 'slip services expose' / static routes for other hosts."
+    )]
+    ListenerConflict { server: String, listener: String },
 }
 
 /// Errors that can occur when interacting with the Docker daemon.

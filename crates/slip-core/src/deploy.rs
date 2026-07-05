@@ -4135,6 +4135,7 @@ container = "web"
         config.deploy = Some(crate::config::ServerDeployConfig {
             timeout: Duration::from_secs(timeout_secs),
             preview_timeout: Duration::from_secs(timeout_secs),
+            ..Default::default()
         });
 
         Arc::new(crate::api::AppState {
@@ -4258,6 +4259,7 @@ container = "web"
         config.deploy = Some(crate::config::ServerDeployConfig {
             timeout: Duration::from_secs(600),
             preview_timeout: Duration::from_secs(600),
+            ..Default::default()
         });
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), test_app_config());
