@@ -18,6 +18,7 @@ set -euo pipefail
 
 # Configurable
 SLIP_BIN="${SLIP_BIN:-./target/release/slipd}"
+SLIP_CLI_BIN="${SLIP_CLI_BIN:-./target/release/slip}"
 SLIP_SECRET="${SLIP_SECRET:-test-secret}"
 TIMEOUT="${TIMEOUT:-120}"
 APP="smoke-test"
@@ -187,11 +188,17 @@ EOF
 echo "Config dir: $CONFIG_DIR"
 echo ""
 
-# ── Build slipd if needed ──────────────────────────────────────────────────────
+# ── Build binaries if needed ──────────────────────────────────────────────────
 if [ ! -x "$SLIP_BIN" ]; then
     echo ">>> Building slipd..."
     cargo build --release --bin slipd
     SLIP_BIN="$PROJECT_DIR/target/release/slipd"
+fi
+
+if [ ! -x "$SLIP_CLI_BIN" ]; then
+    echo ">>> Building slip CLI..."
+    cargo build --release --bin slip
+    SLIP_CLI_BIN="$PROJECT_DIR/target/release/slip"
 fi
 
 # ── Start slipd ─────────────────────────────────────────────────────────────────
@@ -213,6 +220,60 @@ for i in {1..30}; do
     fi
     sleep 1
 done
+echo ""
+
+# ── Test 0: slip server init ────────────────────────────────────────────────────
+echo ""
+echo "=== Test 0: slip server init ==="
+echo ""
+
+# Use a separate temp dir for init (SLIP_TEST_* overrides)
+INIT_TEMP_DIR=$(mktemp -d)
+INIT_CONFIG_DIR="$INIT_TEMP_DIR/etc/slip"
+INIT_SYSTEMD_DIR="$INIT_TEMP_DIR/etc/systemd/system"
+INIT_ENV_FILE="$INIT_CONFIG_DIR/slip.env"
+
+# Run init with test overrides, WITHOUT --domain so domain-dependent checks
+# (deploy_webhook_route, webhook_https) are skipped.  Verification then covers
+# caddy_reachable, slip_server_block, and runtime_socket.
+# Use `if ! ...; then` pattern to avoid dead failure branch under set -e.
+INIT_EXIT=0
+INIT_OUTPUT=$(SLIP_TEST_CONFIG_DIR="$INIT_CONFIG_DIR" \
+    SLIP_TEST_SYSTEMD_DIR="$INIT_SYSTEMD_DIR" \
+    SLIP_TEST_ENV_FILE="$INIT_ENV_FILE" \
+    SLIP_TEST_MANIFEST_DIR="$INIT_TEMP_DIR" \
+    "$SLIP_CLI_BIN" server init \
+    --yes \
+    --no-systemd \
+    2>&1) || INIT_EXIT=$?
+
+if [ "$INIT_EXIT" -ne 0 ]; then
+    echo "FAIL: slip server init exited with code $INIT_EXIT"
+    echo "$INIT_OUTPUT"
+    exit 1
+fi
+echo "PASS: slip server init completed (exit 0)"
+
+# Check that verification passed — human output uses ✓/✗ icons and labels
+# caddy_reachable passes: "✓ Caddy admin API reachable — GET ... → 200"
+if ! echo "$INIT_OUTPUT" | grep -q "✓ Caddy admin API reachable"; then
+    echo "FAIL: caddy_reachable check did not pass"
+    echo "$INIT_OUTPUT"
+    exit 1
+fi
+echo "PASS: caddy_reachable check passed"
+
+# Check that manifest was emitted
+MANIFEST_COUNT=$(find "$INIT_TEMP_DIR" -name "*.slip.toml" 2>/dev/null | wc -l | tr -d ' ')
+if [ "$MANIFEST_COUNT" -eq 0 ]; then
+    echo "FAIL: no manifest file emitted"
+    echo "$INIT_OUTPUT"
+    exit 1
+fi
+echo "PASS: manifest emitted"
+
+# Cleanup init temp dir
+rm -rf "$INIT_TEMP_DIR"
 echo ""
 
 # ── Test 1: First deploy ────────────────────────────────────────────────────────

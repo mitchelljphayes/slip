@@ -376,10 +376,936 @@ fn server_init_stub_exits_nonzero() {
     let mut cmd = Command::cargo_bin("slip").unwrap();
     let assert = cmd.args(["server", "init"]).assert();
 
+    // Without root or test overrides, the command should fail with a
+    // prescriptive error about needing root.
     assert
         .failure()
         .code(output::GENERIC)
-        .stderr(predicate::str::contains("not yet implemented"));
+        .stderr(predicate::str::contains("must be run as root"));
+}
+
+// ─── `slip server init` integration tests ───────────────────────────────────────
+
+#[test]
+fn server_init_writes_secret_and_config_in_tempdir() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let env_file = config_dir.join("slip.env");
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args([
+            "server",
+            "init",
+            "--yes",
+            "--no-systemd",
+            "--skip-verify",
+            "--domain",
+            "deploy.example.com",
+        ])
+        .assert();
+
+    let assert = assert.success().code(output::OK);
+
+    // Check env file exists with 64-hex secret
+    assert!(env_file.exists(), "env file should exist");
+    let env_content = std::fs::read_to_string(&env_file).unwrap();
+    assert!(
+        env_content.starts_with("SLIP_ADMIN_SECRET="),
+        "env file should contain SLIP_ADMIN_SECRET"
+    );
+    let secret = env_content
+        .trim()
+        .strip_prefix("SLIP_ADMIN_SECRET=")
+        .unwrap();
+    assert_eq!(secret.len(), 64, "secret should be 64 hex chars");
+    assert!(
+        secret.chars().all(|c| c.is_ascii_hexdigit()),
+        "secret should be hex"
+    );
+
+    // Check 0600 mode
+    let metadata = std::fs::metadata(&env_file).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o600,
+            "env file should be 0600"
+        );
+    }
+
+    // Check config file exists with ${SLIP_ADMIN_SECRET} reference
+    let config_path = config_dir.join("slip.toml");
+    assert!(config_path.exists(), "config file should exist");
+    let config_content = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        config_content.contains("${SLIP_ADMIN_SECRET}"),
+        "config should reference env var"
+    );
+    assert!(
+        config_content.contains("deploy.example.com"),
+        "config should contain deploy domain"
+    );
+    assert!(
+        config_content.contains("backend = \"auto\""),
+        "config should contain runtime backend"
+    );
+
+    // Check 0644 mode on config
+    let config_meta = std::fs::metadata(&config_path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            config_meta.permissions().mode() & 0o777,
+            0o644,
+            "config file should be 0644"
+        );
+    }
+
+    // Check stdout contains the secret banner WITH the actual secret value
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("Admin secret generated"),
+        "stdout should show secret banner"
+    );
+    // Fresh run SHOULD contain the 64-hex secret in stdout (on the banner line)
+    let has_hex_secret = stdout.lines().any(|line| {
+        line.contains("Admin secret generated:")
+            && line.chars().filter(|c| c.is_ascii_hexdigit()).count() >= 64
+    });
+    assert!(
+        has_hex_secret,
+        "fresh run should show the secret in stdout: {stdout}"
+    );
+}
+
+#[test]
+fn server_init_idempotent_skips_existing() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let env_file = config_dir.join("slip.env");
+
+    // First run
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    cmd.env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args(["server", "init", "--yes", "--no-systemd", "--skip-verify"])
+        .assert()
+        .success();
+
+    // Second run (idempotent)
+    let mut cmd2 = Command::cargo_bin("slip").unwrap();
+    let assert2 = cmd2
+        .env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args(["server", "init", "--yes", "--no-systemd", "--skip-verify"])
+        .assert();
+
+    let assert2 = assert2.success().code(output::OK);
+
+    // Should mention "already present"
+    let stderr = String::from_utf8(assert2.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("already present"),
+        "idempotent run should mention existing files: {stderr}"
+    );
+}
+
+#[test]
+fn server_init_force_secret_regenerates() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let env_file = config_dir.join("slip.env");
+
+    // First run
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    cmd.env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args(["server", "init", "--yes", "--no-systemd", "--skip-verify"])
+        .assert()
+        .success();
+
+    let first_secret = std::fs::read_to_string(&env_file).unwrap();
+
+    // Second run with --force=secret
+    let mut cmd2 = Command::cargo_bin("slip").unwrap();
+    let assert2 = cmd2
+        .env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args([
+            "server",
+            "init",
+            "--yes",
+            "--no-systemd",
+            "--skip-verify",
+            "--force",
+            "secret",
+        ])
+        .assert();
+
+    let assert2 = assert2.success().code(output::OK);
+
+    let second_secret = std::fs::read_to_string(&env_file).unwrap();
+    assert_ne!(first_secret, second_secret, "secret should be regenerated");
+
+    let stderr = String::from_utf8(assert2.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("regenerating secret"),
+        "should warn about regeneration"
+    );
+}
+
+#[test]
+fn server_init_writes_unit_file() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let systemd_dir = tmp.path().join("etc/systemd/system");
+    let env_file = config_dir.join("slip.env");
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    cmd.env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_SYSTEMD_DIR", systemd_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args(["server", "init", "--yes", "--skip-verify"])
+        .assert()
+        .success();
+
+    let unit_path = systemd_dir.join("slipd.service");
+    assert!(unit_path.exists(), "unit file should exist");
+    let unit_content = std::fs::read_to_string(&unit_path).unwrap();
+
+    // Check key features
+    assert!(
+        unit_content.contains("EnvironmentFile="),
+        "unit should have EnvironmentFile"
+    );
+    assert!(
+        unit_content.contains("ProtectSystem=strict"),
+        "unit should have ProtectSystem=strict"
+    );
+    assert!(
+        unit_content.contains("ReadWritePaths"),
+        "unit should have ReadWritePaths"
+    );
+    assert!(
+        unit_content.contains("RestartPreventExitStatus=78"),
+        "unit should have RestartPreventExitStatus=78"
+    );
+    assert!(
+        unit_content.contains("User=root"),
+        "unit should run as root"
+    );
+}
+
+#[test]
+fn server_init_no_systemd_skips_service() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let env_file = config_dir.join("slip.env");
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args(["server", "init", "--yes", "--no-systemd", "--skip-verify"])
+        .assert();
+
+    let assert = assert.success().code(output::OK);
+
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("systemd unit skipped"),
+        "should mention systemd unit skipped: {stderr}"
+    );
+}
+
+#[test]
+fn server_init_emits_manifest() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let env_file = config_dir.join("slip.env");
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    cmd.env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args([
+            "server",
+            "init",
+            "--yes",
+            "--no-systemd",
+            "--skip-verify",
+            "--domain",
+            "deploy.example.com",
+        ])
+        .assert()
+        .success();
+
+    // Find the manifest file (named after hostname)
+    let entries: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "toml"))
+        .collect();
+
+    assert!(!entries.is_empty(), "manifest file should exist");
+    let manifest_path = &entries[0].path();
+    let manifest_content = std::fs::read_to_string(manifest_path).unwrap();
+
+    // Manifest should NOT contain the secret
+    assert!(
+        !manifest_content.contains("SLIP_ADMIN_SECRET"),
+        "manifest should not contain secret"
+    );
+    assert!(
+        !manifest_content.contains("secret"),
+        "manifest should not contain secret field"
+    );
+
+    // Manifest should contain config sections
+    assert!(
+        manifest_content.contains("[deploy]"),
+        "manifest should have [deploy] section"
+    );
+    assert!(
+        manifest_content.contains("deploy.example.com"),
+        "manifest should contain domain"
+    );
+    assert!(
+        manifest_content.contains("[caddy]"),
+        "manifest should have [caddy] section"
+    );
+    assert!(
+        manifest_content.contains("[server]"),
+        "manifest should have [server] section"
+    );
+    assert!(
+        manifest_content.contains("[runtime]"),
+        "manifest should have [runtime] section"
+    );
+}
+
+#[test]
+fn server_init_full_flow_tempdir() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let systemd_dir = tmp.path().join("etc/systemd/system");
+    let env_file = config_dir.join("slip.env");
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_SYSTEMD_DIR", systemd_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args([
+            "server",
+            "init",
+            "--yes",
+            "--skip-verify",
+            "--domain",
+            "test.example.com",
+            "--tls",
+            "internal",
+            "--runtime",
+            "auto",
+        ])
+        .assert();
+
+    let assert = assert.success().code(output::OK);
+
+    // Verify all files exist with correct modes
+    assert!(env_file.exists(), "env file should exist");
+    let env_meta = std::fs::metadata(&env_file).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(env_meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    let config_path = config_dir.join("slip.toml");
+    assert!(config_path.exists(), "config file should exist");
+    let config_meta = std::fs::metadata(&config_path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(config_meta.permissions().mode() & 0o777, 0o644);
+    }
+
+    let unit_path = systemd_dir.join("slipd.service");
+    assert!(unit_path.exists(), "unit file should exist");
+    let unit_meta = std::fs::metadata(&unit_path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(unit_meta.permissions().mode() & 0o777, 0o644);
+    }
+
+    // Check stdout for secret banner WITH the actual secret value
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("Admin secret generated"),
+        "stdout should show secret"
+    );
+    let has_hex_secret = stdout.lines().any(|line| {
+        line.contains("Admin secret generated:")
+            && line.chars().filter(|c| c.is_ascii_hexdigit()).count() >= 64
+    });
+    assert!(
+        has_hex_secret,
+        "fresh run should show the secret in stdout: {stdout}"
+    );
+}
+
+#[test]
+fn server_init_non_root_fails() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args(["server", "init", "--yes", "--no-systemd", "--skip-verify"])
+        .assert();
+
+    assert
+        .failure()
+        .code(output::GENERIC)
+        .stderr(predicate::str::contains("must be run as root"));
+}
+
+#[test]
+fn server_init_force_all() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let systemd_dir = tmp.path().join("etc/systemd/system");
+    let env_file = config_dir.join("slip.env");
+
+    // First run
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    cmd.env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_SYSTEMD_DIR", systemd_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args(["server", "init", "--yes", "--no-systemd", "--skip-verify"])
+        .assert()
+        .success();
+
+    let first_secret = std::fs::read_to_string(&env_file).unwrap();
+
+    // Second run with bare --force (all)
+    let mut cmd2 = Command::cargo_bin("slip").unwrap();
+    cmd2.env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_SYSTEMD_DIR", systemd_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args([
+            "server",
+            "init",
+            "--yes",
+            "--no-systemd",
+            "--skip-verify",
+            "--force",
+        ])
+        .assert()
+        .success();
+
+    let second_secret = std::fs::read_to_string(&env_file).unwrap();
+    assert_ne!(
+        first_secret, second_secret,
+        "secret should be regenerated with --force"
+    );
+}
+
+#[test]
+fn server_init_manifest_idempotent() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let env_file = config_dir.join("slip.env");
+
+    // First run
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    cmd.env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args([
+            "server",
+            "init",
+            "--yes",
+            "--no-systemd",
+            "--skip-verify",
+            "--domain",
+            "test.example.com",
+        ])
+        .assert()
+        .success();
+
+    // Second run — should not fail
+    let mut cmd2 = Command::cargo_bin("slip").unwrap();
+    cmd2.env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args([
+            "server",
+            "init",
+            "--yes",
+            "--no-systemd",
+            "--skip-verify",
+            "--domain",
+            "test.example.com",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn server_init_from_file_rebuilds() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let systemd_dir = tmp.path().join("etc/systemd/system");
+    let env_file = config_dir.join("slip.env");
+
+    // Write a manifest file
+    let manifest_path = tmp.path().join("myserver.slip.toml");
+    std::fs::write(
+        &manifest_path,
+        r#"[deploy]
+domain = "deploy.example.com"
+tls = "internal"
+
+[caddy]
+admin_api = "http://localhost:2019"
+
+[server]
+listen = "127.0.0.1:7890"
+
+[runtime]
+backend = "auto"
+"#,
+    )
+    .unwrap();
+
+    // Run init with --from-file
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_SYSTEMD_DIR", systemd_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args([
+            "server",
+            "init",
+            "--yes",
+            "--no-systemd",
+            "--skip-verify",
+            "--from-file",
+            manifest_path.to_str().unwrap(),
+        ])
+        .assert();
+
+    let assert = assert.success().code(output::OK);
+
+    // Config should match manifest values
+    let config_path = config_dir.join("slip.toml");
+    assert!(config_path.exists(), "config should exist");
+    let config_content = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        config_content.contains("deploy.example.com"),
+        "config should contain domain from manifest"
+    );
+    assert!(
+        config_content.contains("backend = \"auto\""),
+        "config should contain runtime from manifest"
+    );
+
+    // Secret should be regenerated (fresh)
+    assert!(env_file.exists(), "env file should exist");
+    let env_content = std::fs::read_to_string(&env_file).unwrap();
+    assert!(
+        env_content.starts_with("SLIP_ADMIN_SECRET="),
+        "env file should contain secret"
+    );
+    let secret = env_content
+        .trim()
+        .strip_prefix("SLIP_ADMIN_SECRET=")
+        .unwrap();
+    assert_eq!(secret.len(), 64, "secret should be 64 hex chars");
+
+    // Stderr should contain disaster recovery warning
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("disaster recovery"),
+        "from-file should show disaster recovery warning: {stderr}"
+    );
+}
+
+#[test]
+fn server_init_non_tty_without_yes_completes() {
+    // assert_cmd runs are non-TTY, so this tests the non-TTY path without --yes
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let env_file = config_dir.join("slip.env");
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        // No --yes, no --domain — should complete with defaults (no domain = omit [deploy])
+        .args(["server", "init", "--no-systemd", "--skip-verify"])
+        .assert();
+
+    assert.success().code(output::OK);
+
+    // Config should exist without [deploy] section
+    let config_path = config_dir.join("slip.toml");
+    assert!(config_path.exists(), "config should exist");
+    let config_content = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !config_content.contains("[deploy]"),
+        "config should not have [deploy] section when no domain: {config_content}"
+    );
+}
+
+#[test]
+fn server_init_json_schema() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let systemd_dir = tmp.path().join("etc/systemd/system");
+    let env_file = config_dir.join("slip.env");
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_SYSTEMD_DIR", systemd_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        // Use --skip-verify to avoid network-dependent failures
+        .args(["server", "init", "--yes", "--json", "--skip-verify"])
+        .assert();
+
+    let assert = assert.success().code(output::OK);
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    // Parse as JSON — should be a single JSON document
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("stdout should be valid JSON: {e}\nstdout: {stdout}");
+    });
+
+    // Should have manifest and secret_file
+    assert!(
+        parsed.get("manifest").is_some(),
+        "JSON should have 'manifest'"
+    );
+    assert!(
+        parsed.get("secret_file").is_some(),
+        "JSON should have 'secret_file'"
+    );
+    assert!(
+        parsed.get("next_steps").is_some(),
+        "JSON should have 'next_steps'"
+    );
+
+    // In --json mode the secret is never shown, so next_steps must reference
+    // the env file and must NOT say "shown above".
+    let next_steps = parsed["next_steps"].as_array().unwrap_or_else(|| {
+        panic!("next_steps should be an array");
+    });
+    let combined: String = next_steps
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !combined.contains("shown above"),
+        "JSON next_steps must not say 'shown above': {combined}"
+    );
+}
+
+#[test]
+fn server_init_json_verify_fails_exit_5() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let systemd_dir = tmp.path().join("etc/systemd/system");
+    let env_file = config_dir.join("slip.env");
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let output = cmd
+        .env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_SYSTEMD_DIR", systemd_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        // Point Caddy admin at a dead port — verification will fail
+        .args(["server", "init", "--yes", "--no-systemd", "--json"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    let _stderr = String::from_utf8(output.stderr.clone()).unwrap();
+
+    assert!(!output.status.success(), "expected failure, got success");
+    assert_eq!(
+        output.status.code(),
+        Some(output::DEPLOY_FAILED),
+        "expected exit code 5"
+    );
+
+    // stdout should be parseable JSON with checks[] populated
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("stdout should be valid JSON on failure path: {e}\nstdout: {stdout}");
+    });
+
+    // Should have checks array with at least one entry
+    let checks = parsed.get("checks").and_then(|c| c.as_array());
+    assert!(checks.is_some(), "JSON should have 'checks' array");
+    if let Some(arr) = checks {
+        assert!(!arr.is_empty(), "checks array should not be empty");
+        for check in arr {
+            assert!(check.get("name").is_some(), "each check should have 'name'");
+            assert!(
+                check.get("status").is_some(),
+                "each check should have 'status'"
+            );
+            assert!(
+                check.get("detail").is_some(),
+                "each check should have 'detail'"
+            );
+        }
+    }
+
+    assert!(parsed.get("passed").is_some(), "JSON should have 'passed'");
+    assert!(parsed.get("failed").is_some(), "JSON should have 'failed'");
+    assert_eq!(parsed["overall"], "fail", "overall should be 'fail'");
+    assert!(
+        parsed.get("manifest").is_some(),
+        "JSON should have 'manifest'"
+    );
+    assert!(
+        parsed.get("secret_file").is_some(),
+        "JSON should have 'secret_file'"
+    );
+    assert!(
+        parsed.get("next_steps").is_some(),
+        "JSON should have 'next_steps'"
+    );
+}
+
+#[test]
+fn server_init_verify_fails_exit_5() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let systemd_dir = tmp.path().join("etc/systemd/system");
+    let env_file = config_dir.join("slip.env");
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let output = cmd
+        .env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_SYSTEMD_DIR", systemd_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        // Point Caddy admin at a dead port — verification will fail
+        .args(["server", "init", "--yes", "--no-systemd"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    let _stderr = String::from_utf8(output.stderr.clone()).unwrap();
+
+    assert!(!output.status.success(), "expected failure, got success");
+    assert_eq!(
+        output.status.code(),
+        Some(output::DEPLOY_FAILED),
+        "expected exit code 5"
+    );
+
+    // Verification output goes to stdout
+    assert!(
+        stdout.contains("Caddy admin API reachable"),
+        "stdout should contain verification output: {stdout}"
+    );
+    assert!(
+        stdout.contains("✗"),
+        "stdout should show failures: {stdout}"
+    );
+}
+
+#[test]
+fn server_init_unit_converges_on_mismatch() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let systemd_dir = tmp.path().join("etc/systemd/system");
+    let env_file = config_dir.join("slip.env");
+
+    // Pre-write a stale unit file
+    let unit_path = systemd_dir.join("slipd.service");
+    std::fs::create_dir_all(&systemd_dir).unwrap();
+    std::fs::write(&unit_path, "[Unit]\nDescription=stale\n").unwrap();
+
+    // Run init — should converge (overwrite) since content differs
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    cmd.env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_SYSTEMD_DIR", systemd_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args(["server", "init", "--yes", "--skip-verify"])
+        .assert()
+        .success();
+
+    // Unit should now have the correct content
+    let unit_content = std::fs::read_to_string(&unit_path).unwrap();
+    assert!(
+        unit_content.contains("EnvironmentFile="),
+        "unit should have EnvironmentFile after convergence"
+    );
+    assert!(
+        unit_content.contains("ProtectSystem=strict"),
+        "unit should have ProtectSystem=strict after convergence"
+    );
+}
+
+#[test]
+fn server_init_force_unit_overwrites() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let systemd_dir = tmp.path().join("etc/systemd/system");
+    let env_file = config_dir.join("slip.env");
+
+    // First run
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    cmd.env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_SYSTEMD_DIR", systemd_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args(["server", "init", "--yes", "--skip-verify"])
+        .assert()
+        .success();
+
+    // Second run with --force=unit — should overwrite even if content matches
+    let mut cmd2 = Command::cargo_bin("slip").unwrap();
+    cmd2.env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_SYSTEMD_DIR", systemd_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args([
+            "server",
+            "init",
+            "--yes",
+            "--skip-verify",
+            "--force",
+            "unit",
+        ])
+        .assert()
+        .success();
+
+    // Unit should still have correct content
+    let unit_path = systemd_dir.join("slipd.service");
+    let unit_content = std::fs::read_to_string(&unit_path).unwrap();
+    assert!(
+        unit_content.contains("EnvironmentFile="),
+        "unit should have EnvironmentFile after force overwrite"
+    );
+}
+
+#[test]
+fn server_init_cli_flag_overrides_manifest() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let systemd_dir = tmp.path().join("etc/systemd/system");
+    let env_file = config_dir.join("slip.env");
+
+    // Write a manifest with domain "manifest.example.com"
+    let manifest_path = tmp.path().join("myserver.slip.toml");
+    std::fs::write(
+        &manifest_path,
+        r#"[deploy]
+domain = "manifest.example.com"
+tls = "internal"
+"#,
+    )
+    .unwrap();
+
+    // Run init with --from-file AND --domain — CLI flag should win
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    cmd.env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_SYSTEMD_DIR", systemd_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args([
+            "server",
+            "init",
+            "--yes",
+            "--no-systemd",
+            "--skip-verify",
+            "--from-file",
+            manifest_path.to_str().unwrap(),
+            "--domain",
+            "cli.example.com",
+        ])
+        .assert()
+        .success();
+
+    // Config should use CLI domain, not manifest domain
+    let config_path = config_dir.join("slip.toml");
+    let config_content = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        config_content.contains("cli.example.com"),
+        "config should use CLI flag domain"
+    );
+    assert!(
+        !config_content.contains("manifest.example.com"),
+        "config should NOT use manifest domain"
+    );
+}
+
+#[test]
+fn server_init_idempotent_stdout_no_secret() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let env_file = config_dir.join("slip.env");
+
+    // First run
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    cmd.env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args(["server", "init", "--yes", "--no-systemd", "--skip-verify"])
+        .assert()
+        .success();
+
+    // Second run (idempotent) — stdout should NOT contain a 64-hex secret
+    let mut cmd2 = Command::cargo_bin("slip").unwrap();
+    let assert2 = cmd2
+        .env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args(["server", "init", "--yes", "--no-systemd", "--skip-verify"])
+        .assert();
+
+    let assert2 = assert2.success().code(output::OK);
+
+    let stdout = String::from_utf8(assert2.get_output().stdout.clone()).unwrap();
+    // Should NOT contain "Admin secret generated" since no new secret was written
+    assert!(
+        !stdout.contains("Admin secret generated"),
+        "idempotent run should not print secret banner: {stdout}"
+    );
+    // Should NOT contain any 64-hex string
+    let has_hex_secret = stdout.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.chars().all(|c| c.is_ascii_hexdigit()) && trimmed.len() == 64
+    });
+    assert!(
+        !has_hex_secret,
+        "idempotent run should not leak secret in stdout"
+    );
 }
 
 #[test]
