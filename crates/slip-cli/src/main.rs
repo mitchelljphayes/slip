@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 #[allow(dead_code)]
 mod output;
 
+mod server_init;
+
 /// slip CLI — manage apps, deploys, secrets, and status.
 #[derive(Parser)]
 #[command(name = "slip", version, about)]
@@ -157,7 +159,33 @@ enum Commands {
 #[derive(Subcommand)]
 enum ServerCommands {
     /// Bootstrap slipd on a new server.
-    Init,
+    Init {
+        /// Deploy webhook domain (e.g. deploy.example.com).
+        #[arg(long)]
+        domain: Option<String>,
+        /// TLS strategy [default: internal] [possible values: internal].
+        #[arg(long, default_value = "internal")]
+        tls: String,
+        /// Container runtime backend [default: auto] [possible values: auto, docker, podman].
+        #[arg(long, default_value = "auto")]
+        runtime: String,
+        /// Non-interactive: use defaults, never prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Force overwrite [possible values: config, secret, unit, service].
+        /// Pass --force with no value to force all.
+        #[arg(long, num_args = 0.., default_missing_value = "all", value_parser = clap::value_parser!(server_init::ForceTarget))]
+        force: Vec<server_init::ForceTarget>,
+        /// Skip systemd unit install and service start.
+        #[arg(long)]
+        no_systemd: bool,
+        /// Skip the verification step.
+        #[arg(long)]
+        skip_verify: bool,
+        /// Initialize from a server manifest (disaster recovery).
+        #[arg(long)]
+        from_file: Option<std::path::PathBuf>,
+    },
     /// Show server status.
     Status,
 }
@@ -2002,8 +2030,36 @@ async fn main() -> anyhow::Result<()> {
             output::not_implemented(&format!("logs {app} --since {since_str}"), cli.json);
         }
         Commands::Server(command) => match command {
-            ServerCommands::Init => {
-                output::not_implemented("server init", cli.json);
+            ServerCommands::Init {
+                domain,
+                tls,
+                runtime,
+                yes,
+                force,
+                no_systemd,
+                skip_verify,
+                from_file,
+            } => {
+                let force_all = force
+                    .iter()
+                    .any(|f| matches!(f, server_init::ForceTarget::All));
+                let force_targets: Vec<server_init::ForceTarget> = force
+                    .into_iter()
+                    .filter(|f| !matches!(f, server_init::ForceTarget::All))
+                    .collect();
+                let opts = server_init::ServerInitOpts {
+                    domain,
+                    tls,
+                    runtime,
+                    yes,
+                    force: force_targets,
+                    force_all,
+                    no_systemd,
+                    skip_verify,
+                    from_file,
+                    json: cli.json,
+                };
+                server_init::run(opts);
             }
             ServerCommands::Status => {
                 output::not_implemented("server status", cli.json);

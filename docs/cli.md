@@ -25,7 +25,7 @@ slip <noun> <subcommand> [<args>] [--json] [--server <url>] [--token <token>]
 
 | Command | Status | Description |
 |---------|--------|-------------|
-| `slip server init` | 🚧 Phase 2 | Bootstrap slipd on a new server |
+| `slip server init` | ✅ Working | Bootstrap slipd on a new server |
 | `slip server status` | 🚧 Phase 2 | Show server status |
 | `slip services list` | 🚧 Phase 3 | List registered services |
 | `slip secrets list <app>` | ✅ Working | List secret keys for an app |

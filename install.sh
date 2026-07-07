@@ -168,66 +168,19 @@ mkdir -p "$CONFIG_DIR/apps"
 mkdir -p "$DATA_DIR/state" "$DATA_DIR/secrets" "$DATA_DIR/volumes"
 chown -R "$SERVICE_USER":"$SERVICE_USER" "$DATA_DIR" "$CONFIG_DIR"
 
-# Write default config if none exists
-if [ ! -f "$CONFIG_DIR/slip.toml" ]; then
-    info "Writing default config to $CONFIG_DIR/slip.toml..."
-    cat > "$CONFIG_DIR/slip.toml" <<'EOF'
-[server]
-listen = "127.0.0.1:7890"
-
-[runtime]
-backend = "auto"
-
-[caddy]
-admin_api = "http://localhost:2019"
-
-[storage]
-path = "/var/lib/slip"
-EOF
-    chown "$SERVICE_USER":"$SERVICE_USER" "$CONFIG_DIR/slip.toml"
-fi
-
-# Install systemd service
-info "Installing systemd service..."
-cat > /etc/systemd/system/slipd.service <<EOF
-[Unit]
-Description=slip deploy daemon
-After=network-online.target podman.service docker.service caddy.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=$SERVICE_USER
-Group=$SERVICE_USER
-ExecStart=$PREFIX/bin/slipd --config $CONFIG_DIR
-Restart=on-failure
-RestartSec=5
-# SLIP-88: a Caddy :443 listener conflict is a config error (exit 78 / EX_CONFIG),
-# not a transient failure — don't crash-loop; let the user fix the Caddyfile.
-RestartPreventExitStatus=78
-Environment="RUST_LOG=info"
-
-# Hardening
-NoNewPrivileges=true
-ProtectHome=true
-PrivateTmp=true
-ReadWritePaths=$DATA_DIR $CONFIG_DIR
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-
 info ""
 info "✅ slip $VERSION installed successfully!"
 info ""
-info "Next steps:"
-info "  1. Edit $CONFIG_DIR/slip.toml"
-info "  2. Create app configs in $CONFIG_DIR/apps/"
-info "  3. Validate:          slipd --config $CONFIG_DIR --check"
-info "  4. Start the service:  systemctl enable --now slipd"
-info "  5. Check logs:         journalctl -u slipd -f"
-info ""
-info "See https://github.com/$REPO/blob/main/docs/getting-started.md"
-info "for full setup instructions."
+
+# Offer to run `slip server init` (TTY-gated)
+if [ -t 0 ] && [ "${SLIP_NONINTERACTIVE:-0}" != "1" ]; then
+    info "Run 'slip server init' now to configure the server?"
+    printf "  [Y/n] " >&2
+    read -r reply
+    case "$reply" in
+        n*|N*) info "Skipped. Run 'slip server init' later as root." ;;
+        *)     exec "$PREFIX/bin/slip" server init ;;
+    esac
+else
+    info "Run 'slip server init' as root to configure the server."
+fi
