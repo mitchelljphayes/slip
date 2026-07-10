@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::caddy::{CaddyClient, RouteInfo};
+use crate::caddy::{CaddyClient, Route, RouteInfo};
 use crate::config::AppConfig;
 use crate::deploy::{AppRuntimeState, AppStatus, RouteState};
 use crate::error::CaddyError;
@@ -264,21 +264,17 @@ pub async fn reconcile_routes(
                         port: r.port,
                     })
                     .collect()
-            } else if let Some(port) = state.current_port {
-                let config = match app_configs.get(app_name) {
-                    Some(c) => c,
-                    None => {
-                        tracing::warn!(app = %app_name, "no config found for running app, skipping route reconciliation");
-                        return None;
-                    }
+            } else {
+                let port = state.current_port?;
+                let Some(config) = app_configs.get(app_name) else {
+                    tracing::warn!(app = %app_name, "no config found for running app, skipping route reconciliation");
+                    return None;
                 };
                 vec![RouteInfo {
                     app_name: app_name.clone(),
                     domain: config.routing.domain.clone().unwrap_or_default(),
                     port,
                 }]
-            } else {
-                return None;
             };
             Some(route_infos)
         })
@@ -301,6 +297,10 @@ pub async fn reconcile_routes(
 /// For each preview state with status `Running` and a non-empty domain, calls
 /// `set_route` to ensure the Caddy route exists. This recovers routes that were
 /// lost due to a Caddy restart while slipd was down.
+///
+/// Per-preview tracing spans carry `app` and `preview_id` so failures name
+/// the affected preview (HE #6). Failures are collected and logged but do not
+/// abort the reconcile (collect-and-continue).
 pub async fn reconcile_preview_routes(
     caddy: &CaddyClient,
     preview_states: &DashMap<String, PreviewState>,
@@ -336,7 +336,40 @@ pub async fn reconcile_preview_routes(
         route_count = routes.len(),
         "reconciling caddy routes for preview deployments"
     );
-    caddy.reconcile(&routes).await
+
+    // Collect-and-continue: log per-preview failures with app/preview_id spans
+    // rather than fail-fast on the first error (HE #6).
+    let mut first_err: Option<CaddyError> = None;
+    for route in &routes {
+        // route_id = slip-{app}-preview-{preview_id}-0 (the naming used by
+        // set_routes for a single-route preview).
+        let route_id = format!("slip-{}-0", route.app_name);
+        let _span = tracing::info_span!(
+            "reconcile_preview_route",
+            app = %route.app_name,
+            route_id = %route_id,
+        );
+        let r = vec![Route {
+            hostname: route.domain.clone(),
+            port: route.port,
+        }];
+        if let Err(e) = caddy.set_routes(&route.app_name, &r).await {
+            tracing::warn!(
+                app = %route.app_name,
+                route_id = %route_id,
+                error = %e,
+                "preview route reconcile failed on startup (non-fatal)"
+            );
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
+    }
+
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 // ─── Preview state persistence ────────────────────────────────────────────────

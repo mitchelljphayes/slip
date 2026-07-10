@@ -8,12 +8,18 @@
 //! Each test starts a fresh `caddy run` process with an admin-only config on a
 //! free port, exercises the `CaddyClient` API, and kills the process on drop.
 
+use std::collections::HashMap;
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use slip_core::CaddyClient;
 use slip_core::caddy::Route;
+use slip_core::config::{
+    AppConfig, AppInfo, DeployConfig, HealthConfig, NetworkConfig, ResourceConfig, RoutingConfig,
+};
+use slip_core::deploy::{AppRuntimeState, AppStatus};
+use slip_core::reconcile::{ReconcileContext, default_backoff, reconcile_tick};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -193,4 +199,124 @@ async fn set_and_remove_routes_on_real_caddy() {
         404,
         "route slip-app1-0 should be gone after remove_routes"
     );
+}
+
+// ── Chaos: reconcile self-heals after a Caddy restart ────────────────────────
+
+/// Helper to build a minimal single-route AppConfig.
+fn test_app_config(name: &str, domain: &str) -> AppConfig {
+    AppConfig {
+        app: AppInfo {
+            name: name.to_string(),
+            image: "nginx".to_string(),
+            secret: None,
+        },
+        routing: RoutingConfig {
+            domain: Some(domain.to_string()),
+            port: Some(80),
+            routes: vec![],
+        },
+        health: HealthConfig::default(),
+        deploy: DeployConfig::default(),
+        env: HashMap::new(),
+        env_file: None,
+        resources: ResourceConfig::default(),
+        network: NetworkConfig::default(),
+        preview: None,
+        volumes: vec![],
+    }
+}
+
+/// Helper to build a ReconcileContext for a single running app.
+fn test_context(client: CaddyClient, app: &str, domain: &str, port: u16) -> ReconcileContext {
+    let mut apps = HashMap::new();
+    apps.insert(app.to_string(), test_app_config(app, domain));
+    let mut states = HashMap::new();
+    states.insert(
+        app.to_string(),
+        AppRuntimeState {
+            status: AppStatus::Running,
+            current_port: Some(port),
+            ..Default::default()
+        },
+    );
+    ReconcileContext {
+        caddy: client,
+        app_states: states,
+        apps,
+        preview: None,
+        caddy_tls: None,
+        deploy: None,
+        listen_addr: "127.0.0.1:7890".to_string(),
+    }
+}
+
+/// Assert that a route `@id` exists on the Caddy at `base_url` within
+/// `timeout`. Polls every 200ms.
+async fn assert_route_exists(base_url: &str, route_id: &str, timeout: Duration) {
+    let http = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::time::Instant::now() > deadline {
+            panic!("route {route_id} did not appear on {base_url} within {timeout:?}");
+        }
+        let resp = http
+            .get(format!("{base_url}/id/{route_id}"))
+            .send()
+            .await
+            .expect("GET route");
+        if resp.status().is_success() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The reconcile loop self-heals routes after a real Caddy restart.
+///
+/// This is the SLIP-99 acceptance test: kill Caddy, start a fresh instance
+/// (new port, empty config), run a reconcile tick, and confirm the route
+/// reappears — proving the loop converges without manual intervention.
+#[tokio::test]
+#[ignore]
+async fn reconcile_loop_converges_after_caddy_restart() {
+    // ── 1. Start Caddy, bootstrap, set an initial route ─────────────────────
+    let guard = start_caddy();
+    let client = CaddyClient::new(guard.base_url.clone());
+    client.bootstrap().await.expect("bootstrap should succeed");
+
+    let ctx = test_context(client, "test-app", "test.local", 8080);
+    let backoff = default_backoff();
+    let summary = reconcile_tick(&ctx, &backoff).await;
+    assert_eq!(summary.routes_failed, 0, "initial reconcile should succeed");
+    assert_route_exists(&guard.base_url, "slip-test-app-0", Duration::from_secs(5)).await;
+
+    // ── 2. CHAOS: kill Caddy, start a fresh instance on a new port ──────────
+    drop(guard);
+    let guard2 = start_caddy();
+    let client2 = CaddyClient::new(guard2.base_url.clone());
+
+    // The fresh Caddy has no slip server block and no routes.
+    let http = reqwest::Client::new();
+    let resp = http
+        .get(format!("{}/id/slip-test-app-0", guard2.base_url))
+        .send()
+        .await
+        .expect("GET route on fresh caddy");
+    assert_eq!(
+        resp.status(),
+        404,
+        "route should be gone on fresh Caddy (simulating restart)"
+    );
+
+    // ── 3. Run a reconcile tick against the new Caddy — self-heal ───────────
+    let ctx2 = test_context(client2, "test-app", "test.local", 8080);
+    let summary2 = reconcile_tick(&ctx2, &backoff).await;
+    assert_eq!(
+        summary2.routes_failed, 0,
+        "reconcile after restart should succeed"
+    );
+
+    // ── 4. Assert the route reappeared within 10s ───────────────────────────
+    assert_route_exists(&guard2.base_url, "slip-test-app-0", Duration::from_secs(10)).await;
 }
