@@ -297,6 +297,9 @@ pub struct CaddyConfig {
     /// Optional TLS configuration for wildcard certificates (e.g., for preview deployments).
     #[serde(default)]
     pub tls: Option<CaddyTlsConfig>,
+    /// Reconcile loop configuration (`[caddy.reconcile]`).
+    #[serde(default)]
+    pub reconcile: ReconcileConfig,
 }
 
 /// TLS configuration for Caddy to obtain wildcard certificates via DNS challenge.
@@ -331,6 +334,35 @@ pub struct CaddyTlsConfig {
     pub staging: bool,
 }
 
+/// Caddy reconcile loop configuration (`[caddy.reconcile]`).
+///
+/// Controls the background safety-net loop that re-applies slip-owned Caddy
+/// state (slip HTTP server, app routes, deploy-webhook route, TLS policies)
+/// on a fixed interval. The loop self-heals routes after a Caddy restart,
+/// reload, or missed webhook. It is **not** the primary update path — deploys
+/// still push routes immediately via the webhook handler.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReconcileConfig {
+    /// Interval between reconcile ticks.
+    ///
+    /// Expressed as a duration string (e.g. "45s", "1m"). Defaults to "45s".
+    /// Must be at least 1s; smaller values are rejected at load time.
+    #[serde(default = "default_reconcile_interval", with = "duration_serde")]
+    pub interval: Duration,
+}
+
+fn default_reconcile_interval() -> Duration {
+    Duration::from_secs(45)
+}
+
+impl Default for ReconcileConfig {
+    fn default() -> Self {
+        Self {
+            interval: default_reconcile_interval(),
+        }
+    }
+}
+
 fn default_propagation_delay() -> String {
     "2m".to_owned()
 }
@@ -340,6 +372,7 @@ impl Default for CaddyConfig {
         Self {
             admin_api: default_caddy_admin_api(),
             tls: None,
+            reconcile: ReconcileConfig::default(),
         }
     }
 }
@@ -649,6 +682,14 @@ pub fn load_config(path: &Path) -> Result<(SlipConfig, HashMap<String, AppConfig
         source: e,
     })?;
 
+    // Validate reconcile interval — must be at least 1s to avoid hot-looping.
+    if slip_cfg.caddy.reconcile.interval < Duration::from_secs(1) {
+        return Err(ConfigError::Internal(format!(
+            "[caddy.reconcile] interval must be at least 1s — got {:?}",
+            slip_cfg.caddy.reconcile.interval
+        )));
+    }
+
     // Resolve env vars in auth.secret
     slip_cfg.auth.secret = resolve_env_vars(&slip_cfg.auth.secret)?;
 
@@ -883,6 +924,84 @@ secret = "s"
         assert_eq!(cfg.runtime.backend, "auto");
         // TLS config should be None by default
         assert!(cfg.caddy.tls.is_none());
+    }
+
+    // ── ReconcileConfig parsing ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_slip_toml_with_reconcile_section() {
+        let toml = r#"
+[server]
+
+[caddy]
+admin_api = "http://localhost:2019"
+
+[caddy.reconcile]
+interval = "30s"
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.caddy.reconcile.interval,
+            Duration::from_secs(30),
+            "explicit [caddy.reconcile] interval should parse"
+        );
+    }
+
+    #[test]
+    fn parse_slip_toml_reconcile_defaults() {
+        // No [caddy.reconcile] section — should fall back to 45s default.
+        let toml = r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.caddy.reconcile.interval,
+            Duration::from_secs(45),
+            "reconcile interval should default to 45s"
+        );
+    }
+
+    #[test]
+    fn parse_slip_toml_reconcile_rejects_subsecond() {
+        // Interval below 1s must be rejected at load time. We test the
+        // deserialization produces the small duration so the validator in
+        // load_config can catch it.
+        let toml = r#"
+[server]
+
+[caddy]
+
+[caddy.reconcile]
+interval = "500ms"
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        assert!(
+            cfg.caddy.reconcile.interval < Duration::from_secs(1),
+            "500ms should parse to a sub-second duration (rejected by load_config)"
+        );
     }
 
     // ── CaddyTlsConfig parsing ───────────────────────────────────────────────

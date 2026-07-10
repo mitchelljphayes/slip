@@ -72,5 +72,8 @@ getrandom = "0.2"
 # JSON diff/patch (RFC 6902) for `slip apply`
 json-patch = { version = "4", features = ["diff"] }
 
+# Retry with backoff (Caddy reconcile loop)
+backon = "1"
+
 # Shared crate
 slip-core = { path = "crates/slip-core" }

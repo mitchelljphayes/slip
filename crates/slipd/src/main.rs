@@ -1,15 +1,16 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use clap::Parser;
 use dashmap::DashMap;
 use slip_core::preview::preview_reaper;
+use slip_core::reconcile::reconcile_loop;
 use slip_core::runtime::RuntimeBackend;
 use slip_core::{
     AppState, CaddyClient, Db, DockerClient, HealthChecker, PodmanBackend, build_router,
-    load_app_states, load_config, load_preview_states, reconcile_preview_routes, reconcile_routes,
-    verify_containers,
+    load_app_states, load_config, load_preview_states, reconcile_preview_routes, verify_containers,
 };
 use tokio::sync::RwLock;
 
@@ -216,8 +217,28 @@ async fn main() -> anyhow::Result<()> {
     let raw_states = load_app_states(&state_dir).unwrap_or_default();
     let verified_states = verify_containers(runtime.as_ref(), raw_states).await;
 
-    if let Err(e) = reconcile_routes(&caddy, &verified_states, &apps).await {
-        tracing::warn!(error = %e, "caddy route reconciliation failed on startup (non-fatal)");
+    // Reconcile app routes on startup using the new collect-and-continue
+    // reconcile (per-route retry with backoff, structured app/route_id logging).
+    // The old `reconcile_routes()` fail-fast bug (HE #6) is fixed by routing
+    // through `reconcile_app_routes` instead.
+    {
+        let backoff = slip_core::reconcile::default_backoff();
+        let summary =
+            slip_core::reconcile::reconcile_app_routes(&caddy, &verified_states, &apps, &backoff)
+                .await;
+        if summary.routes_failed > 0 {
+            tracing::warn!(
+                ok = summary.routes_ok,
+                failed = summary.routes_failed,
+                total = summary.routes_total,
+                "caddy route reconciliation completed with partial failures on startup (non-fatal)"
+            );
+        } else {
+            tracing::info!(
+                routes = summary.routes_total,
+                "caddy routes reconciled on startup"
+            );
+        }
     }
 
     // ── Initialize SQLite deploy history ──────────────────────────────────────
@@ -296,6 +317,20 @@ async fn main() -> anyhow::Result<()> {
     // ── Spawn background tasks ────────────────────────────────────────────────
     tokio::spawn(preview_reaper(state.clone()));
 
+    // Caddy reconcile loop — self-heals routes, deploy-webhook, and TLS after
+    // a Caddy restart or missed webhook. Safety net, not the primary update
+    // path. Gated behind [caddy.reconcile] (default-on, harmless when no
+    // drift). Cancelled via oneshot alongside the HTTP server's graceful
+    // shutdown.
+    let (reconcile_shutdown_tx, reconcile_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let reconcile_interval = state.config.caddy.reconcile.interval;
+    let reconcile_handle = tokio::spawn(reconcile_loop(
+        state.clone(),
+        reconcile_shutdown_rx,
+        reconcile_interval,
+    ));
+    tracing::info!(interval = ?reconcile_interval, "caddy reconcile loop started");
+
     // ── Build router ─────────────────────────────────────────────────────────
     let router = build_router(state);
 
@@ -324,6 +359,8 @@ async fn main() -> anyhow::Result<()> {
             _ = ctrl_c => {},
             _ = terminate => {},
         }
+        // Signal the reconcile loop to shut down before we stop the server.
+        let _ = reconcile_shutdown_tx.send(());
         tracing::info!("shutdown signal received, stopping server");
     };
 
@@ -331,6 +368,14 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal)
         .await?;
+
+    // Wait for the reconcile loop to finish (bounded — it should exit promptly
+    // once the shutdown oneshot fires, but we cap at 10s to avoid hanging).
+    match tokio::time::timeout(Duration::from_secs(10), reconcile_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "reconcile loop task panicked"),
+        Err(_) => tracing::warn!("reconcile loop did not shut down within 10s, dropping"),
+    }
 
     tracing::info!("slipd stopped");
 

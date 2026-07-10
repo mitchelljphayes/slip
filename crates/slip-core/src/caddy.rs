@@ -112,6 +112,7 @@ pub struct RouteInfo {
 }
 
 /// Client for the Caddy admin API.
+#[derive(Clone)]
 pub struct CaddyClient {
     client: reqwest::Client,
     base_url: String,

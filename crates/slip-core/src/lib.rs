@@ -12,6 +12,7 @@ pub mod manifest;
 pub mod merge;
 pub mod podman;
 pub mod preview;
+pub mod reconcile;
 pub mod repo_config;
 pub mod runtime;
 pub mod secrets;
@@ -25,9 +26,9 @@ pub use api::{
 pub use caddy::{CaddyClient, ReverseProxy, RouteInfo};
 pub use config::{
     AppConfig, AppInfo, AppPreviewConfig, CaddyConfig, CaddyTlsConfig, DeployConfig, EnvFileConfig,
-    HealthConfig, NetworkConfig, RegistryConfig, ResourceConfig, RoutingConfig, RuntimeConfig,
-    ServerConfig, ServerPreviewConfig, SlipConfig, StorageConfig, VolumeConfig, load_config,
-    resolve_env_vars,
+    HealthConfig, NetworkConfig, ReconcileConfig, RegistryConfig, ResourceConfig, RoutingConfig,
+    RuntimeConfig, ServerConfig, ServerPreviewConfig, SlipConfig, StorageConfig, VolumeConfig,
+    load_config, resolve_env_vars,
 };
 pub use db::Db;
 pub use deploy::{
@@ -40,6 +41,10 @@ pub use manifest::{ManifestError, RenderContext, render_manifest};
 pub use merge::{MergedConfig, MergedVolume, merge_config};
 pub use podman::PodmanBackend;
 pub use preview::{PersistedPreviewState, PreviewState};
+pub use reconcile::{
+    ReconcileContext, ReconcileSummary, RouteFailure, default_backoff, reconcile_app_routes,
+    reconcile_loop, reconcile_tick, run_reconcile,
+};
 pub use repo_config::{
     PreviewConfig, RemoteConfig, RepoConfig, RepoDeployConfig, RepoVolume, parse_repo_config,
 };
