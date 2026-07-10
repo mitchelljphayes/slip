@@ -220,7 +220,8 @@ pub async fn reconcile_app_routes(
                         port: r.port,
                     })
                     .collect()
-            } else if let Some(port) = state.current_port {
+            } else {
+                let port = state.current_port?;
                 let Some(config) = app_configs.get(app_name) else {
                     tracing::warn!(
                         app = %app_name,
@@ -233,8 +234,6 @@ pub async fn reconcile_app_routes(
                     domain: config.routing.domain.clone().unwrap_or_default(),
                     port,
                 }]
-            } else {
-                return None;
             };
             Some(route_infos)
         })
