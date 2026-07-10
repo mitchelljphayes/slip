@@ -221,15 +221,12 @@ pub async fn reconcile_app_routes(
                     })
                     .collect()
             } else if let Some(port) = state.current_port {
-                let config = match app_configs.get(app_name) {
-                    Some(c) => c,
-                    None => {
-                        tracing::warn!(
-                            app = %app_name,
-                            "no config found for running app, skipping route reconciliation"
-                        );
-                        return None;
-                    }
+                let Some(config) = app_configs.get(app_name) else {
+                    tracing::warn!(
+                        app = %app_name,
+                        "no config found for running app, skipping route reconciliation"
+                    );
+                    return None;
                 };
                 vec![RouteInfo {
                     app_name: app_name.clone(),
