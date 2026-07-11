@@ -20,7 +20,7 @@ use crate::runtime::RuntimeBackend;
 ///
 /// We deliberately omit fields that are not meaningful across restarts
 /// (e.g. `previous_container_id`, `deploy_id`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PersistedAppState {
     pub current_tag: Option<String>,
     pub previous_tag: Option<String>,
@@ -39,6 +39,14 @@ pub struct PersistedAppState {
     /// App kind: "container", "pod", or "worker".
     #[serde(default)]
     pub kind: Option<String>,
+    /// The last `AppResponse` JSON applied via `slip apply`, used for config
+    /// drift detection in `slip status`.
+    ///
+    /// Stored as a JSON string (the wire format of `AppResponse`) so drift can
+    /// be computed by re-running `compute_diff` against the live server config.
+    /// `None` when no apply has been recorded yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_applied: Option<String>,
 }
 
 /// Persisted route state for a single route.
@@ -67,6 +75,7 @@ impl From<&AppRuntimeState> for PersistedAppState {
             current_pod_name: s.current_pod_name.clone(),
             current_manifest_path: s.current_manifest_path.clone(),
             kind: s.kind.clone(),
+            last_applied: s.last_applied.clone(),
         }
     }
 }
@@ -99,6 +108,7 @@ impl From<PersistedAppState> for AppRuntimeState {
             current_pod_name: p.current_pod_name,
             current_manifest_path: p.current_manifest_path,
             kind: p.kind,
+            last_applied: p.last_applied,
         }
     }
 }
@@ -120,6 +130,50 @@ pub fn save_app_state(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let path = state_dir.join(format!("{app_name}.json"));
+    std::fs::write(path, json)
+}
+
+/// Save the `last_applied` config for an app, merging into any existing state file.
+///
+/// This is called after `slip apply` (create or update) to record the exact
+/// `AppResponse` JSON that was applied, enabling config drift detection in
+/// `slip status`.
+///
+/// If the state file doesn't exist yet, a minimal one is created with only
+/// `last_applied` set. If it exists, the `last_applied` field is updated
+/// while preserving all other persisted fields.
+pub fn save_last_applied(
+    state_dir: &Path,
+    app_name: &str,
+    app_response: &crate::api::AppResponse,
+) -> Result<(), std::io::Error> {
+    std::fs::create_dir_all(state_dir)?;
+
+    let path = state_dir.join(format!("{app_name}.json"));
+    let last_applied_json = serde_json::to_string(app_response)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    // Try to load and merge with existing state, or create fresh.
+    let mut persisted: PersistedAppState = match std::fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => PersistedAppState {
+            current_tag: None,
+            previous_tag: None,
+            current_container_id: None,
+            current_port: None,
+            current_routes: Vec::new(),
+            deployed_at: None,
+            current_pod_name: None,
+            current_manifest_path: None,
+            kind: None,
+            last_applied: None,
+        },
+    };
+
+    persisted.last_applied = Some(last_applied_json);
+
+    let json = serde_json::to_string_pretty(&persisted)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(path, json)
 }
 
@@ -544,6 +598,7 @@ mod tests {
             current_pod_name: None,
             current_manifest_path: None,
             kind: Some("container".to_string()),
+            last_applied: None,
         }
     }
 
@@ -661,6 +716,82 @@ mod tests {
         assert!(restored.current_tag.is_none());
         assert!(restored.current_container_id.is_none());
         assert!(restored.current_port.is_none());
+    }
+
+    // ── save_last_applied tests ──────────────────────────────────────────────
+
+    fn sample_app_response() -> crate::api::AppResponse {
+        use std::collections::HashMap as HM;
+        crate::api::AppResponse {
+            name: "myapp".to_string(),
+            image: "ghcr.io/org/myapp".to_string(),
+            domain: "myapp.example.com".to_string(),
+            port: 8080,
+            secret: None,
+            env: HM::new(),
+            resources: crate::config::ResourceConfig::default(),
+            network: crate::config::NetworkConfig::default(),
+            health: crate::config::HealthConfig::default(),
+            deploy: crate::config::DeployConfig::default(),
+            preview: None,
+            volumes: Vec::new(),
+            routes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_save_last_applied_creates_file() {
+        let dir = TempDir::new().unwrap();
+        let state_dir = dir.path();
+        let resp = sample_app_response();
+
+        save_last_applied(state_dir, "myapp", &resp).expect("save should succeed");
+
+        // File should exist.
+        assert!(
+            state_dir.join("myapp.json").exists(),
+            "state file should be created"
+        );
+
+        // Load and verify last_applied is set.
+        let loaded = load_app_states(state_dir).expect("load should succeed");
+        let restored = &loaded["myapp"];
+        assert!(
+            restored.last_applied.is_some(),
+            "last_applied should be set"
+        );
+        let last_applied_json = restored.last_applied.as_ref().unwrap();
+        assert!(
+            last_applied_json.contains("myapp.example.com"),
+            "last_applied JSON should contain the domain"
+        );
+    }
+
+    #[test]
+    fn test_save_last_applied_preserves_existing_state() {
+        let dir = TempDir::new().unwrap();
+        let state_dir = dir.path();
+
+        // First, save a runtime state.
+        let state = sample_state();
+        save_app_state(state_dir, "myapp", &state).expect("save should succeed");
+
+        // Then, save last_applied (should merge, not overwrite).
+        let resp = sample_app_response();
+        save_last_applied(state_dir, "myapp", &resp).expect("save_last_applied should succeed");
+
+        // Load and verify both runtime state and last_applied are present.
+        let loaded = load_app_states(state_dir).expect("load should succeed");
+        let restored = &loaded["myapp"];
+
+        // Runtime state should be preserved.
+        assert_eq!(restored.current_tag, Some("v1.2.3".to_string()));
+        assert_eq!(
+            restored.current_container_id,
+            Some("abc123def456".to_string())
+        );
+        // last_applied should also be set.
+        assert!(restored.last_applied.is_some());
     }
 
     // ── Reconcile routes tests ──────────────────────────────────────────────────

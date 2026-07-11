@@ -5,6 +5,8 @@
 
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::ResourceConfig;
 use crate::error::RuntimeError;
 use crate::merge::MergedVolume;
@@ -176,6 +178,22 @@ pub trait RuntimeBackend: Send + Sync {
         })
     }
 
+    /// List containers matching a given label key=value pair.
+    ///
+    /// Used by `slip status` to find all containers belonging to a slip app
+    /// via the `slip.app` label, rather than name substring matching (which
+    /// breaks on truncated tag prefixes — FR §3.11).
+    ///
+    /// Returns containers in any state (running, exited, etc.) so the status
+    /// command can report stale containers.
+    fn list_by_label<'a>(
+        &'a self,
+        label_key: &'a str,
+        label_value: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<ContainerInfo>, RuntimeError>> + Send + 'a>,
+    >;
+
     /// Return the runtime name ("docker" or "podman").
     fn name(&self) -> &str;
 }
@@ -201,4 +219,21 @@ impl std::fmt::Debug for RegistryCredentials {
 pub struct PodInfo {
     pub name: String,
     pub containers: Vec<String>,
+}
+
+/// Lightweight info about a running container, returned by [`RuntimeBackend::list_by_label`].
+///
+/// Used by `slip status` to discover containers by their `slip.app` label
+/// rather than name substrings (which are truncated in the container name —
+/// see FR §3.11).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerInfo {
+    /// Container ID (short form, 12 chars).
+    pub id: String,
+    /// Container name (first name, if any).
+    pub name: Option<String>,
+    /// Docker/Podman state string: "running", "exited", "created", etc.
+    pub state: String,
+    /// The `slip.tag` label value, if present.
+    pub tag: Option<String>,
 }

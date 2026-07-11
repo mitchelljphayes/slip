@@ -1355,10 +1355,396 @@ fn resolve_token(cli_token: Option<String>) -> String {
 
 // ─── Link command implementation ───────────────────────────────────────────────
 
-/// Response from `GET /v1/status`.
+/// Response from `GET /v1/status` (minimal version used by `slip link`).
+///
+/// This is NOT the full `slip_core::StatusResponse` — `slip link` only needs
+/// the daemon version to confirm connectivity. The full status response is
+/// deserialized separately in the `slip status` command.
 #[derive(Debug, Deserialize)]
-struct StatusResponse {
+struct LinkStatusResponse {
     version: String,
+}
+
+// ─── Status command implementation ────────────────────────────────────────────
+
+/// Full daemon status response from `GET /v1/status`.
+///
+/// Mirrors `slip_core::StatusResponse` but we deserialize locally to keep the
+/// CLI decoupled from internal crate types (only the wire schema matters).
+#[derive(Debug, Serialize, Deserialize)]
+struct DaemonStatusResponse {
+    schema: String,
+    daemon: String,
+    version: String,
+    uptime_seconds: i64,
+    caddy: String,
+    runtime: String,
+    runtime_backend: Option<String>,
+    app_count: usize,
+    #[serde(default)]
+    last_deploys: Vec<DeploySummaryJson>,
+    #[serde(default)]
+    apps: std::collections::HashMap<String, AppStatusJson>,
+}
+
+/// Per-app status in the daemon status response.
+#[derive(Debug, Serialize, Deserialize)]
+struct AppStatusJson {
+    status: String,
+    tag: Option<String>,
+    #[serde(default)]
+    deployed_at: Option<String>,
+    #[serde(default)]
+    container_id: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    deploy_id: Option<String>,
+    #[serde(default)]
+    triggered_by: Option<String>,
+}
+
+/// Deploy summary in the status response.
+#[derive(Debug, Serialize, Deserialize)]
+struct DeploySummaryJson {
+    deploy_id: String,
+    app: String,
+    tag: String,
+    status: String,
+    triggered_by: String,
+}
+
+/// Detailed per-app status response from `GET /v1/apps/{name}/status`.
+#[derive(Debug, Serialize, Deserialize)]
+struct DetailedAppStatus {
+    status: String,
+    tag: Option<String>,
+    #[serde(default)]
+    deployed_at: Option<String>,
+    #[serde(default)]
+    container_id: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    deploy_id: Option<String>,
+    #[serde(default)]
+    triggered_by: Option<String>,
+    #[serde(default)]
+    container_state: Option<String>,
+    #[serde(default)]
+    health: Option<HealthStatusJson>,
+    #[serde(default)]
+    last_deploy: Option<DeploySummaryJson>,
+    #[serde(default)]
+    routes: Vec<RouteStatusJson>,
+    #[serde(default)]
+    secrets: Vec<String>,
+    #[serde(default)]
+    cert: Option<CertStatusJson>,
+    #[serde(default)]
+    config_drift: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HealthStatusJson {
+    #[serde(default)]
+    path: Option<String>,
+    retries: u32,
+    status: String,
+    #[serde(default)]
+    last_check: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RouteStatusJson {
+    hostname: String,
+    port: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CertStatusJson {
+    issuer: String,
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+/// `slip status [app]` — show daemon or per-app status.
+///
+/// - With an app name: calls `GET /v1/apps/{name}/status` and renders a
+///   detailed report (tag, container state, health, deploy, routes, cert,
+///   secrets, drift).
+/// - Without an app name: calls `GET /v1/status` and renders a compact table
+///   of all apps.
+async fn status_command(
+    server: &str,
+    token: &str,
+    app: Option<&str>,
+    json: bool,
+) -> Result<(), anyhow::Error> {
+    let client = create_client();
+
+    if let Some(app_name) = app {
+        // ── Per-app detailed status ─────────────────────────────────────────
+        let url = format!("{server}/v1/apps/{app_name}/status");
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await;
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                if e.is_connect() || e.is_timeout() {
+                    output::fail(
+                        output::GENERIC,
+                        &format!("can't reach slipd at {server} — is it running?"),
+                        "",
+                    );
+                }
+                anyhow::bail!("HTTP request failed: {e}");
+            }
+        };
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            output::fail(
+                output::AUTH,
+                "auth failed",
+                "check your admin token (--token or SLIP_TOKEN)",
+            );
+        }
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            output::fail(
+                output::NOT_FOUND,
+                &format!("app '{app_name}' not found"),
+                "run `slip apply` to register it",
+            );
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("API error ({}): {}", status, text);
+        }
+
+        let detail: DetailedAppStatus = resp
+            .json()
+            .await
+            .context("failed to parse app status response")?;
+
+        if json {
+            // Output the raw JSON (re-serialize for stable formatting).
+            let val = serde_json::to_value(&detail).unwrap_or(serde_json::Value::Null);
+            println!("{val}");
+        } else {
+            print_detailed_status(app_name, &detail);
+        }
+    } else {
+        // ── Daemon-level status (all apps) ──────────────────────────────────
+        let url = format!("{server}/v1/status");
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await;
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                if e.is_connect() || e.is_timeout() {
+                    output::fail(
+                        output::GENERIC,
+                        &format!("can't reach slipd at {server} — is it running?"),
+                        "",
+                    );
+                }
+                anyhow::bail!("HTTP request failed: {e}");
+            }
+        };
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            output::fail(
+                output::AUTH,
+                "auth failed",
+                "check your admin token (--token or SLIP_TOKEN)",
+            );
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("API error ({}): {}", status, text);
+        }
+
+        let status_data: DaemonStatusResponse = resp
+            .json()
+            .await
+            .context("failed to parse status response")?;
+
+        if json {
+            let val = serde_json::to_value(&status_data).unwrap_or(serde_json::Value::Null);
+            println!("{val}");
+        } else {
+            print_daemon_status(&status_data);
+        }
+    }
+
+    Ok(())
+}
+
+/// Print a compact daemon status overview with a table of all apps.
+fn print_daemon_status(status: &DaemonStatusResponse) {
+    println!(
+        "slipd {} (uptime: {}s)",
+        status.version, status.uptime_seconds
+    );
+    println!(
+        "  caddy: {}  runtime: {}{}  apps: {}",
+        status.caddy,
+        status.runtime,
+        status
+            .runtime_backend
+            .as_ref()
+            .map(|b| format!(" ({b})"))
+            .unwrap_or_default(),
+        status.app_count,
+    );
+
+    if status.apps.is_empty() {
+        println!("\n  no apps registered");
+        return;
+    }
+
+    // Sort apps by name for stable output.
+    let mut app_names: Vec<&String> = status.apps.keys().collect();
+    app_names.sort();
+
+    println!();
+    println!(
+        "  {:<20} {:<14} {:<16} {:<8} {:<8}",
+        "APP", "STATUS", "TAG", "PORT", "KIND"
+    );
+    println!(
+        "  {:-<20} {:-<14} {:-<16} {:-<8} {:-<8}",
+        "", "", "", "", ""
+    );
+
+    for name in app_names {
+        let app = &status.apps[name];
+        println!(
+            "  {:<20} {:<14} {:<16} {:<8} {:<8}",
+            name,
+            app.status,
+            app.tag.as_deref().unwrap_or("-"),
+            app.port
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            app.kind.as_deref().unwrap_or("-"),
+        );
+    }
+
+    if !status.last_deploys.is_empty() {
+        println!("\n  Last deploys:");
+        for dep in &status.last_deploys {
+            println!(
+                "    {} {} {} ({})",
+                dep.deploy_id, dep.app, dep.tag, dep.status
+            );
+        }
+    }
+}
+
+/// Print a detailed per-app status report.
+fn print_detailed_status(app_name: &str, detail: &DetailedAppStatus) {
+    println!("app: {app_name}");
+    println!("  status:       {}", detail.status);
+    println!("  tag:          {}", detail.tag.as_deref().unwrap_or("-"));
+    if let Some(ref cid) = detail.container_id {
+        println!("  container:    {cid}");
+    }
+    if let Some(ref state) = detail.container_state {
+        println!("  container state: {state}");
+    }
+    if let Some(port) = detail.port {
+        println!("  port:         {port}");
+    }
+    if let Some(ref kind) = detail.kind {
+        println!("  kind:         {kind}");
+    }
+    if let Some(ref at) = detail.deployed_at {
+        println!("  deployed at:  {at}");
+    }
+
+    // Deploy metadata
+    if let Some(ref dep) = detail.last_deploy {
+        println!();
+        println!("  last deploy:");
+        println!("    id:          {}", dep.deploy_id);
+        println!("    tag:         {}", dep.tag);
+        println!("    status:      {}", dep.status);
+        println!("    triggered:   {}", dep.triggered_by);
+    }
+
+    // Health
+    if let Some(ref h) = detail.health {
+        println!();
+        println!("  health:");
+        println!("    status:      {}", h.status);
+        if let Some(ref path) = h.path {
+            println!("    path:        {path}");
+        }
+        println!("    retries:     {}", h.retries);
+        if let Some(ref lc) = h.last_check {
+            println!("    last check:  {lc}");
+        }
+    }
+
+    // Routes
+    if !detail.routes.is_empty() {
+        println!();
+        println!("  routes:");
+        for r in &detail.routes {
+            println!("    {} → :{}", r.hostname, r.port);
+        }
+    }
+
+    // Cert
+    if let Some(ref cert) = detail.cert {
+        println!();
+        println!("  cert:");
+        println!("    issuer:      {}", cert.issuer);
+        if let Some(ref exp) = cert.expires_at {
+            println!("    expires:     {exp}");
+        }
+    }
+
+    // Secrets (key names only)
+    if !detail.secrets.is_empty() {
+        println!();
+        println!("  secrets (keys only):");
+        for key in &detail.secrets {
+            println!("    {key}");
+        }
+    }
+
+    // Config drift
+    if let Some(drift) = detail.config_drift {
+        println!();
+        if drift {
+            println!("  config drift: YES — server config differs from last `slip apply`");
+        } else {
+            println!("  config drift: none — up to date");
+        }
+    }
 }
 
 async fn link_command(
@@ -1405,7 +1791,7 @@ async fn link_command(
         anyhow::bail!("API error ({}): {}", status, text);
     }
 
-    let status_data: StatusResponse = resp
+    let status_data: LinkStatusResponse = resp
         .json()
         .await
         .context("failed to parse status response")?;
@@ -2013,17 +2399,14 @@ async fn main() -> anyhow::Result<()> {
             apply_command(&server, &token, &app, dry_run, no_redact, cli.json).await?;
         }
         Commands::Status { app } => {
-            let target = match app {
-                Some(a) => a,
-                None => {
-                    // Try [remote].app as a fallback
-                    resolve_remote()
-                        .filter(|r| !r.app.is_empty())
-                        .map(|r| r.app)
-                        .unwrap_or_else(|| "all apps".to_string())
-                }
-            };
-            output::not_implemented(&format!("status {target}"), cli.json);
+            let token = resolve_token(cli.token);
+            let app = app.or_else(|| {
+                // Try [remote].app as a fallback
+                resolve_remote()
+                    .filter(|r| !r.app.is_empty())
+                    .map(|r| r.app)
+            });
+            status_command(&server, &token, app.as_deref(), cli.json).await?;
         }
         Commands::Logs { app, since } => {
             let since_str = since.as_deref().unwrap_or("now");

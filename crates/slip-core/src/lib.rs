@@ -21,7 +21,8 @@ pub mod validate;
 
 // Re-exports for convenience
 pub use api::{
-    AppResponse, AppState, DeployRequest, DeployResponse, PreviewRequestInfo, build_router,
+    AppResponse, AppState, DeployRequest, DeployResponse, DeploySummary, PreviewRequestInfo,
+    StatusResponse, build_router,
 };
 pub use caddy::{CaddyClient, ReverseProxy, RouteInfo};
 pub use config::{
@@ -48,12 +49,12 @@ pub use reconcile::{
 pub use repo_config::{
     PreviewConfig, RemoteConfig, RepoConfig, RepoDeployConfig, RepoVolume, parse_repo_config,
 };
-pub use runtime::{PodInfo, RegistryCredentials, RuntimeBackend};
+pub use runtime::{ContainerInfo, PodInfo, RegistryCredentials, RuntimeBackend};
 pub use secrets::SecretsStore;
 pub use state::{
     PersistedAppState, delete_preview_state, load_app_states, load_preview_states,
-    reconcile_preview_routes, reconcile_routes, save_app_state, save_preview_state,
-    verify_containers,
+    reconcile_preview_routes, reconcile_routes, save_app_state, save_last_applied,
+    save_preview_state, verify_containers,
 };
 pub use validate::{
     ValidationError, ValidationResult, parse_and_validate, validate_image_refs,

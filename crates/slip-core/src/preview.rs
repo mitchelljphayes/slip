@@ -1735,9 +1735,22 @@ mod tests {
             };
             Box::pin(async move { result })
         }
-    }
 
-    // ── Mock: ReverseProxy ────────────────────────────────────────────────────
+        fn list_by_label<'a>(
+            &'a self,
+            _label_key: &'a str,
+            _label_value: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Vec<crate::runtime::ContainerInfo>, RuntimeError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+    }
 
     struct MockCaddy {
         ok: bool,
