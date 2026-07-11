@@ -467,14 +467,37 @@ fn init_scaffolded_slip_toml_passes_validate() {
 }
 
 #[test]
-fn logs_stub_exits_nonzero() {
+fn logs_command_rejects_invalid_since() {
     let mut cmd = Command::cargo_bin("slip").unwrap();
-    let assert = cmd.args(["logs", "myapp"]).assert();
+    let assert = cmd.args(["logs", "myapp", "--since", "abc"]).assert();
+
+    // Invalid --since exits with USAGE (2), stderr mentions "invalid --since".
+    assert
+        .failure()
+        .code(output::USAGE)
+        .stderr(predicate::str::contains("invalid --since"));
+}
+
+#[test]
+fn logs_follow_flag_accepted() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    // --follow should NOT exit with "not yet implemented" (the stub is gone).
+    // It will fail with a connection error (no server), but that's not a stub.
+    let assert = cmd.args(["logs", "myapp", "--follow"]).assert();
 
     assert
         .failure()
-        .code(output::GENERIC)
-        .stderr(predicate::str::contains("not yet implemented"));
+        .stderr(predicate::str::contains("not yet implemented").not());
+}
+
+#[test]
+fn logs_short_follow_flag_accepted() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd.args(["logs", "myapp", "-f"]).assert();
+
+    assert
+        .failure()
+        .stderr(predicate::str::contains("not yet implemented").not());
 }
 
 #[test]

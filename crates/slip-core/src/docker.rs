@@ -6,8 +6,8 @@ use std::pin::Pin;
 use bollard::Docker;
 use bollard::auth::DockerCredentials;
 use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
-    StartContainerOptions, StopContainerOptions,
+    Config, CreateContainerOptions, ListContainersOptions, LogOutput, LogsOptions,
+    RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
@@ -21,7 +21,9 @@ use tracing::{debug, info, warn};
 
 use crate::config::ResourceConfig;
 use crate::error::{DockerError, RuntimeError};
-use crate::runtime::{ContainerInfo, RegistryCredentials, RuntimeBackend};
+use crate::runtime::{
+    ContainerInfo, LogStream, LogStreamItem, RegistryCredentials, RuntimeBackend,
+};
 
 /// A thin wrapper around [`bollard::Docker`] providing higher-level container
 /// lifecycle operations used by the slip deploy daemon.
@@ -763,9 +765,79 @@ impl RuntimeBackend for DockerClient {
                 .map_err(RuntimeError::from)
         })
     }
+
+    fn container_logs<'a>(
+        &'a self,
+        container_id: &'a str,
+        since: Option<i64>,
+        follow: bool,
+    ) -> Pin<Box<dyn futures_util::Stream<Item = Result<LogStreamItem, RuntimeError>> + Send + 'a>>
+    {
+        let options = LogsOptions::<String> {
+            stdout: true,
+            stderr: true,
+            follow,
+            timestamps: true,
+            tail: "200".to_string(),
+            since: since.unwrap_or(0),
+            ..Default::default()
+        };
+
+        let stream = self
+            .docker
+            .logs(container_id, Some(options))
+            .map(move |item| {
+                let log = item.map_err(|e| RuntimeError::ContainerError(e.to_string()))?;
+                let (stream_kind, message) = match log {
+                    LogOutput::StdOut { message } => (LogStream::StdOut, message),
+                    LogOutput::StdErr { message } => (LogStream::StdErr, message),
+                    LogOutput::Console { message } => (LogStream::Console, message),
+                    // Docker never sends StdIn for `logs()`; ignore defensively.
+                    LogOutput::StdIn { message } => (LogStream::Console, message),
+                };
+                let (ts, line) = parse_timestamped(&message);
+                Ok(LogStreamItem {
+                    ts,
+                    stream: stream_kind,
+                    line,
+                })
+            });
+
+        Box::pin(stream)
+    }
 }
 
 // ─── Helper functions ─────────────────────────────────────────────────────────
+
+/// Split a `timestamps(true)` log line into `(parsed_timestamp, rest_of_line)`.
+///
+/// bollard prefixes each log line with an RFC 3339 timestamp followed by a
+/// single space, e.g. `"2026-07-11T15:30:00.123456789Z hello world\n"`. This
+/// helper splits on the first space; if no space is found (no timestamp
+/// prefix), returns `(None, full_line)`.
+///
+/// This is shared by the Docker and Podman `container_logs` implementations
+/// since both use the bollard Docker-compatible API with `timestamps(true)`.
+pub(crate) fn parse_timestamped(raw: &[u8]) -> (Option<chrono::DateTime<chrono::Utc>>, String) {
+    let text = String::from_utf8_lossy(raw);
+    // Trim only the trailing newline for a clean log line; the timestamp is
+    // at the start and separated by a single space.
+    let trimmed = text.trim_end_matches(['\n', '\r']);
+    match trimmed.split_once(' ') {
+        Some((ts_str, rest)) => {
+            let ts = chrono::DateTime::parse_from_rfc3339(ts_str)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc));
+            if ts.is_some() {
+                (ts, rest.to_string())
+            } else {
+                // Timestamp prefix unparseable — return the whole line, no ts.
+                (None, trimmed.to_string())
+            }
+        }
+        None => (None, trimmed.to_string()),
+    }
+}
 
 /// Parse a human-readable memory limit string (e.g. `"512m"`, `"1g"`, `"256k"`)
 /// into a byte count suitable for Docker's `HostConfig.memory` field.
@@ -930,5 +1002,69 @@ mod tests {
     #[test]
     fn cpu_empty_string() {
         assert_eq!(parse_cpu_limit(&opt("")), None);
+    }
+
+    // ── parse_timestamped ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_timestamped_with_rfc3339_prefix() {
+        let raw = b"2026-07-11T15:30:00.123456789Z hello world\n";
+        let (ts, line) = parse_timestamped(raw);
+        assert!(ts.is_some(), "timestamp should parse");
+        assert_eq!(line, "hello world");
+        let ts = ts.unwrap();
+        assert_eq!(ts.timestamp(), 1_783_783_800);
+    }
+
+    #[test]
+    fn parse_timestamped_no_newline() {
+        let raw = b"2026-07-11T15:30:00Z hello world";
+        let (ts, line) = parse_timestamped(raw);
+        assert!(ts.is_some());
+        assert_eq!(line, "hello world");
+    }
+
+    #[test]
+    fn parse_timestamped_multiline_log() {
+        // Multi-line stack traces arrive as a single LogOutput message with
+        // embedded newlines after the timestamp prefix.
+        let raw = b"2026-07-11T15:30:00Z Error: something failed\n  at foo() line 42\n";
+        let (ts, line) = parse_timestamped(raw);
+        assert!(ts.is_some());
+        assert_eq!(line, "Error: something failed\n  at foo() line 42");
+    }
+
+    #[test]
+    fn parse_timestamped_no_timestamp_returns_full_line() {
+        // When timestamps(true) somehow isn't set, there's no space prefix.
+        let raw = b"just a log line\n";
+        let (ts, line) = parse_timestamped(raw);
+        assert!(ts.is_none(), "no timestamp prefix -> None");
+        assert_eq!(line, "just a log line");
+    }
+
+    #[test]
+    fn parse_timestamped_invalid_timestamp_returns_full_line() {
+        // Garbage where the timestamp should be — keep the whole line.
+        let raw = b"garbage hello world\n";
+        let (ts, line) = parse_timestamped(raw);
+        assert!(ts.is_none());
+        assert_eq!(line, "garbage hello world");
+    }
+
+    #[test]
+    fn parse_timestamped_empty_message() {
+        let raw = b"";
+        let (ts, line) = parse_timestamped(raw);
+        assert!(ts.is_none());
+        assert_eq!(line, "");
+    }
+
+    #[test]
+    fn parse_timestamped_only_timestamp() {
+        let raw = b"2026-07-11T15:30:00Z\n";
+        let (ts, line) = parse_timestamped(raw);
+        assert!(ts.is_none(), "no space separator -> no timestamp");
+        assert_eq!(line, "2026-07-11T15:30:00Z");
     }
 }

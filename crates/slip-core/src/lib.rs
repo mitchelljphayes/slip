@@ -49,7 +49,9 @@ pub use reconcile::{
 pub use repo_config::{
     PreviewConfig, RemoteConfig, RepoConfig, RepoDeployConfig, RepoVolume, parse_repo_config,
 };
-pub use runtime::{ContainerInfo, PodInfo, RegistryCredentials, RuntimeBackend};
+pub use runtime::{
+    ContainerInfo, LogStream, LogStreamItem, PodInfo, RegistryCredentials, RuntimeBackend,
+};
 pub use secrets::SecretsStore;
 pub use state::{
     PersistedAppState, delete_preview_state, load_app_states, load_preview_states,

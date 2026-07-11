@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+use std::io::IsTerminal;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
+use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncBufReadExt;
 
 #[allow(dead_code)]
 mod output;
@@ -111,9 +114,12 @@ enum Commands {
     Logs {
         /// App name.
         app: String,
-        /// Show logs since duration (e.g., "1h").
+        /// Show logs since duration (e.g., "1h", "5m30s").
         #[arg(long)]
         since: Option<String>,
+        /// Follow log output (stream new lines as they arrive).
+        #[arg(long, short = 'f')]
+        follow: bool,
     },
     /// Roll back to the previous version.
     Rollback {
@@ -415,6 +421,24 @@ struct SetDeployKeyResponse {
     message: Option<String>,
 }
 
+/// One NDJSON line from the logs endpoint (text-mode parsing).
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LogLine {
+    ts: Option<String>,
+    container: String,
+    stream: String,
+    line: String,
+}
+
+/// In-stream error event from the logs endpoint.
+#[derive(Debug, Deserialize)]
+struct LogErrorLine {
+    error: String,
+    #[serde(default)]
+    container: Option<String>,
+}
+
 // ─── HTTP client helpers ──────────────────────────────────────────────────────
 
 fn create_client() -> reqwest::Client {
@@ -423,6 +447,15 @@ fn create_client() -> reqwest::Client {
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()
         .expect("failed to create HTTP client")
+}
+
+/// Create a reqwest client with no timeout — for streaming endpoints (logs --follow)
+/// that need to stay open indefinitely.
+fn create_streaming_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("failed to create streaming HTTP client")
 }
 
 async fn api_request(
@@ -1663,6 +1696,148 @@ fn print_daemon_status(status: &DaemonStatusResponse) {
     }
 }
 
+// ─── Logs command implementation ──────────────────────────────────────────────
+
+/// ANSI color codes for blue/green container prefixes.
+const COLOR_BLUE: &str = "\x1b[34m";
+const COLOR_GREEN: &str = "\x1b[32m";
+const COLOR_RESET: &str = "\x1b[0m";
+
+/// Stream container logs from `GET /v1/apps/{app}/logs`.
+///
+/// In `--json` mode, prints each NDJSON line as-is. In text mode, parses each
+/// NDJSON line and prints with a colored `[container_short]` prefix (blue/green).
+async fn logs_command(
+    server: &str,
+    token: &str,
+    app: &str,
+    since: Option<&str>,
+    follow: bool,
+    json: bool,
+) -> Result<(), anyhow::Error> {
+    let client = create_streaming_client();
+    let url = format!("{server}/v1/apps/{app}/logs");
+
+    // Build query params using reqwest's built-in encoding.
+    let mut query: Vec<(&str, String)> =
+        vec![("follow", follow.to_string()), ("json", json.to_string())];
+    if let Some(s) = since {
+        query.push(("since", s.to_string()));
+    }
+
+    let resp = match client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .query(&query)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            if e.is_connect() || e.is_timeout() {
+                output::fail(
+                    output::GENERIC,
+                    &format!("can't reach slipd at {server} — is it running?"),
+                    "",
+                );
+            }
+            anyhow::bail!("HTTP request failed: {e}");
+        }
+    };
+
+    // Pre-stream error handling.
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        output::fail(
+            output::AUTH,
+            "auth failed",
+            "check your admin token (--token or SLIP_TOKEN)",
+        );
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        output::fail(
+            output::NOT_FOUND,
+            &format!("app '{app}' not found or no running containers"),
+            "run `slip apply` to register it, then `slip deploy` to start a container",
+        );
+    }
+    if status == reqwest::StatusCode::BAD_REQUEST {
+        let text = resp.text().await.unwrap_or_default();
+        // Extract the error message from the JSON response.
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+            .unwrap_or(text);
+        output::fail(output::USAGE, &msg, "use formats like 1h, 5m, 30s, 5m30s");
+    }
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("API error ({status}): {text}");
+    }
+
+    // Consume the NDJSON stream line by line.
+    let is_tty = std::io::stdout().is_terminal();
+
+    let byte_stream = resp
+        .bytes_stream()
+        .map_err(|e| std::io::Error::other(e.to_string()));
+    let stream_reader = tokio_util::io::StreamReader::new(byte_stream);
+    let mut reader = tokio::io::BufReader::new(stream_reader);
+    let mut line_buf = String::new();
+
+    loop {
+        line_buf.clear();
+        let n = reader.read_line(&mut line_buf).await?;
+        if n == 0 {
+            break; // stream ended
+        }
+
+        let line_str = line_buf.trim_end_matches(['\n', '\r']);
+        if line_str.is_empty() {
+            continue;
+        }
+
+        if json {
+            // In --json mode, print the NDJSON line as-is.
+            println!("{line_str}");
+            // Check for error lines and print to stderr.
+            if let Ok(err) = serde_json::from_str::<LogErrorLine>(line_str) {
+                eprintln!(
+                    "error: {} (container: {})",
+                    err.error,
+                    err.container.unwrap_or_else(|| "?".to_string())
+                );
+            }
+        } else {
+            // Text mode: parse the NDJSON line and format with color prefix.
+            match serde_json::from_str::<LogLine>(line_str) {
+                Ok(log) => {
+                    let container_short = log.container.split('/').next().unwrap_or(&log.container);
+                    let color = if log.container.starts_with("blue") {
+                        COLOR_BLUE
+                    } else {
+                        COLOR_GREEN
+                    };
+                    if is_tty {
+                        println!("{color}[{container_short}]{COLOR_RESET} {}", log.line);
+                    } else {
+                        println!("[{container_short}] {}", log.line);
+                    }
+                }
+                Err(_) => {
+                    // Might be an error/info event — try parsing as LogErrorLine.
+                    if let Ok(err) = serde_json::from_str::<LogErrorLine>(line_str) {
+                        eprintln!("error: {}", err.error);
+                    }
+                    // Otherwise skip unparseable lines.
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Print a detailed per-app status report.
 fn print_detailed_status(app_name: &str, detail: &DetailedAppStatus) {
     println!("app: {app_name}");
@@ -2408,9 +2583,19 @@ async fn main() -> anyhow::Result<()> {
             });
             status_command(&server, &token, app.as_deref(), cli.json).await?;
         }
-        Commands::Logs { app, since } => {
-            let since_str = since.as_deref().unwrap_or("now");
-            output::not_implemented(&format!("logs {app} --since {since_str}"), cli.json);
+        Commands::Logs { app, since, follow } => {
+            // Validate --since before requiring the token — fails fast on bad input.
+            if let Some(ref s) = since
+                && parse_duration(s).is_err()
+            {
+                output::fail(
+                    output::USAGE,
+                    &format!("invalid --since '{s}'"),
+                    "use formats like 1h, 5m, 30s, 5m30s",
+                );
+            }
+            let token = resolve_token(cli.token);
+            logs_command(&server, &token, &app, since.as_deref(), follow, cli.json).await?;
         }
         Commands::Server(command) => match command {
             ServerCommands::Init {
