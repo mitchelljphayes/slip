@@ -31,6 +31,7 @@ rusqlite_migration = { workspace = true }
 getrandom = { workspace = true }
 json-patch = { workspace = true }
 backon = { workspace = true }
+tokio-stream = "0.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

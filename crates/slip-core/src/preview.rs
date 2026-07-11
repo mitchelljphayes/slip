@@ -1750,6 +1750,22 @@ mod tests {
         > {
             Box::pin(async move { Ok(Vec::new()) })
         }
+
+        fn container_logs<'a>(
+            &'a self,
+            _container_id: &'a str,
+            _since: Option<i64>,
+            _follow: bool,
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures_util::Stream<Item = Result<crate::runtime::LogStreamItem, RuntimeError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            // Preview tests don't exercise log streaming; return an empty stream.
+            Box::pin(futures_util::stream::empty())
+        }
     }
 
     struct MockCaddy {

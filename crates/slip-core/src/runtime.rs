@@ -194,6 +194,27 @@ pub trait RuntimeBackend: Send + Sync {
         Box<dyn std::future::Future<Output = Result<Vec<ContainerInfo>, RuntimeError>> + Send + 'a>,
     >;
 
+    /// Stream container logs as an async [`Stream`] of [`LogStreamItem`]s.
+    ///
+    /// When `follow` is true the stream stays open and yields new lines as
+    /// they arrive; when false it yields existing logs then ends.
+    ///
+    /// `since` is an optional Unix-epoch seconds cutoff; `None` means no
+    /// since-filter (return all available logs). The caller (the API handler)
+    /// converts a duration string into a Unix timestamp before calling.
+    ///
+    /// The implementation MUST set `timestamps(true)` on the underlying
+    /// runtime call so each line is prefixed with an RFC 3339 timestamp,
+    /// which is parsed into `LogStreamItem::ts`.
+    fn container_logs<'a>(
+        &'a self,
+        container_id: &'a str,
+        since: Option<i64>,
+        follow: bool,
+    ) -> std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<LogStreamItem, RuntimeError>> + Send + 'a>,
+    >;
+
     /// Return the runtime name ("docker" or "podman").
     fn name(&self) -> &str;
 }
@@ -236,4 +257,38 @@ pub struct ContainerInfo {
     pub state: String,
     /// The `slip.tag` label value, if present.
     pub tag: Option<String>,
+}
+
+/// Which stream a log line came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogStream {
+    StdOut,
+    StdErr,
+    Console,
+}
+
+impl LogStream {
+    /// Lowercase wire name used in NDJSON output ("stdout", "stderr", "console").
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LogStream::StdOut => "stdout",
+            LogStream::StdErr => "stderr",
+            LogStream::Console => "console",
+        }
+    }
+}
+
+/// A single log line streamed from a container via [`RuntimeBackend::container_logs`].
+///
+/// When `timestamps(true)` is set on the runtime log call, `ts` is the parsed
+/// RFC 3339 timestamp prefix; otherwise it is `None` and `line` contains the
+/// raw log line.
+#[derive(Debug, Clone)]
+pub struct LogStreamItem {
+    /// Parsed RFC 3339 timestamp from the `timestamps(true)` prefix, if present.
+    pub ts: Option<chrono::DateTime<chrono::Utc>>,
+    /// Which stream the line came from.
+    pub stream: LogStream,
+    /// The log line (timestamp already stripped when `ts` is `Some`).
+    pub line: String,
 }

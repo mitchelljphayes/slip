@@ -11,8 +11,8 @@ use std::pin::Pin;
 use bollard::Docker;
 use bollard::auth::DockerCredentials;
 use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
-    StartContainerOptions, StopContainerOptions,
+    Config, CreateContainerOptions, ListContainersOptions, LogOutput, LogsOptions,
+    RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::image::CreateImageOptions;
 use bollard::models::{
@@ -26,9 +26,12 @@ use tracing::{debug, info, warn};
 use crate::config::ResourceConfig;
 use crate::docker::{
     extract_file_from_tar, extract_host_port, parse_cpu_limit, parse_memory_limit,
+    parse_timestamped,
 };
 use crate::error::RuntimeError;
-use crate::runtime::{ContainerInfo, PodInfo, RegistryCredentials, RuntimeBackend};
+use crate::runtime::{
+    ContainerInfo, LogStream, LogStreamItem, PodInfo, RegistryCredentials, RuntimeBackend,
+};
 
 /// Podman container runtime backend.
 ///
@@ -714,6 +717,49 @@ impl RuntimeBackend for PodmanBackend {
 
             Ok(result)
         })
+    }
+
+    fn container_logs<'a>(
+        &'a self,
+        container_id: &'a str,
+        since: Option<i64>,
+        follow: bool,
+    ) -> std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<LogStreamItem, RuntimeError>> + Send + 'a>,
+    > {
+        // Podman exposes the Docker-compatible socket API via bollard, so the
+        // implementation is identical to DockerClient's. See the DockerClient
+        // impl in `docker.rs` for the per-field rationale.
+        let options = LogsOptions::<String> {
+            stdout: true,
+            stderr: true,
+            follow,
+            timestamps: true,
+            tail: "200".to_string(),
+            since: since.unwrap_or(0),
+            ..Default::default()
+        };
+
+        let stream = self
+            .client
+            .logs(container_id, Some(options))
+            .map(move |item| {
+                let log = item.map_err(|e| RuntimeError::ContainerError(e.to_string()))?;
+                let (stream_kind, message) = match log {
+                    LogOutput::StdOut { message } => (LogStream::StdOut, message),
+                    LogOutput::StdErr { message } => (LogStream::StdErr, message),
+                    LogOutput::Console { message } => (LogStream::Console, message),
+                    LogOutput::StdIn { message } => (LogStream::Console, message),
+                };
+                let (ts, line) = parse_timestamped(&message);
+                Ok(LogStreamItem {
+                    ts,
+                    stream: stream_kind,
+                    line,
+                })
+            });
+
+        Box::pin(stream)
     }
 }
 

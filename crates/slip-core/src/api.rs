@@ -4,12 +4,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, body::Bytes};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
@@ -24,7 +26,7 @@ use crate::preview::{
     PreviewDeployContext, PreviewState, execute_preview_deploy, resolve_preview_domain,
     teardown_preview,
 };
-use crate::runtime::{RegistryCredentials, RuntimeBackend};
+use crate::runtime::{ContainerInfo, RegistryCredentials, RuntimeBackend};
 use crate::secrets::{SecretsStore, validate_secret_key};
 
 // ─── Request / Response types ─────────────────────────────────────────────────
@@ -78,6 +80,37 @@ pub struct DeployResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+/// Query parameters for `GET /v1/apps/{name}/logs`.
+#[derive(Debug, Deserialize)]
+pub struct LogsQueryParams {
+    /// Duration string (e.g. "1h", "5m30s") — only show logs newer than this.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Follow log output (stream new lines as they arrive). Default: false.
+    #[serde(default)]
+    pub follow: Option<bool>,
+}
+
+/// One NDJSON line in the logs stream.
+#[derive(Debug, Serialize)]
+pub struct LogEntry {
+    /// RFC 3339 timestamp (or null if the runtime didn't provide one).
+    pub ts: Option<String>,
+    /// Container short ID or name.
+    pub container: String,
+    /// Stream name: "stdout", "stderr", or "console".
+    pub stream: String,
+    /// The log line (timestamp already stripped).
+    pub line: String,
+}
+
+/// In-stream error event (NDJSON line).
+#[derive(Debug, Serialize)]
+struct LogStreamError {
+    error: String,
+    container: String,
 }
 
 /// Response for `GET /v1/status`.
@@ -527,6 +560,7 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
             "/v1/apps/{name}/status",
             axum::routing::get(handle_app_status),
         )
+        .route("/v1/apps/{name}/logs", axum::routing::get(handle_app_logs))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             management_auth,
@@ -1651,6 +1685,233 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
 
 /// `GET /v1/apps/{name}/status`
 ///
+/// `GET /v1/apps/{name}/logs` — stream container logs as NDJSON (chunked).
+///
+/// Resolves containers by the `slip.app` label (catches both blue-green
+/// overlap containers), merges their log streams via `futures_util::stream::select`,
+/// and emits one JSON object per line. Pre-stream errors return HTTP status
+/// codes (404/400); mid-stream errors are emitted as NDJSON error lines.
+///
+/// Query params:
+/// - `since` — duration string like "1h", "5m30s" (converted to Unix timestamp)
+/// - `follow` — stream new lines as they arrive (default false)
+async fn handle_app_logs(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(params): Query<LogsQueryParams>,
+) -> Response {
+    // ── a. Verify app exists ──────────────────────────────────────────────────
+    {
+        let apps = state.apps.read().await;
+        if !apps.contains_key(&name) {
+            return AppError::NotFound(format!(
+                "app '{name}' not found — register it via POST /v1/apps or run `slip apply`"
+            ))
+            .into_response();
+        }
+    }
+
+    // ── b. Parse `since` duration → Unix timestamp ─────────────────────────────
+    let since_unix: Option<i64> = if let Some(ref s) = params.since {
+        match parse_since_duration(s) {
+            Ok(ts) => Some(ts),
+            Err(msg) => {
+                return AppError::BadRequest(format!(
+                    "invalid --since '{s}': {msg} — use formats like 1h, 5m, 30s, 5m30s"
+                ))
+                .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    let follow = params.follow.unwrap_or(false);
+
+    // ── c. Resolve running containers by `slip.app` label ─────────────────────
+    let containers: Vec<ContainerInfo> = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.runtime.list_by_label("slip.app", &name),
+    )
+    .await
+    {
+        Ok(Ok(cs)) => cs.into_iter().filter(|c| c.state == "running").collect(),
+        Ok(Err(_)) | Err(_) => Vec::new(),
+    };
+
+    if containers.is_empty() {
+        return AppError::NotFound(format!(
+            "app '{name}' has no running containers — run `slip deploy` to start one"
+        ))
+        .into_response();
+    }
+
+    // ── d. Determine blue/green roles from AppRuntimeState ─────────────────────
+    let (green_id, blue_id) = {
+        let app_states = state.app_states.read().await;
+        let rs = app_states.get(&name);
+        let current = rs.and_then(|s| s.current_container_id.as_deref());
+        let previous = rs.and_then(|s| s.previous_container_id.as_deref());
+
+        let green = containers
+            .iter()
+            .find(|c| current.is_some_and(|id| id.starts_with(&c.id) || c.id.starts_with(id)))
+            .map(|c| c.id.clone())
+            .or_else(|| containers.first().map(|c| c.id.clone()));
+
+        let blue = containers
+            .iter()
+            .find(|c| previous.is_some_and(|id| id.starts_with(&c.id) || c.id.starts_with(id)))
+            .map(|c| c.id.clone());
+
+        (green, blue)
+    };
+
+    // ── e. Build per-container tagged streams via mpsc channels ───────────────
+    // Each container's log stream borrows `&runtime` (not 'static), but
+    // `Body::from_stream` requires 'static. We bridge by spawning a task per
+    // container that reads the borrowed stream and sends NDJSON Bytes into an
+    // mpsc channel; the ReceiverStream is 'static.
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        Result<Bytes, std::boxed::Box<dyn std::error::Error + Send + Sync>>,
+    >(256);
+
+    for c in &containers {
+        let role = if Some(&c.id) == green_id.as_ref() {
+            "green"
+        } else if Some(&c.id) == blue_id.as_ref() {
+            "blue"
+        } else if containers.len() == 1 {
+            "green"
+        } else {
+            "blue"
+        };
+        let container_label = format!("{role}-{}/{}", c.id, c.name.as_deref().unwrap_or(&c.id));
+        let container_id = c.id.clone();
+        let runtime = state.runtime.clone();
+        let tx = tx.clone();
+        let since = since_unix;
+
+        tokio::spawn(async move {
+            let mut stream = runtime.container_logs(&container_id, since, follow);
+            while let Some(item) = stream.next().await {
+                let bytes = match item {
+                    Ok(log) => {
+                        let entry = LogEntry {
+                            ts: log.ts.map(|t| t.to_rfc3339()),
+                            container: container_label.clone(),
+                            stream: log.stream.as_str().to_string(),
+                            line: log.line,
+                        };
+                        match serde_json::to_vec(&entry) {
+                            Ok(v) => {
+                                let mut line = v;
+                                line.push(b'\n');
+                                Bytes::from(line)
+                            }
+                            Err(e) => {
+                                let err = LogStreamError {
+                                    error: format!("serialize error: {e}"),
+                                    container: container_label.clone(),
+                                };
+                                let mut line =
+                                    serde_json::to_vec(&err).unwrap_or_else(|_| b"{}\n".to_vec());
+                                line.push(b'\n');
+                                Bytes::from(line)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let err = LogStreamError {
+                            error: e.to_string(),
+                            container: container_label.clone(),
+                        };
+                        let mut line =
+                            serde_json::to_vec(&err).unwrap_or_else(|_| b"{}\n".to_vec());
+                        line.push(b'\n');
+                        Bytes::from(line)
+                    }
+                };
+                if tx.send(Ok(bytes)).await.is_err() {
+                    // Receiver dropped (client disconnected) — stop streaming.
+                    break;
+                }
+            }
+        });
+    }
+
+    // Drop the last clone of tx so the ReceiverStream ends when all senders drop.
+    drop(tx);
+
+    // ── f. Build the merged 'static stream from the mpsc receiver ─────────────
+    let merged = tokio_stream::wrappers::ReceiverStream::new(rx);
+
+    // ── g. Build the chunked NDJSON response ────────────────────────────────────
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/x-ndjson")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(merged))
+        .unwrap()
+}
+
+/// Parse a duration string ("1h", "5m30s", "30s") into a Unix timestamp
+/// representing `now - duration`. Returns the timestamp on success, or an
+/// error message on failure.
+fn parse_since_duration(s: &str) -> Result<i64, String> {
+    if s.is_empty() {
+        return Err("empty duration string".to_string());
+    }
+    let mut total_secs: i64 = 0;
+    let mut current: i64 = 0;
+    for ch in s.chars() {
+        match ch {
+            '0'..='9' => {
+                current = current
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add((ch as u8 - b'0') as i64))
+                    .ok_or_else(|| "overflow in duration".to_string())?;
+            }
+            's' => {
+                total_secs = total_secs
+                    .checked_add(current)
+                    .ok_or_else(|| "overflow in duration".to_string())?;
+                current = 0;
+            }
+            'm' => {
+                total_secs = total_secs
+                    .checked_add(
+                        current
+                            .checked_mul(60)
+                            .ok_or_else(|| "overflow in duration".to_string())?,
+                    )
+                    .ok_or_else(|| "overflow in duration".to_string())?;
+                current = 0;
+            }
+            'h' => {
+                total_secs = total_secs
+                    .checked_add(
+                        current
+                            .checked_mul(3600)
+                            .ok_or_else(|| "overflow in duration".to_string())?,
+                    )
+                    .ok_or_else(|| "overflow in duration".to_string())?;
+                current = 0;
+            }
+            _ => {
+                return Err(format!(
+                    "unexpected character '{ch}' in duration, expected digits followed by s/m/h"
+                ));
+            }
+        }
+    }
+    if current > 0 {
+        return Err("duration must have a unit suffix (s, m, or h)".to_string());
+    }
+    let now = chrono::Utc::now().timestamp();
+    Ok(now - total_secs)
+}
+
 /// Returns a detailed status report for a single app: current tag, container
 /// id/state, health config + last probe result, last deploy, route hostnames,
 /// secret key names, cert issuer, and config drift flag.
@@ -2129,6 +2390,7 @@ mod tests {
 
     use chrono::Utc;
 
+    use super::{LogEntry, parse_since_duration};
     use crate::api::{
         AppListResponse, AppResponse, AppState, DeployResponse, ErrorResponse, build_router,
     };
@@ -5601,5 +5863,127 @@ path = "/tmp/slip-test"
             payload3["config_drift"], false,
             "config_drift should be false when last_applied matches current config"
         );
+    }
+
+    // ── Logs endpoint tests ────────────────────────────────────────────────────
+
+    /// `GET /v1/apps/unknown/logs` returns 404 for a non-existent app.
+    #[tokio::test]
+    async fn test_logs_handler_returns_404_for_unknown_app() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/apps/unknown/logs")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `GET /v1/apps/{name}/logs?since=abc` returns 400 for an invalid duration.
+    #[tokio::test]
+    async fn test_logs_handler_returns_400_for_invalid_since() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/logs?since=abc"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            payload.error.contains("invalid --since"),
+            "error should mention --since: {}",
+            payload.error
+        );
+    }
+
+    /// `GET /v1/apps/{name}/logs` without auth returns 401.
+    #[tokio::test]
+    async fn test_logs_handler_requires_auth() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/logs"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `parse_since_duration` parses valid duration strings.
+    #[test]
+    fn test_parse_since_duration_valid() {
+        // "30s" — 30 seconds ago
+        let now = chrono::Utc::now().timestamp();
+        let ts = parse_since_duration("30s").unwrap();
+        assert_eq!(ts, now - 30);
+
+        // "5m" — 300 seconds ago
+        let ts = parse_since_duration("5m").unwrap();
+        assert_eq!(ts, now - 300);
+
+        // "1h" — 3600 seconds ago
+        let ts = parse_since_duration("1h").unwrap();
+        assert_eq!(ts, now - 3600);
+
+        // "5m30s" — combined
+        let ts = parse_since_duration("5m30s").unwrap();
+        assert_eq!(ts, now - 330);
+    }
+
+    /// `parse_since_duration` rejects invalid input.
+    #[test]
+    fn test_parse_since_duration_invalid() {
+        assert!(parse_since_duration("").is_err());
+        assert!(parse_since_duration("abc").is_err());
+        assert!(parse_since_duration("5").is_err(), "needs unit suffix");
+        assert!(parse_since_duration("5x").is_err(), "unknown unit");
+    }
+
+    /// `LogEntry` serializes with the expected fields.
+    #[test]
+    fn test_log_entry_serialization() {
+        let entry = LogEntry {
+            ts: Some("2026-07-11T15:30:00Z".to_string()),
+            container: "green-abc123/testapp".to_string(),
+            stream: "stdout".to_string(),
+            line: "hello world".to_string(),
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["ts"], "2026-07-11T15:30:00Z");
+        assert_eq!(json["container"], "green-abc123/testapp");
+        assert_eq!(json["stream"], "stdout");
+        assert_eq!(json["line"], "hello world");
+    }
+
+    /// `LogEntry` with null timestamp serializes correctly.
+    #[test]
+    fn test_log_entry_null_ts() {
+        let entry = LogEntry {
+            ts: None,
+            container: "blue-xyz/other".to_string(),
+            stream: "stderr".to_string(),
+            line: "error!".to_string(),
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["ts"], serde_json::Value::Null);
+        assert_eq!(json["stream"], "stderr");
     }
 }
