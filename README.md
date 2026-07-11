@@ -26,7 +26,7 @@ GitHub Actions → signed webhook → slipd → pull → health check → swap r
 - **Per-container health** — mixed HTTP + worker containers in a single pod
 - **Structured logging** — JSON logs via `tracing`
 - **`slip init`** — 🚧 WIP (currently a stub; see [v1.0 roadmap](https://linear.app/mitchelljphayes/project/slip-v1-0-roadmap-3b6e6e0b0b0b))
-- **`slip status`** — 🚧 WIP (currently a stub; see [v1.0 roadmap](https://linear.app/mitchelljphayes/project/slip-v1-0-roadmap-3b6e6e0b0b0b))
+- **`slip status`** — daemon overview (uptime, Caddy/runtime health, app table) and per-app detail (tag, container state, health probe, last deploy, routes, cert issuer, secret keys, config drift)
 - **`slip logs`** — 🚧 WIP (currently a stub; see [v1.0 roadmap](https://linear.app/mitchelljphayes/project/slip-v1-0-roadmap-3b6e6e0b0b0b))
 
 ## Install

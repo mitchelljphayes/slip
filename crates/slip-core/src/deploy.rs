@@ -211,6 +211,10 @@ pub struct AppRuntimeState {
     pub current_manifest_path: Option<PathBuf>,
     /// App kind: "container", "pod", or "worker".
     pub kind: Option<String>,
+    /// The last applied config JSON (from `slip apply`), for drift detection.
+    /// `None` when no apply has been recorded. Not serialized (only persisted
+    /// via `PersistedAppState`).
+    pub last_applied: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -2248,6 +2252,21 @@ mod tests {
                 )),
             };
             Box::pin(async move { result })
+        }
+
+        fn list_by_label<'a>(
+            &'a self,
+            _label_key: &'a str,
+            _label_value: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Vec<crate::runtime::ContainerInfo>, RuntimeError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(Vec::new()) })
         }
     }
 

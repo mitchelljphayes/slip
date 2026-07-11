@@ -596,6 +596,66 @@ impl CaddyClient {
             )))
         }
     }
+
+    /// Query Caddy's TLS automation policies to determine the certificate
+    /// issuer for a given domain.
+    ///
+    /// Returns `Ok(Some(issuer_string))` where issuer is `"internal"`
+    /// (self-signed) or `"acme"` (Let's Encrypt / ACME). Returns `Ok(None)`
+    /// when no matching policy is found (Caddy's default issuer is ACME).
+    pub async fn get_tls_issuer(&self, domain: &str) -> Result<Option<String>, CaddyError> {
+        let policies_url = format!("{}/config/apps/tls/automation/policies", self.base_url);
+        let resp = self.client.get(&policies_url).send().await?;
+
+        if !resp.status().is_success() {
+            // No TLS automation config → Caddy uses ACME by default.
+            return Ok(None);
+        }
+
+        let policies: Vec<serde_json::Value> = resp.json().await.unwrap_or_default();
+
+        for policy in policies {
+            // Check if this policy's subjects include the domain or a wildcard
+            // that matches it.
+            if let Some(subjects) = policy.get("subjects").and_then(|s| s.as_array()) {
+                let matches = subjects.iter().any(|s| {
+                    s.as_str()
+                        .map(|subj| domain == subj || is_wildcard_match(subj, domain))
+                        .unwrap_or(false)
+                });
+                if matches {
+                    // Determine issuer module.
+                    if let Some(issuers) = policy.get("issuers").and_then(|i| i.as_array())
+                        && let Some(first_issuer) = issuers.first()
+                        && let Some(module) = first_issuer.get("module").and_then(|m| m.as_str())
+                    {
+                        return Ok(Some(module.to_string()));
+                    }
+                    return Ok(Some("unknown".to_string()));
+                }
+            }
+        }
+
+        // No matching policy → Caddy default is ACME.
+        Ok(None)
+    }
+}
+
+/// Check if a wildcard subject (e.g. `*.example.com`) matches a domain.
+///
+/// `*.example.com` matches `foo.example.com` but NOT `example.com` itself.
+fn is_wildcard_match(wildcard: &str, domain: &str) -> bool {
+    if let Some(suffix) = wildcard.strip_prefix("*.") {
+        // suffix is "example.com" — domain must have at least one label
+        // before it, i.e. "foo.example.com", not "example.com" itself.
+        domain.ends_with(suffix) && domain.len() > suffix.len() && {
+            // The char before the suffix match must be a dot.
+            let prefix = &domain[..domain.len() - suffix.len()];
+            prefix.ends_with('.')
+        }
+    } else {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1629,5 +1689,38 @@ mod tests {
             1,
             "should still have exactly one TLS policy (no duplicates)"
         );
+    }
+
+    // ── is_wildcard_match ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_wildcard_match_exact_suffix() {
+        assert!(is_wildcard_match("*.example.com", "foo.example.com"));
+        assert!(is_wildcard_match("*.example.com", "bar.example.com"));
+    }
+
+    #[test]
+    fn test_wildcard_match_no_match() {
+        assert!(!is_wildcard_match("*.example.com", "example.org"));
+        assert!(!is_wildcard_match("*.example.com", "example.com"));
+    }
+
+    #[test]
+    fn test_wildcard_match_not_wildcard() {
+        assert!(!is_wildcard_match("example.com", "example.com"));
+    }
+
+    // ── get_tls_issuer ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_tls_issuer_no_policies_returns_none() {
+        let (port, _state) = start_mock_caddy().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        let issuer = client.get_tls_issuer("example.com").await.unwrap();
+        // No policies → None (Caddy default is ACME, but we return None to
+        // indicate "no explicit policy").
+        assert!(issuer.is_none());
     }
 }

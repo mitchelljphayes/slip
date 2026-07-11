@@ -81,17 +81,37 @@ pub struct ErrorResponse {
 }
 
 /// Response for `GET /v1/status`.
-#[derive(Debug, Serialize)]
+///
+/// Schema: `slip.status/v1`
+#[derive(Debug, Serialize, Deserialize)]
 pub struct StatusResponse {
+    /// Schema version tag.
+    pub schema: String,
+    /// Daemon name ("slipd").
     pub daemon: String,
+    /// slipd version (from CARGO_PKG_VERSION).
+    pub version: String,
     pub uptime_seconds: i64,
+    /// "ok" or "error".
     pub caddy: String,
+    /// "ok" or "error".
     pub runtime: String,
+    /// Runtime backend name ("docker" or "podman").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_backend: Option<String>,
+    /// Number of registered apps.
+    pub app_count: usize,
+    /// Last deploys summary (latest deploy per app).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub last_deploys: Vec<DeploySummary>,
     pub apps: HashMap<String, AppStatusResponse>,
 }
 
 /// Per-app status within a `StatusResponse`.
-#[derive(Debug, Serialize)]
+///
+/// When queried for a specific app (`slip status <app>`), this is enriched
+/// with health, routes, secrets, cert, and drift information.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AppStatusResponse {
     pub status: String,
     pub tag: Option<String>,
@@ -107,6 +127,84 @@ pub struct AppStatusResponse {
     /// How the latest deploy was triggered (from the deploy history cache).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub triggered_by: Option<String>,
+    // ── Enriched fields (populated by `slip status <app>`) ──────────────────
+    /// Container state from the runtime (e.g. "running", "exited").
+    /// Populated by querying containers by `slip.app` label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_state: Option<String>,
+
+    /// Health check config + last probe result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthStatus>,
+
+    /// Last deploy summary (id, status, reason, timestamp).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_deploy: Option<DeploySummary>,
+
+    /// Route hostnames registered in Caddy for this app.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<RouteStatus>,
+
+    /// Secret key names (never values).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
+
+    /// Certificate issuer for this app's domain(s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cert: Option<CertStatus>,
+
+    /// True when live server config differs from last `slip apply`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_drift: Option<bool>,
+}
+
+/// Health check status for an app.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HealthStatus {
+    /// Configured health check path (None = no health check configured).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Number of retries configured.
+    pub retries: u32,
+    /// "healthy", "unhealthy", or "unknown" (not yet probed / no path configured).
+    pub status: String,
+    /// Timestamp of the last health probe, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_check: Option<DateTime<Utc>>,
+}
+
+/// Deploy summary for status responses.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DeploySummary {
+    pub deploy_id: String,
+    pub app: String,
+    pub tag: String,
+    /// Deploy status string ("completed", "failed", "accepted", etc.).
+    pub status: String,
+    /// How the deploy was triggered: "webhook", "cli", or "rollback".
+    pub triggered_by: String,
+    pub started_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Route status for an app.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RouteStatus {
+    pub hostname: String,
+    pub port: u16,
+}
+
+/// Certificate status for an app's domain.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CertStatus {
+    /// TLS issuer: "internal" (self-signed) or "acme" (Let's Encrypt).
+    pub issuer: String,
+    /// Certificate expiry (if known).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 /// Response for `GET /v1/deploys/:deploy_id`.
@@ -237,7 +335,7 @@ fn validate_tag(tag: &str) -> Result<(), AppError> {
 }
 
 /// Response for `GET /v1/apps` and `GET /v1/apps/{name}`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppResponse {
     pub name: String,
     pub image: String,
@@ -424,6 +522,10 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         .route(
             "/v1/apps/{name}/key",
             axum::routing::put(handle_set_deploy_key),
+        )
+        .route(
+            "/v1/apps/{name}/status",
+            axum::routing::get(handle_app_status),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -621,15 +723,25 @@ async fn handle_create_app(
     // Write config to disk (non-blocking)
     let config_dir = state.config_dir.clone();
     let app_config_clone = app_config.clone();
+    let state_dir = state.config.storage.path.join("state");
+    let app_response = AppResponse::from(&app_config);
+    let app_name_clone = req.name.clone();
+    let app_response_clone = app_response.clone();
     tokio::task::spawn_blocking(move || {
         if let Err(e) = crate::config::write_app_config(&config_dir, &app_config_clone) {
             warn!(error = %e, "failed to write app config");
+        }
+        // Save last_applied for drift detection.
+        if let Err(e) =
+            crate::state::save_last_applied(&state_dir, &app_name_clone, &app_response_clone)
+        {
+            warn!(error = %e, "failed to save last_applied state");
         }
     });
 
     info!(app = %req.name, "app created");
 
-    Ok((StatusCode::CREATED, Json(AppResponse::from(&app_config))))
+    Ok((StatusCode::CREATED, Json(app_response)))
 }
 
 /// `GET /v1/apps` — List all apps.
@@ -722,15 +834,25 @@ async fn handle_update_app(
     // Write config to disk
     let config_dir = state.config_dir.clone();
     let app_config_clone = updated_config.clone();
+    let state_dir = state.config.storage.path.join("state");
+    let app_response = AppResponse::from(&updated_config);
+    let app_name_clone = name.clone();
+    let app_response_clone = app_response.clone();
     tokio::task::spawn_blocking(move || {
         if let Err(e) = crate::config::write_app_config(&config_dir, &app_config_clone) {
             warn!(error = %e, "failed to write app config");
+        }
+        // Save last_applied for drift detection.
+        if let Err(e) =
+            crate::state::save_last_applied(&state_dir, &app_name_clone, &app_response_clone)
+        {
+            warn!(error = %e, "failed to save last_applied state");
         }
     });
 
     info!(app = %name, "app updated");
 
-    Ok((StatusCode::OK, Json(AppResponse::from(&updated_config))))
+    Ok((StatusCode::OK, Json(app_response)))
 }
 
 /// `DELETE /v1/apps/{name}` — Delete an app.
@@ -1375,6 +1497,44 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
     let app_states = state.app_states.read().await;
 
     let apps_keys: Vec<String> = state.apps.read().await.keys().cloned().collect();
+    let app_count = apps_keys.len();
+
+    // Build last_deploys summary (latest per app).
+    let last_deploys: Vec<DeploySummary> = apps_keys
+        .iter()
+        .filter_map(|app_name| {
+            let cached = state.deploys.get(app_name)?;
+            let triggered_by = match cached.triggered_by {
+                crate::deploy::TriggerSource::Webhook => "webhook",
+                crate::deploy::TriggerSource::Cli => "cli",
+                crate::deploy::TriggerSource::Rollback => "rollback",
+            };
+            let status_str = match cached.status {
+                crate::deploy::DeployStatus::Accepted => "accepted",
+                crate::deploy::DeployStatus::Pulling => "pulling",
+                crate::deploy::DeployStatus::Configuring => "configuring",
+                crate::deploy::DeployStatus::Starting => "starting",
+                crate::deploy::DeployStatus::HealthChecking => "health_checking",
+                crate::deploy::DeployStatus::Switching => "switching",
+                crate::deploy::DeployStatus::StoppingOld => "stopping_old",
+                crate::deploy::DeployStatus::RemovingRoute => "removing_route",
+                crate::deploy::DeployStatus::RestartingOld => "restarting_old",
+                crate::deploy::DeployStatus::Completed => "completed",
+                crate::deploy::DeployStatus::Failed => "failed",
+            };
+            Some(DeploySummary {
+                deploy_id: cached.id.clone(),
+                app: cached.app.clone(),
+                tag: cached.tag.clone(),
+                status: status_str.to_string(),
+                triggered_by: triggered_by.to_string(),
+                started_at: cached.started_at,
+                finished_at: cached.finished_at,
+                error: cached.error.clone(),
+            })
+        })
+        .collect();
+
     let apps = apps_keys
         .into_iter()
         .map(|app_name| {
@@ -1388,6 +1548,13 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                     kind: None,
                     deploy_id: None,
                     triggered_by: None,
+                    container_state: None,
+                    health: None,
+                    last_deploy: None,
+                    routes: Vec::new(),
+                    secrets: Vec::new(),
+                    cert: None,
+                    config_drift: None,
                 },
                 Some(runtime) => {
                     let status_str = match runtime.status {
@@ -1405,6 +1572,13 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                         kind: runtime.kind.clone(),
                         deploy_id: None,
                         triggered_by: None,
+                        container_state: None,
+                        health: None,
+                        last_deploy: None,
+                        routes: Vec::new(),
+                        secrets: Vec::new(),
+                        cert: None,
+                        config_drift: None,
                     }
                 }
             };
@@ -1421,6 +1595,36 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                     }
                     .to_string(),
                 );
+
+                // Build last_deploy summary.
+                let status_str = match cached.status {
+                    crate::deploy::DeployStatus::Accepted => "accepted",
+                    crate::deploy::DeployStatus::Pulling => "pulling",
+                    crate::deploy::DeployStatus::Configuring => "configuring",
+                    crate::deploy::DeployStatus::Starting => "starting",
+                    crate::deploy::DeployStatus::HealthChecking => "health_checking",
+                    crate::deploy::DeployStatus::Switching => "switching",
+                    crate::deploy::DeployStatus::StoppingOld => "stopping_old",
+                    crate::deploy::DeployStatus::RemovingRoute => "removing_route",
+                    crate::deploy::DeployStatus::RestartingOld => "restarting_old",
+                    crate::deploy::DeployStatus::Completed => "completed",
+                    crate::deploy::DeployStatus::Failed => "failed",
+                };
+                let triggered_str = match cached.triggered_by {
+                    crate::deploy::TriggerSource::Webhook => "webhook",
+                    crate::deploy::TriggerSource::Cli => "cli",
+                    crate::deploy::TriggerSource::Rollback => "rollback",
+                };
+                enriched.last_deploy = Some(DeploySummary {
+                    deploy_id: cached.id.clone(),
+                    app: app_name.clone(),
+                    tag: cached.tag.clone(),
+                    status: status_str.to_string(),
+                    triggered_by: triggered_str.to_string(),
+                    started_at: cached.started_at,
+                    finished_at: cached.finished_at,
+                    error: cached.error.clone(),
+                });
             }
             (app_name.clone(), enriched)
         })
@@ -1429,13 +1633,271 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
     (
         StatusCode::OK,
         Json(StatusResponse {
+            schema: "slip.status/v1".to_string(),
             daemon: "slipd".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_seconds,
             caddy: caddy_health.to_string(),
             runtime: runtime_health.to_string(),
+            runtime_backend: Some(state.runtime.name().to_string()),
+            app_count,
+            last_deploys,
             apps,
         }),
     )
+}
+
+// ─── Per-app status handler ───────────────────────────────────────────────────
+
+/// `GET /v1/apps/{name}/status`
+///
+/// Returns a detailed status report for a single app: current tag, container
+/// id/state, health config + last probe result, last deploy, route hostnames,
+/// secret key names, cert issuer, and config drift flag.
+///
+/// This is the backend for `slip status <app>`.
+async fn handle_app_status(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<(StatusCode, Json<AppStatusResponse>), AppError> {
+    // Verify app exists and get config.
+    let app_cfg = state.apps.read().await.get(&name).cloned().ok_or_else(|| {
+        AppError::NotFound(format!(
+            "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+            name
+        ))
+    })?;
+
+    // Get runtime state.
+    let runtime_state = state.app_states.read().await.get(&name).cloned();
+
+    let status_str = match &runtime_state {
+        Some(rs) => match rs.status {
+            crate::deploy::AppStatus::Running => "running",
+            crate::deploy::AppStatus::Deploying => "deploying",
+            crate::deploy::AppStatus::Failed => "failed",
+            crate::deploy::AppStatus::NotDeployed => "not_deployed",
+        },
+        None => "not_deployed",
+    };
+
+    // ── Container state via label query (2s timeout — a hanging runtime
+    //    socket must not block the status response) ─────────────────────────
+    let container_query_timeout = std::time::Duration::from_secs(2);
+    let container_state = if let Some(ref rs) = runtime_state {
+        // If we have a container_id, check if it's running via the runtime.
+        if let Some(ref cid) = rs.current_container_id {
+            match tokio::time::timeout(
+                container_query_timeout,
+                state.runtime.container_is_running(cid),
+            )
+            .await
+            {
+                Ok(Ok(true)) => Some("running".to_string()),
+                Ok(Ok(false)) => Some("exited".to_string()),
+                Ok(Err(_)) => None,
+                Err(_) => Some("unknown".to_string()),
+            }
+        } else {
+            // No container_id — query by label for the app.
+            match tokio::time::timeout(
+                container_query_timeout,
+                state.runtime.list_by_label("slip.app", &name),
+            )
+            .await
+            {
+                Ok(Ok(containers)) => containers.first().map(|first| first.state.clone()),
+                Ok(Err(_)) => None,
+                Err(_) => Some("unknown".to_string()),
+            }
+        }
+    } else {
+        // Query by label even if no runtime state.
+        match tokio::time::timeout(
+            container_query_timeout,
+            state.runtime.list_by_label("slip.app", &name),
+        )
+        .await
+        {
+            Ok(Ok(containers)) => containers.first().map(|first| first.state.clone()),
+            Ok(Err(_)) => None,
+            Err(_) => Some("unknown".to_string()),
+        }
+    };
+
+    // ── Health status (sync 2s probe) ──────────────────────────────────────
+    let health = if let Some(ref rs) = runtime_state
+        && let Some(port) = rs.current_port
+    {
+        let health_cfg = &app_cfg.health;
+        let path = health_cfg.path.clone();
+
+        if let Some(ref _p) = path {
+            // Do a quick synchronous probe with a 2-second timeout.
+            let probe_url = format!("http://127.0.0.1:{port}{}", path.as_deref().unwrap_or("/"));
+            let probe_result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                state.health.client().get(&probe_url).send(),
+            )
+            .await;
+
+            let health_status = match probe_result {
+                Ok(Ok(resp)) if resp.status().is_success() => "healthy",
+                Ok(Ok(_)) => "unhealthy",
+                Ok(Err(_)) => "unhealthy",
+                Err(_) => "unhealthy",
+            };
+
+            Some(HealthStatus {
+                path: path.clone(),
+                retries: health_cfg.retries,
+                status: health_status.to_string(),
+                last_check: Some(Utc::now()),
+            })
+        } else {
+            // No health path configured.
+            Some(HealthStatus {
+                path: None,
+                retries: health_cfg.retries,
+                status: "unknown".to_string(),
+                last_check: None,
+            })
+        }
+    } else {
+        None
+    };
+
+    // ── Routes from runtime state ──────────────────────────────────────────
+    let routes: Vec<RouteStatus> = if let Some(ref rs) = runtime_state {
+        rs.current_routes
+            .iter()
+            .map(|r| RouteStatus {
+                hostname: r.hostname.clone(),
+                port: r.port,
+            })
+            .collect()
+    } else {
+        // Fall back to config routes.
+        app_cfg
+            .routing
+            .effective_routes()
+            .into_iter()
+            .filter_map(|r| {
+                r.port.map(|p| RouteStatus {
+                    hostname: r.hostname,
+                    port: p,
+                })
+            })
+            .collect()
+    };
+
+    // ── Secret key names (never values) ────────────────────────────────────
+    let secrets = state.secrets_store.list(&name).unwrap_or_default();
+
+    // ── Deploy metadata from cache ─────────────────────────────────────────
+    let mut last_deploy: Option<DeploySummary> = None;
+    let mut deploy_id: Option<String> = None;
+    let mut triggered_by: Option<String> = None;
+
+    if let Some(cached) = state.deploys.get(&name) {
+        let status_str = match cached.status {
+            crate::deploy::DeployStatus::Accepted => "accepted",
+            crate::deploy::DeployStatus::Pulling => "pulling",
+            crate::deploy::DeployStatus::Configuring => "configuring",
+            crate::deploy::DeployStatus::Starting => "starting",
+            crate::deploy::DeployStatus::HealthChecking => "health_checking",
+            crate::deploy::DeployStatus::Switching => "switching",
+            crate::deploy::DeployStatus::StoppingOld => "stopping_old",
+            crate::deploy::DeployStatus::RemovingRoute => "removing_route",
+            crate::deploy::DeployStatus::RestartingOld => "restarting_old",
+            crate::deploy::DeployStatus::Completed => "completed",
+            crate::deploy::DeployStatus::Failed => "failed",
+        };
+        let triggered_str = match cached.triggered_by {
+            crate::deploy::TriggerSource::Webhook => "webhook",
+            crate::deploy::TriggerSource::Cli => "cli",
+            crate::deploy::TriggerSource::Rollback => "rollback",
+        };
+        deploy_id = Some(cached.id.clone());
+        triggered_by = Some(triggered_str.to_string());
+        last_deploy = Some(DeploySummary {
+            deploy_id: cached.id.clone(),
+            app: name.clone(),
+            tag: cached.tag.clone(),
+            status: status_str.to_string(),
+            triggered_by: triggered_str.to_string(),
+            started_at: cached.started_at,
+            finished_at: cached.finished_at,
+            error: cached.error.clone(),
+        });
+    }
+
+    // ── Config drift (last_applied vs current) ─────────────────────────────
+    let config_drift = if let Some(ref rs) = runtime_state {
+        if let Some(ref last_applied_json) = rs.last_applied {
+            // Parse last_applied as AppResponse and compare with current config.
+            match serde_json::from_str::<AppResponse>(last_applied_json) {
+                Ok(last) => {
+                    let current = AppResponse::from(&app_cfg);
+                    // If they differ, there's drift.
+                    let last_val = serde_json::to_value(&last).unwrap_or(serde_json::Value::Null);
+                    let curr_val =
+                        serde_json::to_value(&current).unwrap_or(serde_json::Value::Null);
+                    Some(last_val != curr_val)
+                }
+                Err(_) => Some(true),
+            }
+        } else {
+            // No last_applied recorded — can't determine drift.
+            None
+        }
+    } else {
+        None
+    };
+
+    // ── Cert status (from Caddy TLS policies) ──────────────────────────────
+    let cert = if !routes.is_empty() {
+        // Query Caddy for the TLS issuer of the first route's hostname.
+        let hostname = &routes[0].hostname;
+        match state.caddy.get_tls_issuer(hostname).await {
+            Ok(Some(issuer)) => Some(CertStatus {
+                issuer,
+                expires_at: None, // Caddy admin API doesn't expose cert expiry directly
+            }),
+            Ok(None) => {
+                // No matching TLS policy → Caddy default is ACME.
+                Some(CertStatus {
+                    issuer: "acme".to_string(),
+                    expires_at: None,
+                })
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let response = AppStatusResponse {
+        status: status_str.to_string(),
+        tag: runtime_state.as_ref().and_then(|r| r.current_tag.clone()),
+        deployed_at: runtime_state.as_ref().and_then(|r| r.deployed_at),
+        container_id: runtime_state
+            .as_ref()
+            .and_then(|r| r.current_container_id.clone()),
+        port: runtime_state.as_ref().and_then(|r| r.current_port),
+        kind: runtime_state.as_ref().and_then(|r| r.kind.clone()),
+        deploy_id,
+        triggered_by,
+        container_state,
+        health,
+        last_deploy,
+        routes,
+        secrets,
+        cert,
+        config_drift,
+    };
+
+    Ok((StatusCode::OK, Json(response)))
 }
 
 // ─── Deploy status handler ────────────────────────────────────────────────────
@@ -4618,5 +5080,526 @@ path = "/tmp/slip-test"
             "KEPT_KEY should remain"
         );
         assert_eq!(payload.env.len(), 1, "only KEPT_KEY should remain");
+    }
+
+    // ── GET /v1/apps/{name}/status ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_app_status_not_found() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/apps/nonexistent/status")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_app_status_not_deployed() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/status"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(payload["status"], "not_deployed");
+        assert!(payload["tag"].is_null());
+        // Routes should fall back to config routes.
+        assert!(payload["routes"].is_array());
+        // No secrets for a fresh app (field is skipped when empty).
+        assert!(
+            payload["secrets"].is_array() || payload["secrets"].is_null(),
+            "secrets should be absent or empty array"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_app_status_with_running_app() {
+        let state = create_test_state();
+
+        // Pre-populate runtime state.
+        {
+            let mut app_states = state.app_states.write().await;
+            app_states.insert(
+                APP_NAME.to_string(),
+                AppRuntimeState {
+                    status: AppStatus::Running,
+                    current_tag: Some("v1.0.0".to_string()),
+                    current_container_id: Some("abc123".to_string()),
+                    current_port: Some(54321),
+                    deployed_at: Some(Utc::now()),
+                    kind: Some("container".to_string()),
+                    current_routes: vec![crate::deploy::RouteState {
+                        hostname: "testapp.example.com".to_string(),
+                        port: 54321,
+                    }],
+                    ..Default::default()
+                },
+            );
+        }
+
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/status"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(payload["status"], "running");
+        assert_eq!(payload["tag"], "v1.0.0");
+        assert_eq!(payload["container_id"], "abc123");
+        assert_eq!(payload["port"], 54321);
+        assert_eq!(payload["kind"], "container");
+        // Routes from runtime state.
+        assert_eq!(payload["routes"][0]["hostname"], "testapp.example.com");
+        assert_eq!(payload["routes"][0]["port"], 54321);
+    }
+
+    #[tokio::test]
+    async fn test_app_status_includes_deploy_metadata() {
+        let state = create_test_state();
+
+        // Pre-populate runtime state.
+        {
+            let mut app_states = state.app_states.write().await;
+            app_states.insert(
+                APP_NAME.to_string(),
+                AppRuntimeState {
+                    status: AppStatus::Running,
+                    current_tag: Some("v1.0.0".to_string()),
+                    current_container_id: Some("abc123".to_string()),
+                    current_port: Some(54321),
+                    deployed_at: Some(Utc::now()),
+                    kind: Some("container".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Populate deploy cache.
+        let ctx = DeployContext {
+            id: "dep_status001".to_string(),
+            app: APP_NAME.to_string(),
+            image: APP_IMAGE.to_string(),
+            tag: "v1.2.3".to_string(),
+            status: DeployStatus::Completed,
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            error: None,
+            triggered_by: TriggerSource::Webhook,
+            new_container_id: Some("abc123".to_string()),
+            new_port: Some(8080),
+            images: HashMap::new(),
+            new_pod_name: None,
+            new_manifest_path: None,
+            rollback_failed: false,
+        };
+        state.deploys.insert(ctx.app.clone(), ctx);
+
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/status"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(payload["deploy_id"], "dep_status001");
+        assert_eq!(payload["triggered_by"], "webhook");
+        assert_eq!(payload["last_deploy"]["deploy_id"], "dep_status001");
+        assert_eq!(payload["last_deploy"]["status"], "completed");
+        assert_eq!(payload["last_deploy"]["triggered_by"], "webhook");
+    }
+
+    #[tokio::test]
+    async fn test_app_status_no_secret_values() {
+        let state = create_test_state();
+
+        // Set some secrets.
+        state
+            .secrets_store
+            .set(APP_NAME, "API_KEY", "supersecret123")
+            .unwrap();
+        state
+            .secrets_store
+            .set(APP_NAME, "DB_PASSWORD", "hunter2")
+            .unwrap();
+
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/status"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let secrets = payload["secrets"].as_array().unwrap();
+        assert_eq!(secrets.len(), 2, "should list 2 secret keys");
+        let key_names: Vec<&str> = secrets.iter().map(|s| s.as_str().unwrap()).collect();
+        assert!(key_names.contains(&"API_KEY"));
+        assert!(key_names.contains(&"DB_PASSWORD"));
+        // No secret values should appear anywhere in the response.
+        let raw = serde_json::to_string(&payload).unwrap();
+        assert!(
+            !raw.contains("supersecret123"),
+            "secret value must not appear in status"
+        );
+        assert!(!raw.contains("hunter2"), "secret value must not appear");
+    }
+
+    #[tokio::test]
+    async fn test_app_status_auth_required() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        // No auth header → 401.
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/status"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Acceptance-criteria debugging scenarios ──────────────────────────────
+    // These three tests verify that `slip status <app>` output alone is
+    // sufficient to debug the three scenarios called out in the SLIP-100
+    // acceptance criteria: stuck deploy, failed health, drifted config.
+
+    /// Scenario 1: Stuck deploy.
+    /// App is in `Deploying` status, the latest deploy record is in a
+    /// non-terminal `DeployStatus` (e.g. `HealthChecking`) with no
+    /// `finished_at`. The status output must show `status: "deploying"` and
+    /// `last_deploy.status` reflecting the stuck phase so an operator can see
+    /// the deploy is in progress (not completed, not failed).
+    #[tokio::test]
+    async fn test_app_status_stuck_deploy() {
+        let state = create_test_state();
+
+        // Runtime state: app is mid-deploy.
+        {
+            let mut app_states = state.app_states.write().await;
+            app_states.insert(
+                APP_NAME.to_string(),
+                AppRuntimeState {
+                    status: AppStatus::Deploying,
+                    current_tag: Some("v2.0.0".to_string()),
+                    current_container_id: Some("newcid456".to_string()),
+                    current_port: Some(54321),
+                    deployed_at: Some(Utc::now()),
+                    kind: Some("container".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Deploy cache: latest deploy is stuck in HealthChecking (non-terminal).
+        let stuck_ctx = DeployContext {
+            id: "dep_stuck001".to_string(),
+            app: APP_NAME.to_string(),
+            image: APP_IMAGE.to_string(),
+            tag: "v2.0.0".to_string(),
+            status: DeployStatus::HealthChecking,
+            started_at: Utc::now(),
+            finished_at: None, // no finish → still running
+            error: None,
+            triggered_by: TriggerSource::Webhook,
+            new_container_id: Some("newcid456".to_string()),
+            new_port: Some(54321),
+            images: HashMap::new(),
+            new_pod_name: None,
+            new_manifest_path: None,
+            rollback_failed: false,
+        };
+        state.deploys.insert(stuck_ctx.app.clone(), stuck_ctx);
+
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/status"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // The app-level status reflects the deploying state.
+        assert_eq!(payload["status"], "deploying");
+        assert_eq!(payload["tag"], "v2.0.0");
+        // The deploy metadata shows the stuck phase (non-terminal) with no
+        // finished_at — this is the diagnostic that tells an operator the
+        // deploy is in progress and hasn't completed.
+        assert_eq!(payload["deploy_id"], "dep_stuck001");
+        assert_eq!(payload["last_deploy"]["deploy_id"], "dep_stuck001");
+        assert_eq!(payload["last_deploy"]["status"], "health_checking");
+        assert_eq!(payload["last_deploy"]["triggered_by"], "webhook");
+        assert!(
+            payload["last_deploy"]["finished_at"].is_null(),
+            "stuck deploy must have no finished_at"
+        );
+    }
+
+    /// Scenario 2: Failed health.
+    /// App is `Running` with a configured health path, but the health endpoint
+    /// is not responding (port points at nothing). The status output must show
+    /// `health.status: "unhealthy"` so an operator can see the app is
+    /// unhealthy despite being "running".
+    #[tokio::test]
+    async fn test_app_status_failed_health() {
+        let state = create_test_state();
+
+        // Override the app config to include a health check path.
+        {
+            let mut apps = state.apps.write().await;
+            let cfg = apps.get_mut(APP_NAME).expect("test app exists");
+            cfg.health = HealthConfig {
+                path: Some("/healthz".to_string()),
+                ..Default::default()
+            };
+        }
+
+        // Runtime state: running, but port 1 has no listener → connection
+        // refused immediately (no 2s timeout wait).
+        {
+            let mut app_states = state.app_states.write().await;
+            app_states.insert(
+                APP_NAME.to_string(),
+                AppRuntimeState {
+                    status: AppStatus::Running,
+                    current_tag: Some("v1.0.0".to_string()),
+                    current_container_id: Some("abc123".to_string()),
+                    current_port: Some(1), // nothing listening → refused
+                    deployed_at: Some(Utc::now()),
+                    kind: Some("container".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/status"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // App is running but health probe fails.
+        assert_eq!(payload["status"], "running");
+        assert_eq!(payload["health"]["status"], "unhealthy");
+        assert_eq!(payload["health"]["path"], "/healthz");
+        assert!(
+            payload["health"]["last_check"].is_string(),
+            "last_check should be timestamped"
+        );
+    }
+
+    /// Scenario 3: Drifted config.
+    /// The `last_applied` snapshot differs from the current server config (image
+    /// was changed out-of-band). The status output must show
+    /// `config_drift: true` so an operator knows the server config no longer
+    /// matches what was last applied. Also verifies the no-baseline case
+    /// (`last_applied: None` → `config_drift: null`).
+    #[tokio::test]
+    async fn test_app_status_config_drift() {
+        let state = create_test_state();
+
+        // Build a last_applied snapshot from the current config, then mutate
+        // the server config so they differ (simulating an out-of-band change).
+        let current_cfg = state
+            .apps
+            .read()
+            .await
+            .get(APP_NAME)
+            .cloned()
+            .expect("test app exists");
+        let last_applied_json =
+            serde_json::to_string(&AppResponse::from(&current_cfg)).expect("serialize AppResponse");
+
+        // Mutate the server config: change the image to simulate drift.
+        {
+            let mut apps = state.apps.write().await;
+            let cfg = apps.get_mut(APP_NAME).expect("test app exists");
+            cfg.app.image = "ghcr.io/org/different-image".to_string();
+        }
+
+        // Runtime state with the old last_applied snapshot.
+        {
+            let mut app_states = state.app_states.write().await;
+            app_states.insert(
+                APP_NAME.to_string(),
+                AppRuntimeState {
+                    status: AppStatus::Running,
+                    current_tag: Some("v1.0.0".to_string()),
+                    current_container_id: Some("abc123".to_string()),
+                    current_port: Some(54321),
+                    deployed_at: Some(Utc::now()),
+                    kind: Some("container".to_string()),
+                    last_applied: Some(last_applied_json),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/status"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // Drift detected: server config differs from last_applied.
+        assert_eq!(
+            payload["config_drift"], true,
+            "config_drift should be true when server config differs from last_applied"
+        );
+
+        // ── No-baseline case: last_applied = None → config_drift = null ──────
+        let state2 = create_test_state();
+        {
+            let mut app_states = state2.app_states.write().await;
+            app_states.insert(
+                APP_NAME.to_string(),
+                AppRuntimeState {
+                    status: AppStatus::Running,
+                    current_tag: Some("v1.0.0".to_string()),
+                    current_container_id: Some("abc123".to_string()),
+                    current_port: Some(54321),
+                    deployed_at: Some(Utc::now()),
+                    kind: Some("container".to_string()),
+                    last_applied: None, // no baseline
+                    ..Default::default()
+                },
+            );
+        }
+        let app2 = build_router(state2);
+        let request2 = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/status"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+        let response2 = app2.oneshot(request2).await.unwrap();
+        let bytes2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
+        assert!(
+            payload2["config_drift"].is_null(),
+            "config_drift should be null when no last_applied baseline exists"
+        );
+
+        // ── In-sync case: last_applied matches current → config_drift = false
+        let state3 = create_test_state();
+        let synced_json = serde_json::to_string(&AppResponse::from(
+            &state3.apps.read().await.get(APP_NAME).cloned().unwrap(),
+        ))
+        .unwrap();
+        {
+            let mut app_states = state3.app_states.write().await;
+            app_states.insert(
+                APP_NAME.to_string(),
+                AppRuntimeState {
+                    status: AppStatus::Running,
+                    current_tag: Some("v1.0.0".to_string()),
+                    current_container_id: Some("abc123".to_string()),
+                    current_port: Some(54321),
+                    deployed_at: Some(Utc::now()),
+                    kind: Some("container".to_string()),
+                    last_applied: Some(synced_json),
+                    ..Default::default()
+                },
+            );
+        }
+        let app3 = build_router(state3);
+        let request3 = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/status"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+        let response3 = app3.oneshot(request3).await.unwrap();
+        let bytes3 = axum::body::to_bytes(response3.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload3: serde_json::Value = serde_json::from_slice(&bytes3).unwrap();
+        assert_eq!(
+            payload3["config_drift"], false,
+            "config_drift should be false when last_applied matches current config"
+        );
     }
 }

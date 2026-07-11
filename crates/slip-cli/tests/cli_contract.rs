@@ -31,29 +31,172 @@ fn bad_flag_exits_usage() {
         .stderr(predicate::str::contains("error"));
 }
 
-// ─── Stub commands (Phase 2) ──────────────────────────────────────────────────
+// ─── Status command ───────────────────────────────────────────────────────────
 
 #[test]
-fn status_stub_exits_nonzero() {
+fn status_without_token_exits_auth() {
     let mut cmd = Command::cargo_bin("slip").unwrap();
     let assert = cmd.arg("status").assert();
 
     assert
         .failure()
-        .code(output::GENERIC)
-        .stderr(predicate::str::contains("not yet implemented"));
+        .code(output::AUTH)
+        .stderr(predicate::str::contains("SLIP_TOKEN"));
 }
 
 #[test]
-fn status_json_emits_valid_json() {
+fn status_with_token_connection_error_exits_generic() {
     let mut cmd = Command::cargo_bin("slip").unwrap();
-    let assert = cmd.args(["status", "--json"]).assert();
+    let assert = cmd
+        .args([
+            "status",
+            "--token",
+            "test-token",
+            "--server",
+            "http://127.0.0.1:1",
+        ])
+        .assert();
 
     assert
         .failure()
         .code(output::GENERIC)
-        .stdout(predicate::str::contains(r#""status":"not_implemented""#))
-        .stdout(predicate::str::contains(r#""command":"status all apps""#));
+        .stderr(predicate::str::contains("can't reach slipd"));
+}
+
+#[test]
+fn status_json_with_token_connection_error_exits_generic() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "status",
+            "--json",
+            "--token",
+            "test-token",
+            "--server",
+            "http://127.0.0.1:1",
+        ])
+        .assert();
+
+    assert
+        .failure()
+        .code(output::GENERIC)
+        .stderr(predicate::str::contains("can't reach slipd"));
+}
+
+// ─── Status command: debugging scenarios (SLIP-100 acceptance criteria) ───────
+//
+// These verify the CLI renders the diagnostic info from `slip status <app>`
+// so the three debugging scenarios are answerable from CLI output alone.
+
+/// Stuck deploy: the --json output must carry the deploying status and the
+/// non-terminal last_deploy phase.
+#[test]
+fn status_app_stuck_deploy_json_shows_deploying() {
+    let canned = serde_json::json!({
+        "status": "deploying",
+        "tag": "v2.0.0",
+        "container_id": "newcid456",
+        "port": 54321,
+        "kind": "container",
+        "deploy_id": "dep_stuck001",
+        "triggered_by": "webhook",
+        "last_deploy": {
+            "deploy_id": "dep_stuck001",
+            "app": "myapp",
+            "tag": "v2.0.0",
+            "status": "health_checking",
+            "triggered_by": "webhook"
+        }
+    });
+    let url = start_mock_server_with_app_status(canned);
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "status",
+            "myapp",
+            "--json",
+            "--token",
+            "test-token",
+            "--server",
+            &url,
+        ])
+        .assert();
+
+    let stdout = assert.success().get_output().stdout.clone();
+    let parsed: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(parsed["status"], "deploying");
+    assert_eq!(parsed["last_deploy"]["status"], "health_checking");
+}
+
+/// Failed health: the --json output must carry health.status = "unhealthy".
+#[test]
+fn status_app_failed_health_json_shows_unhealthy() {
+    let canned = serde_json::json!({
+        "status": "running",
+        "tag": "v1.0.0",
+        "container_id": "abc123",
+        "port": 8080,
+        "kind": "container",
+        "health": {
+            "path": "/healthz",
+            "retries": 3,
+            "status": "unhealthy",
+            "last_check": "2026-07-11T14:30:00Z"
+        }
+    });
+    let url = start_mock_server_with_app_status(canned);
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "status",
+            "myapp",
+            "--json",
+            "--token",
+            "test-token",
+            "--server",
+            &url,
+        ])
+        .assert();
+
+    let stdout = assert.success().get_output().stdout.clone();
+    let parsed: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(parsed["status"], "running");
+    assert_eq!(parsed["health"]["status"], "unhealthy");
+    assert_eq!(parsed["health"]["path"], "/healthz");
+}
+
+/// Drifted config: the --json output must carry config_drift = true.
+#[test]
+fn status_app_config_drift_json_shows_drift() {
+    let canned = serde_json::json!({
+        "status": "running",
+        "tag": "v1.0.0",
+        "container_id": "abc123",
+        "port": 8080,
+        "kind": "container",
+        "config_drift": true
+    });
+    let url = start_mock_server_with_app_status(canned);
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "status",
+            "myapp",
+            "--json",
+            "--token",
+            "test-token",
+            "--server",
+            &url,
+        ])
+        .assert();
+
+    let stdout = assert.success().get_output().stdout.clone();
+    let parsed: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(parsed["status"], "running");
+    assert_eq!(parsed["config_drift"], true);
 }
 
 // ─── Init command ────────────────────────────────────────────────────────────────
@@ -1339,14 +1482,25 @@ fn apps_list_shows_deprecation_warning() {
 
 #[test]
 fn json_output_is_parseable() {
+    // `slip server init --json` emits parseable JSON.
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("etc/slip");
+    let systemd_dir = tmp.path().join("etc/systemd/system");
+    let env_file = config_dir.join("slip.env");
+
     let mut cmd = Command::cargo_bin("slip").unwrap();
-    let assert = cmd.args(["status", "--json"]).assert();
+    let assert = cmd
+        .env("SLIP_TEST_CONFIG_DIR", config_dir.to_str().unwrap())
+        .env("SLIP_TEST_SYSTEMD_DIR", systemd_dir.to_str().unwrap())
+        .env("SLIP_TEST_ENV_FILE", env_file.to_str().unwrap())
+        .env("SLIP_TEST_MANIFEST_DIR", tmp.path().to_str().unwrap())
+        .args(["server", "init", "--yes", "--json", "--skip-verify"])
+        .assert();
 
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-
-    assert_eq!(parsed["status"], "not_implemented");
-    assert_eq!(parsed["command"], "status all apps");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout should be valid JSON: {e}\nstdout: {stdout}"));
+    assert!(parsed.get("manifest").is_some());
 }
 
 // ─── Key command ────────────────────────────────────────────────────────────────
@@ -1780,6 +1934,39 @@ fn start_mock_server_with_apps(initial_apps: Vec<(&str, Value)>) -> String {
 
 fn start_mock_server() -> String {
     start_mock_server_with_apps(vec![])
+}
+
+/// Start a mock axum server that serves a canned per-app status response at
+/// `GET /v1/apps/{name}/status`. Used for the SLIP-100 debugging-scenario
+/// CLI contract tests.
+fn start_mock_server_with_app_status(status_json: Value) -> String {
+    let state = std::sync::Arc::new(status_json);
+
+    let app = Router::new().route(
+        "/v1/apps/{name}/status",
+        get({
+            let state = state.clone();
+            move |axum::extract::Path(_name): axum::extract::Path<String>| {
+                let state = state.clone();
+                async move { (axum::http::StatusCode::OK, Json((*state).clone())) }
+            }
+        }),
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener =
+        rt.block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() });
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{}", addr);
+    std::thread::spawn(move || {
+        rt.block_on(async {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    url
 }
 
 fn make_slip_toml(name: &str, image: &str, domain: &str) -> String {

@@ -6,8 +6,8 @@ use std::pin::Pin;
 use bollard::Docker;
 use bollard::auth::DockerCredentials;
 use bollard::container::{
-    Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
-    StopContainerOptions,
+    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
+    StartContainerOptions, StopContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::ResourceConfig;
 use crate::error::{DockerError, RuntimeError};
-use crate::runtime::{RegistryCredentials, RuntimeBackend};
+use crate::runtime::{ContainerInfo, RegistryCredentials, RuntimeBackend};
 
 /// A thin wrapper around [`bollard::Docker`] providing higher-level container
 /// lifecycle operations used by the slip deploy daemon.
@@ -456,6 +456,45 @@ impl DockerClient {
         info!(name, "network created");
         Ok(())
     }
+
+    /// List containers matching a `label_key=label_value` filter.
+    ///
+    /// Returns all containers (any state) matching the filter, with their ID
+    /// (short form), name, state, and the `slip.tag` label if present.
+    pub async fn list_by_label(
+        &self,
+        label_key: &str,
+        label_value: &str,
+    ) -> Result<Vec<ContainerInfo>, DockerError> {
+        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+        filters.insert(
+            "label".to_string(),
+            vec![format!("{label_key}={label_value}")],
+        );
+
+        let options = Some(ListContainersOptions::<String> {
+            all: true,
+            filters,
+            ..Default::default()
+        });
+
+        let containers = self.docker.list_containers(options).await?;
+
+        let result: Vec<ContainerInfo> = containers
+            .into_iter()
+            .map(|c| ContainerInfo {
+                id: c.id.unwrap_or_default().chars().take(12).collect(),
+                name: c
+                    .names
+                    .and_then(|n| n.into_iter().next())
+                    .map(|s| s.trim_start_matches('/').to_string()),
+                state: c.state.unwrap_or_else(|| "unknown".to_string()),
+                tag: c.labels.and_then(|l| l.get("slip.tag").cloned()),
+            })
+            .collect();
+
+        Ok(result)
+    }
 }
 
 // ─── Tar extraction helper ────────────────────────────────────────────────────
@@ -708,6 +747,20 @@ impl RuntimeBackend for DockerClient {
             }
 
             Ok(output_buf)
+        })
+    }
+
+    fn list_by_label<'a>(
+        &'a self,
+        label_key: &'a str,
+        label_value: &'a str,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<ContainerInfo>, RuntimeError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            DockerClient::list_by_label(self, label_key, label_value)
+                .await
+                .map_err(RuntimeError::from)
         })
     }
 }

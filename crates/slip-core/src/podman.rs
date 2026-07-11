@@ -11,8 +11,8 @@ use std::pin::Pin;
 use bollard::Docker;
 use bollard::auth::DockerCredentials;
 use bollard::container::{
-    Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
-    StopContainerOptions,
+    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
+    StartContainerOptions, StopContainerOptions,
 };
 use bollard::image::CreateImageOptions;
 use bollard::models::{
@@ -28,7 +28,7 @@ use crate::docker::{
     extract_file_from_tar, extract_host_port, parse_cpu_limit, parse_memory_limit,
 };
 use crate::error::RuntimeError;
-use crate::runtime::{PodInfo, RegistryCredentials, RuntimeBackend};
+use crate::runtime::{ContainerInfo, PodInfo, RegistryCredentials, RuntimeBackend};
 
 /// Podman container runtime backend.
 ///
@@ -670,6 +670,49 @@ impl RuntimeBackend for PodmanBackend {
             let bytes = bytes_result?;
             extract_file_from_tar(&bytes, path)
                 .map_err(|e| RuntimeError::ContainerError(e.to_string()))
+        })
+    }
+
+    fn list_by_label<'a>(
+        &'a self,
+        label_key: &'a str,
+        label_value: &'a str,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<ContainerInfo>, RuntimeError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+            filters.insert(
+                "label".to_string(),
+                vec![format!("{label_key}={label_value}")],
+            );
+
+            let options = Some(ListContainersOptions::<String> {
+                all: true,
+                filters,
+                ..Default::default()
+            });
+
+            let containers = self
+                .client
+                .list_containers(options)
+                .await
+                .map_err(|e| RuntimeError::ContainerError(e.to_string()))?;
+
+            let result: Vec<ContainerInfo> = containers
+                .into_iter()
+                .map(|c| ContainerInfo {
+                    id: c.id.unwrap_or_default().chars().take(12).collect(),
+                    name: c
+                        .names
+                        .and_then(|n| n.into_iter().next())
+                        .map(|s| s.trim_start_matches('/').to_string()),
+                    state: c.state.unwrap_or_else(|| "unknown".to_string()),
+                    tag: c.labels.and_then(|l| l.get("slip.tag").cloned()),
+                })
+                .collect();
+
+            Ok(result)
         })
     }
 }

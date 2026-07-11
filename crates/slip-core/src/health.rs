@@ -43,6 +43,11 @@ impl HealthChecker {
         }
     }
 
+    /// Borrow the internal HTTP client (used by `slip status` for sync probes).
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
     /// Check the health of a container listening on `host_port`.
     ///
     /// - If `config.path` is `None` → waits for `start_period` then returns `Ok(())`.
