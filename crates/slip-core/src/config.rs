@@ -634,6 +634,49 @@ pub fn resolve_env_vars(input: &str) -> Result<String, ConfigError> {
     Ok(result)
 }
 
+/// Resolve `${VAR_NAME}` placeholders in `input`, collecting unresolved names
+/// as warnings instead of erroring.
+///
+/// This is the `slip doctor` / `slipd --check` variant (FR §3.10): the running
+/// service is fine (it has the env via the systemd `EnvironmentFile`); a manual
+/// check that doesn't load the env file should warn, not error. Unresolved
+/// placeholders are left in place verbatim and their names are returned in
+/// `unresolved` so the caller can report them.
+pub fn resolve_env_vars_warn(input: &str) -> (String, Vec<String>) {
+    static ENV_VAR_REGEX: OnceLock<Regex> = OnceLock::new();
+    let re = ENV_VAR_REGEX.get_or_init(|| Regex::new(r"\$\{([^}]+)\}").expect("valid regex"));
+
+    let mut result = input.to_owned();
+    let mut unresolved: Vec<String> = Vec::new();
+    let vars: Vec<(String, String)> = re
+        .captures_iter(input)
+        .map(|cap| {
+            let full = cap[0].to_owned();
+            let name = cap[1].to_owned();
+            (full, name)
+        })
+        .collect();
+
+    for (placeholder, var_name) in vars {
+        if var_name.is_empty() {
+            unresolved.push(String::new());
+            continue;
+        }
+        match std::env::var(&var_name) {
+            Ok(value) => {
+                result = result.replace(&placeholder, &value);
+            }
+            Err(_) => {
+                unresolved.push(var_name);
+                // Leave the placeholder in place so it's visible in any
+                // rendered config text.
+            }
+        }
+    }
+
+    (result, unresolved)
+}
+
 // ─── Strategy validation ───────────────────────────────────────────────────────
 
 /// Validate that `DeployConfig.strategy` is a known value.
@@ -1303,6 +1346,38 @@ port = 3000
     fn resolve_env_vars_no_placeholders() {
         let result = resolve_env_vars("plain string without vars").unwrap();
         assert_eq!(result, "plain string without vars");
+    }
+
+    #[test]
+    fn resolve_env_vars_warn_unresolved_collects_names() {
+        // SAFETY: single-threaded test, no concurrent env access.
+        unsafe { std::env::remove_var("SLIP_DEFINITELY_NOT_SET_WARN") };
+        let (resolved, unresolved) = resolve_env_vars_warn("token=${SLIP_DEFINITELY_NOT_SET_WARN}");
+        // Placeholder left in place.
+        assert_eq!(resolved, "token=${SLIP_DEFINITELY_NOT_SET_WARN}");
+        assert_eq!(unresolved, vec!["SLIP_DEFINITELY_NOT_SET_WARN".to_string()]);
+    }
+
+    #[test]
+    fn resolve_env_vars_warn_resolved_does_not_warn() {
+        // SAFETY: single-threaded test, no concurrent env access.
+        unsafe { std::env::set_var("SLIP_TEST_VAR_WARN_OK", "ok") };
+        let (resolved, unresolved) = resolve_env_vars_warn("v=${SLIP_TEST_VAR_WARN_OK}");
+        assert_eq!(resolved, "v=ok");
+        assert!(unresolved.is_empty());
+    }
+
+    #[test]
+    fn resolve_env_vars_warn_multiple_mixed() {
+        // SAFETY: single-threaded test, no concurrent env access.
+        unsafe {
+            std::env::set_var("SLIP_TEST_VAR_WARN_MIX_A", "a");
+            std::env::remove_var("SLIP_TEST_VAR_WARN_MIX_B");
+        }
+        let (resolved, unresolved) =
+            resolve_env_vars_warn("${SLIP_TEST_VAR_WARN_MIX_A}_${SLIP_TEST_VAR_WARN_MIX_B}");
+        assert_eq!(resolved, "a_${SLIP_TEST_VAR_WARN_MIX_B}");
+        assert_eq!(unresolved, vec!["SLIP_TEST_VAR_WARN_MIX_B".to_string()]);
     }
 
     // ── load_config filesystem tests ─────────────────────────────────────────

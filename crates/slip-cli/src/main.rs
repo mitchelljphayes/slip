@@ -10,6 +10,7 @@ use tokio::io::AsyncBufReadExt;
 #[allow(dead_code)]
 mod output;
 
+mod doctor_cmd;
 mod server_init;
 
 /// slip CLI — manage apps, deploys, secrets, and status.
@@ -154,7 +155,29 @@ enum Commands {
     #[command(subcommand)]
     Registry(RegistryCommands),
     /// Diagnose slipd health and configuration.
-    Doctor,
+    Doctor {
+        /// Apply safe remediations (UFW bridge DNS rule only, today).
+        ///
+        /// Requires root. In non-interactive / `--json` mode, also pass `--yes`.
+        #[arg(long)]
+        fix: bool,
+
+        /// With `--fix`: print the exact commands that would be run and exit
+        /// without mutating anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// With `--fix`: skip the interactive confirmation prompt. Required
+        /// in non-TTY and `--json` mode to apply any mutation.
+        #[arg(long)]
+        yes: bool,
+
+        /// Per-check timeout in seconds (default 10) and global deadline
+        /// (default 60). A timed-out check is `fail`; a global timeout exits
+        /// with code 6.
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+    },
     /// Manage applications (deprecated: use `slip apply` instead).
     #[command(subcommand, hide = true)]
     Apps(AppsCommands),
@@ -2643,8 +2666,22 @@ async fn main() -> anyhow::Result<()> {
                 output::not_implemented("registry login", cli.json);
             }
         },
-        Commands::Doctor => {
-            output::not_implemented("doctor", cli.json);
+        Commands::Doctor {
+            fix,
+            dry_run,
+            yes,
+            timeout,
+        } => {
+            doctor_cmd::run(doctor_cmd::DoctorArgs {
+                json: cli.json,
+                fix,
+                dry_run,
+                yes,
+                timeout,
+                server: resolve_server(&cli.server),
+                token: cli.token.clone(),
+            })
+            .await;
         }
 
         // ── Working commands ────────────────────────────────────────────────
