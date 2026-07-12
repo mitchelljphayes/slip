@@ -168,6 +168,20 @@ mkdir -p "$CONFIG_DIR/apps"
 mkdir -p "$DATA_DIR/state" "$DATA_DIR/secrets" "$DATA_DIR/volumes"
 chown -R "$SERVICE_USER":"$SERVICE_USER" "$DATA_DIR" "$CONFIG_DIR"
 
+# ─── UFW bridge DNS rule — NOT added here (SLIP-102 follow-up) ────────────────
+# The FR §3.8 remedy (`ufw allow in on <bridge> to any port 53`) requires the
+# slip network's bridge interface name, which only exists after slipd's
+# `ensure_network` runs on first start (slipd/src/main.rs:135). At install.sh
+# time the network doesn't exist yet, so we can't name the bridge.
+#
+# The immediate remedy path is `sudo slip doctor --fix`, which detects the
+# missing rule and applies it (with confirmation + rollback). The right home
+# for automatic install-time UFW setup is `slip server init`'s post-bootstrap
+# phase (after slipd has created the network) — tracked as a SLIP-102
+# follow-up ticket. See `slip doctor --help` and
+# `.opencode/sessions/2026-07-12_09-55-18_SLIP-102_slip-doctor/plan.md` for
+# the full rationale.
+
 info ""
 info "✅ slip $VERSION installed successfully!"
 info ""

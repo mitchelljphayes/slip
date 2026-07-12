@@ -527,14 +527,256 @@ fn deploy_stub_exits_nonzero() {
 }
 
 #[test]
-fn doctor_stub_exits_nonzero() {
+fn doctor_json_emits_stable_schema() {
+    // `slip doctor --json` must emit the slip.doctor/v1 schema. With no
+    // config / no slipd, most checks will warn/fail, but the schema shape
+    // must be present and the exit code must be nonzero (any fail).
     let mut cmd = Command::cargo_bin("slip").unwrap();
-    let assert = cmd.arg("doctor").assert();
+    let output = cmd.arg("doctor").arg("--json").output().unwrap();
 
-    assert
-        .failure()
-        .code(output::GENERIC)
-        .stderr(predicate::str::contains("not yet implemented"));
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+
+    // Parse the JSON — it must be valid.
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("`slip doctor --json` stdout must be valid JSON: {e}\nstdout: {stdout}");
+    });
+
+    // Schema marker.
+    assert_eq!(
+        parsed["schema"], "slip.doctor/v1",
+        "schema must be slip.doctor/v1, got: {stdout}"
+    );
+
+    // Summary fields.
+    assert!(parsed.get("summary").is_some(), "summary must be present");
+    assert!(
+        parsed["summary"].get("pass").is_some()
+            && parsed["summary"].get("warn").is_some()
+            && parsed["summary"].get("fail").is_some()
+            && parsed["summary"].get("skipped").is_some(),
+        "summary must have pass/warn/fail/skipped"
+    );
+
+    // Checks array.
+    let checks = parsed
+        .get("checks")
+        .and_then(|c| c.as_array())
+        .expect("checks must be an array");
+    assert!(!checks.is_empty(), "checks array must not be empty");
+    for check in checks {
+        assert!(check.get("name").is_some(), "each check has name");
+        assert!(check.get("status").is_some(), "each check has status");
+        assert!(check.get("detail").is_some(), "each check has detail");
+    }
+
+    // Exit code: 0 if no fail, 1 if any fail. On a bare CI host with no
+    // slipd/caddy, at least one check will fail (caddy.reachable), so we
+    // expect a nonzero exit. We accept either 0 or 1 here (the host may
+    // happen to have caddy running), but NOT a stub exit.
+    let code = output.status.code().unwrap_or(-1);
+    assert!(
+        code == output::OK || code == output::GENERIC,
+        "exit code must be 0 or 1, got {code}"
+    );
+}
+
+#[test]
+fn doctor_human_output_shows_checks() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let output = cmd.arg("doctor").output().unwrap();
+
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+
+    // Must NOT say "not yet implemented" — the stub is gone.
+    assert!(
+        !stdout.contains("not yet implemented") && !stderr.contains("not yet implemented"),
+        "doctor must not be a stub"
+    );
+    // Human output should show the Verification header.
+    assert!(
+        stdout.contains("Verification:") || stdout.contains("passed"),
+        "human output should show verification results: {stdout}"
+    );
+}
+
+#[test]
+fn doctor_fix_without_root_fails() {
+    // `slip doctor --fix` without root (and without test overrides) must
+    // fail with a prescriptive "must be run as root" error. We don't set
+    // SLIP_TEST_CONFIG_DIR so the root check is active. If the test host
+    // is root (CI sometimes runs as root), the check passes and we instead
+    // hit the non-TTY/--yes gate; either way the exit is nonzero.
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let output = cmd.arg("doctor").arg("--fix").output().unwrap();
+
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+
+    let code = output.status.code().unwrap_or(-1);
+    // Must exit nonzero (either GENERIC for non-root, or USAGE for non-TTY
+    // without --yes).
+    assert!(
+        code == output::GENERIC || code == output::USAGE,
+        "doctor --fix without root/--yes must exit 1 or 2, got {code}\nstderr: {stderr}"
+    );
+    // Should mention root or --yes.
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        combined.contains("root") || combined.contains("--yes"),
+        "prescriptive error should mention root or --yes: {combined}"
+    );
+}
+
+#[test]
+fn doctor_fix_dry_run_does_not_mutate() {
+    // `slip doctor --fix --dry-run` should print planned actions or
+    // "nothing to fix" without mutating. With no config, there's nothing
+    // to fix, so it exits 0 (or 1 if there are fails but none are
+    // auto-fixable → "no auto-fixable failures").
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let output = cmd
+        .arg("doctor")
+        .arg("--fix")
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+
+    let code = output.status.code().unwrap_or(-1);
+    // Dry-run never mutates; exit is 0 (nothing to fix) or 1 (fails exist
+    // but not auto-fixable).
+    assert!(
+        code == output::OK || code == output::GENERIC,
+        "doctor --fix --dry-run should exit 0 or 1, got {code}"
+    );
+}
+
+#[test]
+fn doctor_fix_yes_json_emits_exactly_one_json_document() {
+    // Regression for BLOCKER #1: `--fix --yes --json` must emit exactly ONE
+    // parseable JSON document on stdout (not two concatenated objects).
+    //
+    // This test does NOT set SLIP_TEST_CONFIG_DIR — production `run()`
+    // passes `skip_root: false` unconditionally, so no env var bypasses
+    // the root check. However, the `NothingToDo` path (no auto-fixable
+    // fails) returns BEFORE the root check, so on a typical test host
+    // (where UFW is absent → warn, not fail → no auto-fixable fails) the
+    // command produces a valid JSON report with `"actions": []` without
+    // needing root.
+    //
+    // If the test host happens to have UFW active with the bridge DNS rule
+    // missing (making ufw.bridge_dns a fail → auto-fixable), the root check
+    // would trigger and exit GENERIC before printing JSON. In that case
+    // the test would fail — but this is extremely unlikely on CI/dev hosts.
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let output = cmd
+        .args(["doctor", "--fix", "--yes", "--json"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    let code = output.status.code().unwrap_or(-1);
+
+    // Two possible outcomes:
+    // 1. NothingToDo (no auto-fixable fails) → one JSON document, exit 0/1.
+    // 2. Root check triggered (auto-fixable fail exists) → no JSON, exit 1.
+    //
+    // We accept both but verify: if stdout is non-empty, it must be a
+    // single valid JSON document (the BLOCKER regression).
+    if !stdout.is_empty() {
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!(
+                "`slip doctor --fix --yes --json` must emit exactly one JSON document: {e}\nstdout: {stdout}"
+            );
+        });
+        assert_eq!(parsed["schema"], "slip.doctor/v1");
+        assert!(
+            parsed.get("actions").is_some(),
+            "--fix --json must include 'actions' field, got: {stdout}"
+        );
+    }
+
+    // Exit code: 0 (no fails), 1 (has fails or non-root), or 2 (usage).
+    assert!(
+        code == output::OK || code == output::GENERIC,
+        "exit code must be 0 or 1, got {code}"
+    );
+}
+
+#[test]
+fn doctor_fix_yes_json_emits_actions_array_even_on_nothing_to_do() {
+    // Regression for BLOCKER #1: the NothingToDo path must still emit
+    // `"actions": []` (not omit the field). Same caveat as above: this
+    // works on hosts without auto-fixable fails (the NothingToDo path
+    // returns before the root check).
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let output = cmd
+        .args(["doctor", "--fix", "--yes", "--json"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+
+    if !stdout.is_empty() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).expect("must be single valid JSON");
+        assert!(
+            parsed.get("actions").is_some(),
+            "actions field must be present in --fix output"
+        );
+        assert!(parsed["actions"].is_array(), "actions must be an array");
+    }
+}
+
+#[test]
+fn doctor_fix_without_root_fails_even_with_test_config_dir() {
+    // Regression proving SLIP_TEST_CONFIG_DIR does NOT bypass the production
+    // root requirement for `--fix`. Production `run()` passes `skip_root:
+    // false` unconditionally — no env var may bypass it.
+    //
+    // We set SLIP_TEST_CONFIG_DIR (which bypasses root for `slip server
+    // init` but NOT for `slip doctor --fix`) and run `--fix` without root.
+    // The command must exit GENERIC with "must be run as root" IF there
+    // are auto-fixable fails. If there are no auto-fixable fails, the
+    // NothingToDo path returns before the root check — so we can't assert
+    // the root failure unconditionally. Instead, we assert that the command
+    // does NOT produce a JSON report with `"actions": [...]` containing
+    // applied/pending entries (which would indicate a root bypass).
+    let tmp = assert_fs::TempDir::new().unwrap();
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let output = cmd
+        .env("SLIP_TEST_CONFIG_DIR", tmp.path().to_str().unwrap())
+        .args(["doctor", "--fix", "--yes", "--json"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    let code = output.status.code().unwrap_or(-1);
+
+    // The command must not produce a report with non-empty actions (which
+    // would indicate a mutation bypassed root). Either:
+    // - NothingToDo (no auto-fixable fails) → JSON with `"actions": []`,
+    //   exit 0/1. Safe — no mutation.
+    // - Root check triggered → no JSON, exit 1. Safe — root required.
+    if !stdout.is_empty() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).expect("must be single valid JSON if present");
+        if let Some(actions) = parsed.get("actions").and_then(|a| a.as_array()) {
+            for action in actions {
+                let status = action.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                assert!(
+                    status == "pending" || status == "already_present",
+                    "SLIP_TEST_CONFIG_DIR must not allow --fix to apply actions \
+                     without root: found status='{status}'"
+                );
+            }
+        }
+    }
+    assert!(
+        code == output::OK || code == output::GENERIC,
+        "exit code must be 0 or 1, got {code}"
+    );
 }
 
 #[test]

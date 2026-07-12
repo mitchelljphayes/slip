@@ -21,7 +21,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
-use serde::Serialize;
+
+use slip_core::doctor::{CheckStatus, VerificationCheck};
 
 use crate::output;
 
@@ -64,27 +65,10 @@ pub enum ForceTarget {
     All,
 }
 
-/// Status of a single verification check.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CheckStatus {
-    Pass,
-    Fail,
-    Warn,
-}
-
-/// A single verification check result.
-#[derive(Debug, Clone, Serialize)]
-pub struct VerificationCheck {
-    /// Stable snake_case identifier (for --json).
-    pub name: String,
-    /// Human-readable label.
-    pub label: String,
-    pub status: CheckStatus,
-    pub detail: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub remedy: Option<String>,
-}
+// `CheckStatus` and `VerificationCheck` are imported from `slip_core::doctor`
+// (see the `use` block at the top of this file). They used to be defined here;
+// promoting them to `slip-core` keeps `slip server init --verify` and
+// `slip doctor` on one shared schema (SLIP-102).
 
 // ─── Constants ─────────────────────────────────────────────────────────────────
 
@@ -877,6 +861,7 @@ fn print_verification(
                 CheckStatus::Pass => "✓",
                 CheckStatus::Fail => "✗",
                 CheckStatus::Warn => "⚠",
+                CheckStatus::Skipped => "–",
             };
             println!("  {icon} {} — {}", check.label, check.detail);
             if let Some(ref remedy) = check.remedy {

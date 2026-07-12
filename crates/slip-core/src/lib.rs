@@ -6,6 +6,7 @@ pub mod db;
 pub mod deploy;
 pub mod diff;
 pub mod docker;
+pub mod doctor;
 pub mod error;
 pub mod health;
 pub mod manifest;
@@ -26,16 +27,21 @@ pub use api::{
 };
 pub use caddy::{CaddyClient, ReverseProxy, RouteInfo};
 pub use config::{
-    AppConfig, AppInfo, AppPreviewConfig, CaddyConfig, CaddyTlsConfig, DeployConfig, EnvFileConfig,
-    HealthConfig, NetworkConfig, ReconcileConfig, RegistryConfig, ResourceConfig, RoutingConfig,
-    RuntimeConfig, ServerConfig, ServerPreviewConfig, SlipConfig, StorageConfig, VolumeConfig,
-    load_config, resolve_env_vars,
+    AppConfig, AppInfo, AppPreviewConfig, AuthConfig, CaddyConfig, CaddyTlsConfig, DeployConfig,
+    EnvFileConfig, HealthConfig, NetworkConfig, ReconcileConfig, RegistryConfig, ResourceConfig,
+    RoutingConfig, RuntimeConfig, ServerConfig, ServerDeployConfig, ServerPreviewConfig,
+    SlipConfig, StorageConfig, VolumeConfig, load_config, resolve_env_vars, resolve_env_vars_warn,
 };
 pub use db::Db;
 pub use deploy::{
     AppRuntimeState, AppStatus, DeployContext, DeployStatus, TriggerSource, execute_deploy,
 };
 pub use docker::{DockerClient, parse_cpu_limit, parse_memory_limit};
+pub use doctor::{
+    CheckStatus, CidrSet, DoctorAction, DoctorReport, Summary, VerificationCheck, aggregate_exit,
+    classify_dns_expectation, classify_ip, classify_ufw, fetch_cloudflare_ranges,
+    is_private_or_cgnat, parse_caddy_modules, render_human,
+};
 pub use error::{CaddyError, ConfigError, HealthError, RuntimeError};
 pub use health::{HealthCheck, HealthChecker};
 pub use manifest::{ManifestError, RenderContext, render_manifest};
