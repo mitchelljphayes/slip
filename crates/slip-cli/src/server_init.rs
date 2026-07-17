@@ -209,6 +209,7 @@ fn write_config(
     runtime: &str,
     listen: Option<&str>,
     admin_api: Option<&str>,
+    acme_email: Option<&str>,
 ) -> Result<PathBuf, anyhow::Error> {
     let path = dir.join(CONFIG_FILE_NAME);
     let temp_path = dir.join(format!(".{}.tmp", CONFIG_FILE_NAME));
@@ -222,7 +223,13 @@ fn write_config(
     toml.push_str("[runtime]\n");
     toml.push_str(&format!("backend = \"{runtime}\"\n\n"));
     toml.push_str("[caddy]\n");
-    toml.push_str(&format!("admin_api = \"{effective_admin}\"\n\n"));
+    toml.push_str(&format!("admin_api = \"{effective_admin}\"\n"));
+    if let Some(email) = acme_email {
+        // Escape backslashes and quotes for safe TOML string serialization.
+        let escaped = email.replace('\\', "\\\\").replace('"', "\\\"");
+        toml.push_str(&format!("acme_email = \"{escaped}\"\n"));
+    }
+    toml.push('\n');
     toml.push_str("[auth]\n");
     toml.push_str("secret = \"${SLIP_ADMIN_SECRET}\"\n\n");
     toml.push_str("[storage]\n");
@@ -379,6 +386,7 @@ fn emit_manifest(
     hostname: &str,
     listen: Option<&str>,
     admin_api: Option<&str>,
+    acme_email: Option<&str>,
 ) -> Result<PathBuf, anyhow::Error> {
     let dir = manifest_dir();
     let path = dir.join(format!("{hostname}.slip.toml"));
@@ -413,6 +421,10 @@ fn emit_manifest(
 
     toml.push_str("[caddy]\n");
     toml.push_str(&format!("admin_api = \"{effective_admin}\"\n"));
+    if let Some(email) = acme_email {
+        let escaped = email.replace('\\', "\\\\").replace('"', "\\\"");
+        toml.push_str(&format!("acme_email = \"{escaped}\"\n"));
+    }
 
     if let Some(ref domain) = opts.domain {
         toml.push_str("\n[deploy]\n");
@@ -450,6 +462,9 @@ fn parse_manifest(path: &Path) -> Result<ManifestValues, anyhow::Error> {
         result.admin_api = caddy
             .get("admin_api")
             .and_then(|v| v.as_str().map(String::from));
+        result.acme_email = caddy
+            .get("acme_email")
+            .and_then(|v| v.as_str().map(String::from));
     }
     if let Some(server) = value.get("server") {
         result.listen = server
@@ -472,6 +487,7 @@ struct ManifestValues {
     admin_api: Option<String>,
     listen: Option<String>,
     runtime: Option<String>,
+    acme_email: Option<String>,
 }
 
 /// Print next steps for the user.
@@ -940,16 +956,23 @@ fn resolve_admin_api(manifest: Option<&ManifestValues>) -> Option<String> {
     manifest.and_then(|m| m.admin_api.clone())
 }
 
+/// Resolve the effective ACME email: manifest value > None.
+fn resolve_acme_email(manifest: Option<&ManifestValues>) -> Option<String> {
+    manifest.and_then(|m| m.acme_email.clone())
+}
+
 /// Run the init flow with resolved values.
 ///
 /// `from_file` flag controls whether this is a disaster-recovery flow
 /// (secret always regenerated with loud warning).
+#[allow(clippy::too_many_arguments)]
 fn run_init(
     domain: Option<String>,
     tls: String,
     runtime: String,
     listen: Option<String>,
     admin_api: Option<String>,
+    acme_email: Option<String>,
     opts: &ServerInitOpts,
     from_file: bool,
 ) -> ! {
@@ -1002,6 +1025,7 @@ fn run_init(
             &runtime,
             listen.as_deref(),
             admin_api.as_deref(),
+            acme_email.as_deref(),
         )
         .unwrap_or_else(|e| {
             output::fail(
@@ -1119,6 +1143,7 @@ fn run_init(
                 &hostname,
                 listen.as_deref(),
                 admin_api.as_deref(),
+                acme_email.as_deref(),
             )
             .unwrap_or_else(|e| {
                 eprintln!("warning: failed to write manifest: {e}");
@@ -1162,6 +1187,7 @@ fn run_init(
         &hostname,
         listen.as_deref(),
         admin_api.as_deref(),
+        acme_email.as_deref(),
     )
     .unwrap_or_else(|e| {
         eprintln!("warning: failed to write manifest: {e}");
@@ -1235,6 +1261,7 @@ pub fn run(opts: ServerInitOpts) -> ! {
     let runtime = resolve_runtime(&opts, manifest.as_ref());
     let listen = resolve_listen(manifest.as_ref());
     let admin_api = resolve_admin_api(manifest.as_ref());
+    let acme_email = resolve_acme_email(manifest.as_ref());
 
     run_init(
         domain,
@@ -1242,6 +1269,7 @@ pub fn run(opts: ServerInitOpts) -> ! {
         runtime,
         listen,
         admin_api,
+        acme_email,
         &opts,
         opts.from_file.is_some(),
     )

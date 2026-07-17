@@ -18,6 +18,7 @@ pub mod repo_config;
 pub mod runtime;
 pub mod secrets;
 pub mod state;
+pub mod tailscale;
 pub mod validate;
 
 // Re-exports for convenience
@@ -25,12 +26,17 @@ pub use api::{
     AppResponse, AppState, DeployRequest, DeployResponse, DeploySummary, PreviewRequestInfo,
     StatusResponse, build_router,
 };
-pub use caddy::{CaddyClient, ReverseProxy, RouteInfo};
+pub use caddy::{
+    CaddyClient, ReverseProxy, RouteInfo, RouteTlsDecision, TlsClassification, build_tls_policy,
+    classify_host_tls, redact_external_error, resolve_route_tls, tls_policy_id,
+};
 pub use config::{
     AppConfig, AppInfo, AppPreviewConfig, AuthConfig, CaddyConfig, CaddyTlsConfig, DeployConfig,
     EnvFileConfig, HealthConfig, NetworkConfig, ReconcileConfig, RegistryConfig, ResourceConfig,
-    RoutingConfig, RuntimeConfig, ServerConfig, ServerDeployConfig, ServerPreviewConfig,
-    SlipConfig, StorageConfig, VolumeConfig, load_config, resolve_env_vars, resolve_env_vars_warn,
+    RouteEntry, RoutingConfig, RuntimeConfig, ServerConfig, ServerDeployConfig,
+    ServerPreviewConfig, SlipConfig, StorageConfig, TlsStrategy, VolumeConfig, is_ts_net_host,
+    load_config, resolve_acme_email, resolve_env_vars, resolve_env_vars_warn,
+    validate_tls_strategy,
 };
 pub use db::Db;
 pub use deploy::{
@@ -63,6 +69,11 @@ pub use state::{
     PersistedAppState, delete_preview_state, load_app_states, load_preview_states,
     reconcile_preview_routes, reconcile_routes, save_app_state, save_last_applied,
     save_preview_state, verify_containers,
+};
+pub use tailscale::{
+    TAILSCALED_ENV_FILE, TAILSCALED_SOCKET, TailscalePreflight, TailscalePreflightError,
+    check_caddy_user_permission, host_matches_cert_domains, parse_cert_domains,
+    parse_self_hostname, preflight_tailscale,
 };
 pub use validate::{
     ValidationError, ValidationResult, parse_and_validate, validate_image_refs,

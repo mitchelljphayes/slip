@@ -76,5 +76,16 @@ json-patch = { version = "4", features = ["diff"] }
 # Retry with backoff (Caddy reconcile loop)
 backon = "1"
 
+# TLS certificate probing (slip tls renew — reads served cert notAfter/fingerprint)
+# x509-parser: minimal X.509 DER parser for extracting notAfter/serial from leaf certs
+x509-parser = "0.18"
+# rustls: raw TLS handshake with SNI for cert probing (observation only, no verification)
+# default-features=false, ring only — avoids aws-lc-sys (requires cmake/nasm at build)
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pki-types = "1"
+# tokio-rustls: async TLS handshake (already in tree via reqwest, pinning explicitly)
+# default-features=false to avoid pulling in aws-lc-sys
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
 # Shared crate
 slip-core = { path = "crates/slip-core" }

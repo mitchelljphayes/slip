@@ -736,6 +736,7 @@ mod tests {
             preview: None,
             volumes: Vec::new(),
             routes: Vec::new(),
+            tls: None,
         }
     }
 
@@ -916,6 +917,7 @@ mod tests {
                     domain: Some("app1.example.com".to_string()),
                     port: Some(80),
                     routes: vec![],
+                    tls: None,
                 },
                 health: crate::config::HealthConfig::default(),
                 deploy: crate::config::DeployConfig::default(),
@@ -997,6 +999,7 @@ mod tests {
                     domain: Some("app1.example.com".to_string()),
                     port: Some(80),
                     routes: vec![],
+                    tls: None,
                 },
                 health: crate::config::HealthConfig::default(),
                 deploy: crate::config::DeployConfig::default(),

@@ -717,6 +717,7 @@ mod tests {
             preview: None,
             volumes: Vec::new(),
             routes: Vec::new(),
+            tls: None,
         };
         overrides(&mut resp);
         resp

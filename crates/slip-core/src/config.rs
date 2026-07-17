@@ -14,6 +14,102 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
 
+// ─── TLS strategy enum ────────────────────────────────────────────────────────
+
+/// TLS strategy for a host (deploy-webhook domain or per-app route).
+///
+/// Maps 1:1 to the Caddy automation policy builder in [`crate::caddy`].
+/// Wire format is kebab-case (`"internal"`, `"acme"`, `"cloudflare-dns01"`,
+/// `"tailscale"`) — matching the existing config strings.
+///
+/// - `Internal` — Caddy local CA (self-signed). Works on tailnet/non-public
+///   hosts; callers use `--insecure` or install the root CA.
+/// - `Acme` — Caddy default ACME (HTTP-01 + TLS-ALPN-01) against Let's Encrypt.
+///   Requires a public, reachable host + `acme_email`.
+/// - `CloudflareDns01` — ACME DNS-01 via the `caddy-dns/cloudflare` plugin.
+///   Requires the plugin compiled into Caddy + `{env.CF_API_TOKEN}` + email.
+/// - `Tailscale` — Caddy's built-in `tls.get_certificate.tailscale` manager
+///   (core, no plugin). Only valid for `*.ts.net` subjects. `tailscaled`
+///   handles issuance + renewal; slip does not shell out or write PEM files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TlsStrategy {
+    /// Caddy local CA (self-signed).
+    Internal,
+    /// ACME HTTP-01/TLS-ALPN-01 (Let's Encrypt, public host).
+    Acme,
+    /// ACME DNS-01 via Cloudflare (`caddy-dns/cloudflare` plugin required).
+    CloudflareDns01,
+    /// Caddy's built-in Tailscale certificate manager (`.ts.net` only).
+    Tailscale,
+}
+
+impl TlsStrategy {
+    /// Wire string for this strategy (matches the serde kebab-case form).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TlsStrategy::Internal => "internal",
+            TlsStrategy::Acme => "acme",
+            TlsStrategy::CloudflareDns01 => "cloudflare-dns01",
+            TlsStrategy::Tailscale => "tailscale",
+        }
+    }
+}
+
+impl std::fmt::Display for TlsStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TlsStrategy {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "internal" => Ok(TlsStrategy::Internal),
+            "acme" => Ok(TlsStrategy::Acme),
+            "cloudflare-dns01" => Ok(TlsStrategy::CloudflareDns01),
+            "tailscale" => Ok(TlsStrategy::Tailscale),
+            other => Err(format!(
+                "unknown TLS strategy '{other}' — valid: internal, acme, cloudflare-dns01, tailscale"
+            )),
+        }
+    }
+}
+
+// ─── TLD allowlist for auto-internal classification ───────────────────────────
+
+/// Conservative TLD allowlist for auto-internal classification.
+///
+/// A host whose last label matches one of these suffixes is classified
+/// as "non-public" and gets an `internal` CA policy when no explicit `tls`
+/// is configured. `.ts.net` is **deliberately excluded** — those hosts
+/// use Caddy's built-in Tailscale certificate manager, not internal CA.
+///
+/// Per best-practices Q3: RFC 6761 reserved + ICANN `.internal` + common
+/// home/lab TLDs. An operator can always override with explicit `tls`.
+pub const NON_PUBLIC_TLDS: &[&str] = &[
+    ".test",
+    ".example",
+    ".invalid",
+    ".localhost",
+    ".internal",
+    ".local",
+    ".lan",
+    ".home",
+    ".home.arpa",
+    ".corp",
+];
+
+/// True if `host` ends in `.ts.net` (after stripping a leading `*.` if present).
+///
+/// Used to gate the `tailscale` strategy (only valid for `.ts.net` subjects)
+/// and to exclude `.ts.net` from auto-internal classification.
+pub fn is_ts_net_host(host: &str) -> bool {
+    let h = host.strip_prefix("*.").unwrap_or(host);
+    h.ends_with(".ts.net") || h == "ts.net"
+}
+
 // ─── Custom duration deserializer ────────────────────────────────────────────
 
 /// Deserializes a human-readable duration string like "2s", "30s", "10s" into
@@ -157,8 +253,8 @@ fn default_network_name() -> String {
     "slip".to_owned()
 }
 
-fn default_deploy_tls() -> String {
-    "internal".to_owned()
+fn default_deploy_tls() -> TlsStrategy {
+    TlsStrategy::Internal
 }
 
 fn default_env() -> HashMap<String, String> {
@@ -218,11 +314,13 @@ pub struct ServerDeployConfig {
     pub domain: Option<String>,
     /// TLS strategy for the deploy webhook domain.
     ///
-    /// Defaults to `"internal"` (Caddy local CA, self-signed — works on
-    /// tailnet-only hosts with `--insecure` callers). Other strategies
-    /// (e.g. `"acme"`, `"cloudflare-dns01"`) land in a follow-up ticket.
+    /// Defaults to `internal` (Caddy local CA, self-signed — works on
+    /// tailnet-only hosts with `--insecure` callers). Other strategies:
+    /// `acme` (HTTP-01/TLS-ALPN-01), `cloudflare-dns01` (DNS-01 via
+    /// `caddy-dns/cloudflare`), `tailscale` (built-in manager, `.ts.net`
+    /// only).
     #[serde(default = "default_deploy_tls")]
-    pub tls: String,
+    pub tls: TlsStrategy,
 }
 
 impl Default for ServerDeployConfig {
@@ -240,6 +338,7 @@ impl Default for ServerDeployConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SlipConfig {
     pub server: ServerConfig,
+    #[serde(default)]
     pub caddy: CaddyConfig,
     pub auth: AuthConfig,
     pub registry: RegistryConfig,
@@ -294,6 +393,18 @@ impl Default for ServerConfig {
 pub struct CaddyConfig {
     #[serde(default = "default_caddy_admin_api")]
     pub admin_api: String,
+    /// Optional ACME contact email, applied to any `acme`/`cloudflare-dns01`
+    /// issuer policy that does not carry its own email. Falls back to
+    /// `[caddy.tls].email` if this is absent.
+    ///
+    /// Required (here or via fallback) when an `acme` or `cloudflare-dns01`
+    /// strategy is used. `internal` and `tailscale` strategies never need it.
+    #[serde(default)]
+    pub acme_email: Option<String>,
+    /// Optional ACME CA URL override (e.g. Let's Encrypt staging directory).
+    /// Defaults to the production Let's Encrypt directory when absent.
+    #[serde(default)]
+    pub acme_ca: Option<String>,
     /// Optional TLS configuration for wildcard certificates (e.g., for preview deployments).
     #[serde(default)]
     pub tls: Option<CaddyTlsConfig>,
@@ -371,6 +482,8 @@ impl Default for CaddyConfig {
     fn default() -> Self {
         Self {
             admin_api: default_caddy_admin_api(),
+            acme_email: None,
+            acme_ca: None,
             tls: None,
             reconcile: ReconcileConfig::default(),
         }
@@ -477,6 +590,14 @@ pub struct RouteEntry {
     /// Port to route to. If `None`, the port comes from the repo config.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Explicit TLS strategy override for this route's hostname.
+    ///
+    /// When `None`, the route inherits the auto-internal classification
+    /// (non-public TLD/IP literal → `internal`; public host → Caddy's
+    /// default automatic HTTPS, untouched). When `Some`, the explicit
+    /// strategy wins over classification.
+    #[serde(default)]
+    pub tls: Option<TlsStrategy>,
 }
 
 /// HTTP routing configuration.
@@ -496,6 +617,13 @@ pub struct RoutingConfig {
     /// When non-empty, takes precedence over `domain`/`port`.
     #[serde(default)]
     pub routes: Vec<RouteEntry>,
+    /// Explicit TLS strategy override applied to all routes in this config.
+    ///
+    /// When `Some`, this strategy is applied to every route's hostname unless
+    /// an individual `RouteEntry.tls` overrides it. When `None`, each route
+    /// falls through to auto-internal classification (absent TLS logic).
+    #[serde(default)]
+    pub tls: Option<TlsStrategy>,
 }
 
 impl RoutingConfig {
@@ -512,6 +640,7 @@ impl RoutingConfig {
             vec![RouteEntry {
                 hostname: domain.clone(),
                 port: self.port,
+                tls: self.tls,
             }]
         } else {
             vec![]
@@ -704,6 +833,84 @@ pub fn validate_deploy_strategy(deploy: &DeployConfig) -> Result<(), ConfigError
     Ok(())
 }
 
+// ─── TLS strategy validation ──────────────────────────────────────────────────
+
+/// Context for TLS strategy validation.
+pub struct ValidationCtx<'a> {
+    /// The resolved ACME email (from `[caddy] acme_email` or `[caddy.tls].email`).
+    pub acme_email: Option<&'a str>,
+}
+
+/// Validate a `TlsStrategy` for a given host.
+///
+/// - `Internal` → always ok.
+/// - `Acme` / `CloudflareDns01` → requires `acme_email` (resolved from
+///   `[caddy] acme_email` or `[caddy.tls].email` fallback). Prescriptive
+///   error if both are absent.
+/// - `Tailscale` → host must end in `.ts.net` (after stripping `*.`).
+///   Prescriptive error on non-`.ts.net` hosts.
+pub fn validate_tls_strategy(
+    s: &TlsStrategy,
+    host: Option<&str>,
+    ctx: &ValidationCtx,
+) -> Result<(), ConfigError> {
+    match s {
+        TlsStrategy::Internal => Ok(()),
+        TlsStrategy::Acme | TlsStrategy::CloudflareDns01 => {
+            if ctx.acme_email.is_none() {
+                return Err(ConfigError::Internal(format!(
+                    "TLS strategy '{s}' requires [caddy] acme_email — \
+                     set it in slip.toml, e.g. acme_email = \"you@example.com\". \
+                     (Fallback: [caddy.tls].email is also accepted.)"
+                )));
+            }
+            Ok(())
+        }
+        TlsStrategy::Tailscale => {
+            if let Some(h) = host
+                && !is_ts_net_host(h)
+            {
+                return Err(ConfigError::Internal(format!(
+                    "tailscale strategy requires a *.ts.net host — \
+                     '{h}' is not a Tailscale certificate domain; \
+                     use 'internal' or 'acme' instead"
+                )));
+            }
+            // CT log privacy warning (Tailscale KB 1153): enabling HTTPS
+            // publishes *.ts.net cert names to the public Certificate
+            // Transparency ledger.
+            tracing::warn!(
+                "Tailscale HTTPS certificates publish *.ts.net cert names to the \
+                 public Certificate Transparency ledger — do not enable if machine \
+                 names contain sensitive information (see Tailscale KB 1153)"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Resolve the ACME email from `[caddy] acme_email` → `[caddy.tls].email` fallback.
+///
+/// Returns the first non-None value. Used by both validation and the policy
+/// builder to populate the `email` field on ACME issuers.
+pub fn resolve_acme_email(config: &SlipConfig) -> Option<String> {
+    config
+        .caddy
+        .acme_email
+        .clone()
+        .or_else(|| config.caddy.tls.as_ref().map(|t| t.email.clone()))
+}
+
+/// Check if a DNS provider config key is likely to contain a secret.
+fn is_secret_like_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.contains("token")
+        || lower.contains("key")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("api_token")
+}
+
 // ─── Config loading ───────────────────────────────────────────────────────────
 
 /// Loads the daemon config from `{path}/slip.toml` and all app configs from
@@ -731,6 +938,36 @@ pub fn load_config(path: &Path) -> Result<(SlipConfig, HashMap<String, AppConfig
             "[caddy.reconcile] interval must be at least 1s — got {:?}",
             slip_cfg.caddy.reconcile.interval
         )));
+    }
+
+    // Validate deploy TLS strategy (if [deploy] is configured).
+    let acme_email = resolve_acme_email(&slip_cfg);
+    let validation_ctx = ValidationCtx {
+        acme_email: acme_email.as_deref(),
+    };
+    if let Some(deploy_cfg) = &slip_cfg.deploy
+        && let Some(domain) = deploy_cfg.domain.as_deref()
+    {
+        validate_tls_strategy(&deploy_cfg.tls, Some(domain), &validation_ctx)?;
+    }
+
+    // Validate DNS provider config: reject literal secrets (server-level).
+    if let Some(ref tls) = slip_cfg.caddy.tls
+        && let Some(ref table) = tls.dns_provider_config
+    {
+        for (key, value) in table {
+            if is_secret_like_key(key)
+                && let Some(s) = value.as_str()
+                && (!s.starts_with("{env.") || !s.ends_with('}'))
+            {
+                return Err(ConfigError::Internal(format!(
+                    "DNS provider config key '{key}' contains a literal value — \
+                     use the {{env.*}} placeholder syntax instead, \
+                     e.g. {key} = \"{{env.CF_API_TOKEN}}\". \
+                     Slip must never POST literal secrets to Caddy."
+                )));
+            }
+        }
     }
 
     // Resolve env vars in auth.secret
@@ -799,6 +1036,30 @@ pub fn load_config(path: &Path) -> Result<(SlipConfig, HashMap<String, AppConfig
 
             // Validate deploy strategy
             validate_deploy_strategy(&app_cfg.deploy)?;
+
+            // Validate TLS strategies on routing and route entries.
+            if let Some(routing_tls) = &app_cfg.routing.tls {
+                validate_tls_strategy(routing_tls, None, &validation_ctx)?;
+                // For inherited routing.tls = Tailscale, validate EVERY effective
+                // route hostname is .ts.net (not just routes with explicit tls).
+                if *routing_tls == TlsStrategy::Tailscale {
+                    for route in app_cfg.routing.effective_routes() {
+                        if !is_ts_net_host(&route.hostname) {
+                            return Err(ConfigError::Internal(format!(
+                                "tailscale strategy requires a *.ts.net host — \
+                                 route '{host}' is not a Tailscale certificate domain; \
+                                 use 'internal' or 'acme' instead",
+                                host = route.hostname
+                            )));
+                        }
+                    }
+                }
+            }
+            for route in &app_cfg.routing.routes {
+                if let Some(route_tls) = &route.tls {
+                    validate_tls_strategy(route_tls, Some(&route.hostname), &validation_ctx)?;
+                }
+            }
 
             apps.insert(app_cfg.app.name.clone(), app_cfg);
         }
@@ -1766,5 +2027,463 @@ port = 3000
 "#;
         let cfg: AppConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.deploy.timeout, None);
+    }
+
+    // ── TlsStrategy enum tests (SLIP-104 Phase 1) ───────────────────────────
+
+    #[test]
+    fn tls_strategy_serde_roundtrips_all_four_variants() {
+        for (s, v) in [
+            (TlsStrategy::Internal, "internal"),
+            (TlsStrategy::Acme, "acme"),
+            (TlsStrategy::CloudflareDns01, "cloudflare-dns01"),
+            (TlsStrategy::Tailscale, "tailscale"),
+        ] {
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(json, format!("\"{v}\""));
+            let parsed: TlsStrategy = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, s);
+        }
+    }
+
+    #[test]
+    fn tls_strategy_toml_roundtrips() {
+        let toml = r#"
+[app]
+name = "app"
+image = "img:latest"
+
+[routing]
+domain = "app.test"
+port = 80
+tls = "internal"
+
+[health]
+
+[deploy]
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.routing.tls, Some(TlsStrategy::Internal));
+    }
+
+    #[test]
+    fn tls_strategy_unknown_string_fails_at_deserialize() {
+        let toml = r#"
+[app]
+name = "app"
+image = "img:latest"
+
+[routing]
+domain = "app.test"
+port = 80
+tls = "bogus-strategy"
+
+[health]
+
+[deploy]
+"#;
+        let result: Result<AppConfig, _> = toml::from_str(toml);
+        assert!(result.is_err(), "unknown TLS strategy must fail to parse");
+    }
+
+    #[test]
+    fn tls_strategy_display_matches_wire_string() {
+        assert_eq!(TlsStrategy::Internal.to_string(), "internal");
+        assert_eq!(TlsStrategy::Acme.to_string(), "acme");
+        assert_eq!(TlsStrategy::CloudflareDns01.to_string(), "cloudflare-dns01");
+        assert_eq!(TlsStrategy::Tailscale.to_string(), "tailscale");
+    }
+
+    #[test]
+    fn is_ts_net_host_true_for_ts_net() {
+        assert!(is_ts_net_host("host.tailnet.ts.net"));
+        assert!(is_ts_net_host("machine.example.ts.net"));
+        // Wildcard subjects also match.
+        assert!(is_ts_net_host("*.tailnet.ts.net"));
+    }
+
+    #[test]
+    fn is_ts_net_host_false_for_non_ts_net() {
+        assert!(!is_ts_net_host("deploy.example.com"));
+        assert!(!is_ts_net_host("arrakeen.test"));
+        assert!(!is_ts_net_host("10.0.0.1"));
+    }
+
+    #[test]
+    fn validate_tls_strategy_internal_always_ok() {
+        let ctx = ValidationCtx { acme_email: None };
+        assert!(validate_tls_strategy(&TlsStrategy::Internal, Some("any.host"), &ctx).is_ok());
+        assert!(validate_tls_strategy(&TlsStrategy::Internal, None, &ctx).is_ok());
+    }
+
+    #[test]
+    fn validate_tls_strategy_acme_requires_email() {
+        let ctx = ValidationCtx { acme_email: None };
+        let err = validate_tls_strategy(&TlsStrategy::Acme, Some("deploy.example.com"), &ctx)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("acme_email"),
+            "error must name the remedy: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_tls_strategy_acme_ok_with_email_via_fallback() {
+        let ctx = ValidationCtx {
+            acme_email: Some("ops@example.com"),
+        };
+        assert!(
+            validate_tls_strategy(&TlsStrategy::Acme, Some("deploy.example.com"), &ctx).is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_tls_strategy_cloudflare_dns01_requires_email() {
+        let ctx = ValidationCtx { acme_email: None };
+        assert!(
+            validate_tls_strategy(&TlsStrategy::CloudflareDns01, Some("tailnet.ts.net"), &ctx)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_tls_strategy_tailscale_ok_for_ts_net_host() {
+        let ctx = ValidationCtx { acme_email: None };
+        assert!(
+            validate_tls_strategy(&TlsStrategy::Tailscale, Some("host.tailnet.ts.net"), &ctx)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_tls_strategy_tailscale_rejects_non_ts_net_host() {
+        let ctx = ValidationCtx { acme_email: None };
+        let err = validate_tls_strategy(&TlsStrategy::Tailscale, Some("deploy.example.com"), &ctx)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("*.ts.net"),
+            "error must mention the remedy: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_acme_email_prefers_top_level() {
+        let toml = r#"
+[server]
+
+[caddy]
+admin_api = "http://localhost:2019"
+acme_email = "top@example.com"
+
+[caddy.tls]
+email = "fallback@example.com"
+dns_provider = "cloudflare"
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        assert_eq!(resolve_acme_email(&cfg).as_deref(), Some("top@example.com"));
+    }
+
+    #[test]
+    fn resolve_acme_email_falls_back_to_caddy_tls_email() {
+        let toml = r#"
+[server]
+
+[caddy]
+admin_api = "http://localhost:2019"
+
+[caddy.tls]
+email = "fallback@example.com"
+dns_provider = "cloudflare"
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            resolve_acme_email(&cfg).as_deref(),
+            Some("fallback@example.com")
+        );
+    }
+
+    #[test]
+    fn resolve_acme_email_none_when_both_absent() {
+        let toml = r#"
+[server]
+
+[caddy]
+admin_api = "http://localhost:2019"
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        assert!(resolve_acme_email(&cfg).is_none());
+    }
+
+    #[test]
+    fn routing_config_without_tls_deserializes_to_none() {
+        let toml = r#"
+[app]
+name = "app"
+image = "img:latest"
+
+[routing]
+domain = "app.example.com"
+port = 80
+
+[health]
+
+[deploy]
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert!(
+            cfg.routing.tls.is_none(),
+            "absent tls must deserialize to None"
+        );
+    }
+
+    #[test]
+    fn route_entry_without_tls_deserializes_to_none() {
+        let toml = r#"
+[app]
+name = "multiapp"
+image = "web:latest"
+
+[[routing.routes]]
+hostname = "api.example.com"
+port = 3000
+
+[health]
+
+[deploy]
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.routing.routes.len(), 1);
+        assert!(cfg.routing.routes[0].tls.is_none());
+    }
+
+    #[test]
+    fn load_config_rejects_tailscale_on_non_ts_net_deploy_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+acme_email = "ops@example.com"
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+
+[deploy]
+domain = "deploy.example.com"
+tls = "tailscale"
+"#,
+        );
+        std::fs::create_dir(dir.path().join("apps")).unwrap();
+        let err = load_config(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("*.ts.net"),
+            "must mention ts.net remedy: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_config_rejects_acme_without_email() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+
+[deploy]
+domain = "deploy.example.com"
+tls = "acme"
+"#,
+        );
+        std::fs::create_dir(dir.path().join("apps")).unwrap();
+        let err = load_config(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("acme_email"),
+            "must mention acme_email remedy: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_config_accepts_tailscale_on_ts_net_deploy_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+
+[deploy]
+domain = "host.tailnet.ts.net"
+tls = "tailscale"
+"#,
+        );
+        std::fs::create_dir(dir.path().join("apps")).unwrap();
+        let (cfg, _) = load_config(dir.path()).unwrap();
+        assert_eq!(cfg.deploy.unwrap().tls, TlsStrategy::Tailscale);
+    }
+
+    #[test]
+    fn load_config_rejects_routing_tailscale_on_non_ts_net_route() {
+        // routing.tls = "tailscale" with a non-.ts.net route hostname must fail
+        // at load time (inherited strategy validation).
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+"#,
+        );
+        std::fs::create_dir(dir.path().join("apps")).unwrap();
+        write_file(
+            &dir.path().join("apps"),
+            "myapp.toml",
+            r#"
+[app]
+name = "myapp"
+image = "img:latest"
+
+[routing]
+tls = "tailscale"
+
+[[routing.routes]]
+hostname = "deploy.example.com"
+
+[health]
+
+[deploy]
+"#,
+        );
+        let err = load_config(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("*.ts.net"),
+            "must mention ts.net remedy for inherited routing.tls: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_config_rejects_literal_dns_provider_token() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[caddy.tls]
+email = "ops@example.com"
+dns_provider = "cloudflare"
+
+[caddy.tls.dns_provider_config]
+api_token = "literal-secret-token-value-here-1234567890"
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+"#,
+        );
+        std::fs::create_dir(dir.path().join("apps")).unwrap();
+        let err = load_config(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("{env.*}") || msg.contains("placeholder"),
+            "must mention {{env.*}} placeholder requirement: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_config_accepts_env_placeholder_dns_provider_token() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[caddy.tls]
+email = "ops@example.com"
+dns_provider = "cloudflare"
+
+[caddy.tls.dns_provider_config]
+api_token = "{env.CF_API_TOKEN}"
+
+[auth]
+secret = "s"
+
+[registry]
+
+[storage]
+"#,
+        );
+        std::fs::create_dir(dir.path().join("apps")).unwrap();
+        let (cfg, _) = load_config(dir.path()).unwrap();
+        assert!(cfg.caddy.tls.is_some());
     }
 }

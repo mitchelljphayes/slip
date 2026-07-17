@@ -215,6 +215,7 @@ fn test_app_config(name: &str, domain: &str) -> AppConfig {
             domain: Some(domain.to_string()),
             port: Some(80),
             routes: vec![],
+            tls: None,
         },
         health: HealthConfig::default(),
         deploy: DeployConfig::default(),
@@ -248,6 +249,8 @@ fn test_context(client: CaddyClient, app: &str, domain: &str, port: u16) -> Reco
         caddy_tls: None,
         deploy: None,
         listen_addr: "127.0.0.1:7890".to_string(),
+        acme_email: None,
+        acme_ca: None,
     }
 }
 

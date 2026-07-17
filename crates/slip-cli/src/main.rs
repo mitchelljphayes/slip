@@ -151,6 +151,9 @@ enum Commands {
     /// Manage preview deployments.
     #[command(subcommand)]
     Previews(PreviewsCommands),
+    /// Manage TLS certificates.
+    #[command(subcommand)]
+    Tls(TlsCommands),
     /// Log in to a container registry.
     #[command(subcommand)]
     Registry(RegistryCommands),
@@ -192,8 +195,8 @@ enum ServerCommands {
         /// Deploy webhook domain (e.g. deploy.example.com).
         #[arg(long)]
         domain: Option<String>,
-        /// TLS strategy [default: internal] [possible values: internal].
-        #[arg(long, default_value = "internal")]
+        /// TLS strategy [default: internal] [possible values: internal, acme, cloudflare-dns01, tailscale].
+        #[arg(long, default_value = "internal", value_parser = clap::builder::PossibleValuesParser::new(["internal", "acme", "cloudflare-dns01", "tailscale"]))]
         tls: String,
         /// Container runtime backend [default: auto] [possible values: auto, docker, podman].
         #[arg(long, default_value = "auto")]
@@ -265,6 +268,18 @@ enum PreviewsCommands {
         /// Tear down all previews for the app.
         #[arg(long)]
         all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TlsCommands {
+    /// Force certificate renewal for a host (non-destructive).
+    Renew {
+        /// Host to renew the certificate for.
+        host: String,
+        /// Restart Caddy as a retry if ratio-bump doesn't clear the stuck state.
+        #[arg(long)]
+        restart_caddy: bool,
     },
 }
 
@@ -1095,6 +1110,120 @@ fn format_ttl(expires_at: Option<&str>) -> String {
     }
 }
 
+/// `slip tls renew <host>` — force certificate renewal via the management API.
+/// Exit codes: 0 ok · 5 deploy-failed (not proven) · 6 timeout · 1 generic.
+async fn tls_renew(server: &str, token: &str, host: &str, restart_caddy: bool, json: bool) -> ! {
+    let client = create_client();
+    let url = format!("{server}/v1/tls/renew");
+    let body = serde_json::json!({"host": host, "restart_caddy": restart_caddy});
+
+    let resp = match api_request(&client, reqwest::Method::POST, &url, token, Some(&body)).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let msg = format!("{e}");
+            if msg.contains("401") {
+                output::fail(
+                    output::AUTH,
+                    "authentication failed",
+                    "set --token or SLIP_TOKEN",
+                );
+            }
+            output::fail(
+                output::GENERIC,
+                &msg,
+                "check that slipd is running and reachable",
+            );
+        }
+    };
+
+    let status = resp.status();
+    if status.is_success() {
+        let result: TlsRenewResultJson = match resp.json().await {
+            Ok(r) => r,
+            Err(e) => output::fail(
+                output::GENERIC,
+                &format!("failed to parse response: {e}"),
+                "",
+            ),
+        };
+        if json {
+            println!("{}", serde_json::to_string(&result).unwrap_or_default());
+        } else if result.renewed {
+            println!(
+                "✓ TLS certificate renewed for {} (restored: {}, elapsed: {}ms)",
+                result.host, result.restored, result.elapsed_ms
+            );
+        } else if let Some(ref managed_by) = result.managed_by {
+            if let Some(ref msg) = result.message {
+                println!("✓ {msg}");
+            } else {
+                println!(
+                    "✓ {} is managed by {} — no action needed",
+                    result.host, managed_by
+                );
+            }
+        }
+        std::process::exit(output::OK);
+    }
+
+    // Non-2xx: map to exit codes.
+    let error_text = resp.text().await.unwrap_or_default();
+    let error_msg = if let Ok(err) = serde_json::from_str::<serde_json::Value>(&error_text) {
+        err["error"].as_str().unwrap_or(&error_text).to_string()
+    } else {
+        error_text
+    };
+
+    let redacted_msg = slip_core::redact_external_error(&error_msg);
+
+    match status.as_u16() {
+        401 => output::fail(output::AUTH, &redacted_msg, "set --token or SLIP_TOKEN"),
+        404 => output::fail(
+            output::NOT_FOUND,
+            &redacted_msg,
+            &format!("run `slip apply` to register the TLS policy for {host}"),
+        ),
+        409 => output::fail(
+            output::GENERIC,
+            &redacted_msg,
+            "wait for the in-progress renewal to complete",
+        ),
+        502 => {
+            // RenewNotProven → exit 5 (DEPLOY_FAILED).
+            if json {
+                println!(
+                    r#"{{"schema":"slip.tls.renew/v1","host":"{host}","renewed":false,"error":"{}"}}"#,
+                    redacted_msg.replace('"', "\\\"")
+                );
+            }
+            output::fail(
+                output::DEPLOY_FAILED,
+                &redacted_msg,
+                &format!("try: slip tls renew --restart-caddy {host}"),
+            );
+        }
+        504 => {
+            // RenewTimeout → exit 6 (TIMEOUT).
+            if json {
+                println!(
+                    r#"{{"schema":"slip.tls.renew/v1","host":"{host}","renewed":false,"error":"{}"}}"#,
+                    redacted_msg.replace('"', "\\\"")
+                );
+            }
+            output::fail(
+                output::TIMEOUT,
+                &redacted_msg,
+                &format!("try: slip tls renew --restart-caddy {host}"),
+            );
+        }
+        _ => output::fail(
+            output::GENERIC,
+            &redacted_msg,
+            "check slipd logs for details",
+        ),
+    }
+}
+
 async fn previews_list(server: &str, token: &str, app: &str) -> Result<(), anyhow::Error> {
     let client = create_client();
     let url = format!("{server}/v1/previews/{app}");
@@ -1526,6 +1655,24 @@ struct CertStatusJson {
     issuer: String,
     #[serde(default)]
     expires_at: Option<String>,
+}
+
+/// JSON response from `POST /v1/tls/renew` (schema `slip.tls.renew/v1`).
+#[derive(Debug, Serialize, Deserialize)]
+struct TlsRenewResultJson {
+    schema: String,
+    host: String,
+    #[serde(default)]
+    before_not_after: Option<String>,
+    #[serde(default)]
+    after_not_after: Option<String>,
+    renewed: bool,
+    restored: bool,
+    #[serde(default)]
+    managed_by: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    elapsed_ms: u64,
 }
 
 /// `slip status [app]` — show daemon or per-app status.
@@ -2793,6 +2940,17 @@ async fn main() -> anyhow::Result<()> {
                 }
                 PreviewsCommands::Teardown { app, preview, all } => {
                     previews_teardown(&server, &token, &app, preview, all).await?;
+                }
+            }
+        }
+        Commands::Tls(command) => {
+            let token = resolve_token(cli.token);
+            match command {
+                TlsCommands::Renew {
+                    host,
+                    restart_caddy,
+                } => {
+                    tls_renew(&server, &token, &host, restart_caddy, cli.json).await;
                 }
             }
         }

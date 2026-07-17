@@ -244,6 +244,7 @@ mod tests {
                 domain: Some("testapp.example.com".to_string()),
                 port: Some(3000),
                 routes: vec![],
+                tls: None,
             },
             health: HealthConfig {
                 path: None,
@@ -616,10 +617,12 @@ mod tests {
             crate::config::RouteEntry {
                 hostname: "api.example.com".to_string(),
                 port: None,
+                tls: None,
             },
             crate::config::RouteEntry {
                 hostname: "admin.example.com".to_string(),
                 port: None,
+                tls: None,
             },
         ];
 
@@ -656,6 +659,7 @@ mod tests {
         server.routing.routes = vec![crate::config::RouteEntry {
             hostname: "api.example.com".to_string(),
             port: None,
+            tls: None,
         }];
 
         let mut repo = minimal_repo_config("testapp");
@@ -724,10 +728,12 @@ mod tests {
             crate::config::RouteEntry {
                 hostname: "api.example.com".to_string(),
                 port: None,
+                tls: None,
             },
             crate::config::RouteEntry {
                 hostname: "worker.example.com".to_string(),
                 port: None,
+                tls: None,
             },
         ];
 

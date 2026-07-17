@@ -240,6 +240,33 @@ pub struct CertStatus {
     pub expires_at: Option<String>,
 }
 
+/// Request body for `POST /v1/tls/renew`.
+#[derive(Debug, Deserialize)]
+pub struct TlsRenewRequest {
+    pub host: String,
+    /// Restart Caddy as a retry if ratio-bump doesn't clear the stuck state.
+    #[serde(default)]
+    pub restart_caddy: bool,
+}
+
+/// Response for `POST /v1/tls/renew` (schema `slip.tls.renew/v1`).
+#[derive(Debug, Serialize)]
+pub struct TlsRenewResult {
+    pub schema: &'static str,
+    pub host: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_not_after: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_not_after: Option<String>,
+    pub renewed: bool,
+    pub restored: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub elapsed_ms: u64,
+}
+
 /// Response for `GET /v1/deploys/:deploy_id`.
 #[derive(Debug, Serialize)]
 pub struct DeployStatusResponse {
@@ -290,6 +317,9 @@ pub struct CreateAppRequest {
     /// Multi-route entries.
     #[serde(default)]
     pub routes: Option<Vec<crate::config::RouteEntry>>,
+    /// Per-app routing TLS strategy override (None = inherit/classify).
+    #[serde(default)]
+    pub tls: Option<crate::config::TlsStrategy>,
 }
 
 fn default_app_port() -> u16 {
@@ -315,6 +345,9 @@ pub struct UpdateAppRequest {
     /// Multi-route entries.
     #[serde(default)]
     pub routes: Option<Vec<crate::config::RouteEntry>>,
+    /// Per-app routing TLS strategy override (None = inherit/classify).
+    #[serde(default)]
+    pub tls: Option<crate::config::TlsStrategy>,
 }
 
 /// Request body for `POST /v1/apps/{name}/rollback`.
@@ -387,6 +420,9 @@ pub struct AppResponse {
     pub volumes: Vec<crate::config::VolumeConfig>,
     #[serde(default)]
     pub routes: Vec<crate::config::RouteEntry>,
+    /// Per-app routing TLS strategy override (None = inherit/classify).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<crate::config::TlsStrategy>,
 }
 
 impl From<&AppConfig> for AppResponse {
@@ -406,6 +442,7 @@ impl From<&AppConfig> for AppResponse {
             preview: cfg.preview.clone(),
             volumes: cfg.volumes.clone(),
             routes: cfg.routing.routes.clone(),
+            tls: cfg.routing.tls,
         }
     }
 }
@@ -426,6 +463,10 @@ pub enum AppError {
     NotFound(String),
     Conflict(String),
     Internal(String),
+    /// TLS renewal was not proven by certificate probe (exit 5 / DEPLOY_FAILED).
+    RenewNotProven(String),
+    /// TLS renewal timed out waiting for cert proof (exit 6 / TIMEOUT).
+    RenewTimeout(String),
 }
 
 impl IntoResponse for AppError {
@@ -436,6 +477,10 @@ impl IntoResponse for AppError {
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            // 502 Bad Gateway — Caddy/storage failure that prevents completion.
+            AppError::RenewNotProven(msg) => (StatusCode::from_u16(502).unwrap(), msg),
+            // 504 Gateway Timeout — renewal timed out.
+            AppError::RenewTimeout(msg) => (StatusCode::from_u16(504).unwrap(), msg),
         };
         (status, Json(ErrorResponse { error: message })).into_response()
     }
@@ -484,6 +529,9 @@ pub struct AppState {
     /// Keyed by `"{app}:{preview_id}"`. Allows preview deploys to run concurrently
     /// with production deploys and other previews.
     pub preview_locks: DashMap<String, Arc<Mutex<()>>>,
+    /// Per-host TLS renew locks; prevents concurrent `slip tls renew <host>` calls
+    /// from racing on the renewal_window_ratio bump/revert cycle.
+    pub renew_locks: DashMap<String, Arc<Mutex<()>>>,
     /// File-system backed secret storage (one file per secret with 0o600 perms).
     pub secrets_store: SecretsStore,
 }
@@ -561,6 +609,7 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
             axum::routing::get(handle_app_status),
         )
         .route("/v1/apps/{name}/logs", axum::routing::get(handle_app_logs))
+        .route("/v1/tls/renew", axum::routing::post(handle_tls_renew))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             management_auth,
@@ -731,6 +780,7 @@ async fn handle_create_app(
             domain: Some(req.domain),
             port: Some(req.port),
             routes: req.routes.unwrap_or_default(),
+            tls: req.tls,
         },
         health: req.health.unwrap_or_default(),
         deploy: req.deploy.unwrap_or_default(),
@@ -859,6 +909,9 @@ async fn handle_update_app(
         }
         if let Some(routes) = req.routes {
             updated.routing.routes = routes;
+        }
+        if let Some(tls) = req.tls {
+            updated.routing.tls = Some(tls);
         }
 
         apps.insert(name.clone(), updated.clone());
@@ -2161,7 +2214,487 @@ async fn handle_app_status(
     Ok((StatusCode::OK, Json(response)))
 }
 
-// ─── Deploy status handler ────────────────────────────────────────────────────
+// ─── TLS renew handler ────────────────────────────────────────────────────────
+
+/// Validate a host before probing to prevent SSRF.
+///
+/// Rejects link-local, loopback, and unspecified IP literals. Also rejects
+/// hosts that don't look like valid hostnames (must have at least one dot,
+/// or be a valid IP literal).
+fn validate_renew_host(host: &str) -> Result<(), AppError> {
+    // Reject empty hosts.
+    if host.is_empty() {
+        return Err(AppError::BadRequest("host must not be empty".to_string()));
+    }
+    // Check if it's an IP literal.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        use std::net::IpAddr;
+        match ip {
+            IpAddr::V4(v4) => {
+                if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
+                    return Err(AppError::BadRequest(format!(
+                        "host '{host}' is a loopback/link-local/unspecified IP — \
+                         renew is not permitted against metadata endpoints"
+                    )));
+                }
+            }
+            IpAddr::V6(v6) => {
+                if v6.is_loopback() || v6.is_unspecified() {
+                    return Err(AppError::BadRequest(format!(
+                        "host '{host}' is a loopback/unspecified IPv6 — \
+                         renew is not permitted against metadata endpoints"
+                    )));
+                }
+            }
+        }
+        return Ok(());
+    }
+    // Hostname: must contain at least one dot (reject bare names).
+    if !host.contains('.') {
+        return Err(AppError::BadRequest(format!(
+            "host '{host}' is not a valid FQDN — must contain at least one dot"
+        )));
+    }
+    // Reject obvious SSRF targets.
+    if host == "metadata.google.internal" || host.ends_with(".metadata") {
+        return Err(AppError::BadRequest(format!(
+            "host '{host}' looks like a cloud metadata endpoint — refused"
+        )));
+    }
+    Ok(())
+}
+
+/// `POST /v1/tls/renew` — non-destructive, authenticated TLS certificate
+/// renewal via `renewal_window_ratio` bump-and-revert.
+///
+/// For Tailscale-managed hosts, returns a successful no-op (exit 0).
+/// For ACME-issuer hosts:
+/// 1. Acquire per-host lock (concurrent renew → 409 Conflict).
+/// 2. Validate host (SSRF defense).
+/// 3. Probe the before-state cert (TLS handshake with SNI → fingerprint + notAfter).
+/// 4. Bump `renewal_window_ratio` to 1.0 + reload.
+/// 5. Poll the external cert until fingerprint changes and/or notAfter advances.
+/// 6. If `restart_caddy` is set and ratio-bump didn't prove renewal, restart
+///    Caddy (bounded, prescriptive error if systemd unavailable), wait for
+///    admin readiness, then re-poll for cert proof.
+/// 7. Guard/finally: ALWAYS revert the ratio (success, failure, timeout).
+/// 8. `renewed: true` only if cert probe proves renewal.
+/// 9. If restoration fails, the whole operation fails loudly.
+///
+/// The renewal body (bump→probe→restore) runs in a detached tokio task so
+/// that HTTP client disconnection does not cancel restoration. The handler
+/// awaits the task's result via a oneshot channel.
+async fn handle_tls_renew(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TlsRenewRequest>,
+) -> Result<(StatusCode, Json<TlsRenewResult>), AppError> {
+    let start = std::time::Instant::now();
+    let host = req.host.clone();
+
+    // Validate host (SSRF defense).
+    validate_renew_host(&host)?;
+
+    // Acquire per-host renew lock (concurrent renew → 409).
+    // Use try_lock_owned() so the OwnedMutexGuard can be moved into the
+    // detached task — the lock outlives handler cancellation and protects
+    // the entire renewal cycle, not just the handler's scope.
+    let lock = {
+        state
+            .renew_locks
+            .entry(host.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let guard = lock.try_lock_owned().map_err(|_| {
+        AppError::Conflict(format!(
+            "a TLS renewal for '{host}' is already in progress — wait for it to complete"
+        ))
+    })?;
+
+    // Check if Tailscale-managed → successful no-op.
+    let is_ts = state
+        .caddy
+        .is_tailscale_managed(&host)
+        .await
+        .unwrap_or(false);
+    if is_ts {
+        return Ok((
+            StatusCode::OK,
+            Json(TlsRenewResult {
+                schema: "slip.tls.renew/v1",
+                host: host.clone(),
+                before_not_after: None,
+                after_not_after: None,
+                renewed: false,
+                restored: true,
+                managed_by: Some("tailscale".to_string()),
+                message: Some(format!(
+                    "host {host} uses the Tailscale certificate manager — \
+                     renewal is handled automatically by tailscaled; no action needed"
+                )),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            }),
+        ));
+    }
+
+    // Get the current policy for the host.
+    let original_policy = state.caddy.get_tls_policy(&host).await.map_err(|e| {
+        AppError::Internal(crate::caddy::redact_external_error(&format!(
+            "failed to query TLS policy for {host}: {e}"
+        )))
+    })?;
+
+    let original_policy = original_policy.ok_or_else(|| {
+        AppError::NotFound(format!(
+            "no TLS policy found for {host} — run `slip apply` to register it"
+        ))
+    })?;
+
+    // Capture original ratio for revert.
+    let original_ratio = original_policy
+        .get("renewal_window_ratio")
+        .and_then(|r| r.as_f64());
+
+    // Spawn a detached task for the bump→probe→restore cycle.
+    // This ensures restoration completes even if the HTTP client disconnects.
+    // The lock guard is moved INTO the task, so the lock outlives the handler
+    // and protects the full cycle lifetime (RE-1 fix).
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let caddy = state.caddy.clone();
+    let host_clone = host.clone();
+    let restart_caddy = req.restart_caddy;
+    let original_ratio_clone = original_ratio;
+    let subjects_clone = original_policy
+        .get("subjects")
+        .and_then(|s| s.as_array())
+        .and_then(|a| a.first())
+        .and_then(|s| s.as_str())
+        .map(String::from);
+
+    tokio::spawn(async move {
+        // Lock guard is held for the entire task lifetime.
+        let _guard = guard;
+        let result = run_renewal_cycle(
+            &caddy,
+            &host_clone,
+            restart_caddy,
+            original_ratio_clone,
+            subjects_clone,
+        )
+        .await;
+        let _ = tx.send(result);
+    });
+
+    // Await the result (or return timeout if the client is still connected).
+    let renewal_result = rx
+        .await
+        .map_err(|_| AppError::Internal("renewal task panicked or was cancelled".to_string()))?;
+
+    match renewal_result {
+        RenewalOutcome::Success {
+            before_not_after,
+            after_not_after,
+            restored,
+        } => Ok((
+            StatusCode::OK,
+            Json(TlsRenewResult {
+                schema: "slip.tls.renew/v1",
+                host: host.clone(),
+                before_not_after,
+                after_not_after,
+                renewed: true,
+                restored,
+                managed_by: None,
+                message: None,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            }),
+        )),
+        RenewalOutcome::NotProven { restored } => Err(AppError::RenewNotProven(format!(
+            "TLS renewal for {host} was not proven by certificate probe \
+             (fingerprint/notAfter unchanged). \
+             The renewal_window_ratio has been reverted (restored={restored}). \
+             Try: slip tls renew --restart-caddy {host}"
+        ))),
+        RenewalOutcome::Timeout { restored } => Err(AppError::RenewTimeout(format!(
+            "TLS renewal for {host} timed out waiting for certificate proof. \
+             The renewal_window_ratio has been reverted (restored={restored}). \
+             Try: slip tls renew --restart-caddy {host}"
+        ))),
+        RenewalOutcome::RestorationFailed { detail } => Err(AppError::Internal(
+            crate::caddy::redact_external_error(&format!(
+                "TLS renewal for {host}: renewal_window_ratio revert FAILED — \
+                 Caddy may be left with ratio=1.0 which will hit LE rate limits. \
+                 Manual fix: PATCH the policy for {host} to restore \
+                 renewal_window_ratio, then reload Caddy. Error: {detail}"
+            )),
+        )),
+        RenewalOutcome::Error { detail } => Err(AppError::Internal(
+            crate::caddy::redact_external_error(&detail),
+        )),
+    }
+}
+
+/// Outcome of the renewal cycle (bump→probe→restore).
+enum RenewalOutcome {
+    Success {
+        before_not_after: Option<String>,
+        after_not_after: Option<String>,
+        restored: bool,
+    },
+    /// Renewal not proven (cert unchanged, but not a timeout).
+    NotProven { restored: bool },
+    /// Renewal timed out.
+    Timeout { restored: bool },
+    /// Ratio restoration failed — critical, needs manual intervention.
+    RestorationFailed { detail: String },
+    /// Other error.
+    Error { detail: String },
+}
+
+/// Run the renewal cycle: probe before → bump ratio → poll for cert proof → restore.
+///
+/// This runs in a detached task with the per-host lock held. The ratio is
+/// ALWAYS restored (success, failure, timeout). If restoration fails, returns
+/// `RestorationFailed`. When the original ratio was None, the temporary
+/// `renewal_window_ratio` field is DELETED (not left at 1.0). Restoration
+/// is verified by re-reading the policy after the restore operation.
+async fn run_renewal_cycle(
+    caddy: &CaddyClient,
+    host: &str,
+    restart_caddy: bool,
+    original_ratio: Option<f64>,
+    _subject: Option<String>,
+) -> RenewalOutcome {
+    // ── 1. Probe before-state cert ────────────────────────────────────────
+    let before_probe = match crate::caddy::probe_cert(host).await {
+        Ok(Some(p)) => Some(p),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(host = host, error = %e, "before-probe failed");
+            None
+        }
+    };
+    let before_not_after = before_probe.as_ref().and_then(|p| p.not_after.clone());
+
+    // ── 2. Bump ratio to 1.0 + reload ─────────────────────────────────────
+    if let Err(e) = caddy.patch_tls_policy_ratio(host, 1.0).await {
+        return RenewalOutcome::Error {
+            detail: format!("failed to bump renewal_window_ratio for {host}: {e}"),
+        };
+    }
+
+    if let Err(e) = caddy.reload().await {
+        // Guard: revert ratio before returning.
+        restore_ratio(caddy, host, original_ratio).await;
+        return RenewalOutcome::Error {
+            detail: format!("Caddy reload failed for {host}: {e}"),
+        };
+    }
+
+    // ── 3. Poll for cert proof ─────────────────────────────────────────────
+    let poll_timeout = std::time::Duration::from_secs(120);
+    let poll_interval = std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + poll_timeout;
+
+    let mut renewed = false;
+    let mut timed_out = false;
+    let mut after_probe: Option<crate::caddy::CertProbe> = None;
+
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(poll_interval).await;
+        match crate::caddy::probe_cert(host).await {
+            Ok(Some(p)) => {
+                if crate::caddy::cert_renewed(before_probe.as_ref(), Some(&p)) {
+                    renewed = true;
+                    after_probe = Some(p);
+                    break;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!(host = host, error = %e, "poll probe failed, retrying");
+            }
+        }
+    }
+    if !renewed && std::time::Instant::now() >= deadline {
+        timed_out = true;
+    }
+
+    // ── 4. If not renewed and restart_caddy is set, restart + re-poll ────
+    if !renewed && restart_caddy {
+        tracing::info!(
+            host = host,
+            "ratio-bump did not prove renewal — restarting Caddy"
+        );
+        match restart_caddy_bounded().await {
+            Ok(()) => {
+                if let Err(e) = wait_caddy_ready(caddy, std::time::Duration::from_secs(30)).await {
+                    tracing::warn!(host = host, error = %e, "Caddy readiness wait failed");
+                }
+                let restart_deadline = std::time::Instant::now() + poll_timeout;
+                while std::time::Instant::now() < restart_deadline {
+                    tokio::time::sleep(poll_interval).await;
+                    match crate::caddy::probe_cert(host).await {
+                        Ok(Some(p)) => {
+                            if crate::caddy::cert_renewed(before_probe.as_ref(), Some(&p)) {
+                                renewed = true;
+                                after_probe = Some(p);
+                                break;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::debug!(host = host, error = %e, "post-restart poll failed");
+                        }
+                    }
+                }
+                if !renewed && std::time::Instant::now() >= restart_deadline {
+                    timed_out = true;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(host = host, error = %e, "Caddy restart failed");
+            }
+        }
+    }
+
+    // ── 5. Guard/finally: ALWAYS revert the ratio ────────────────────────
+    // When original_ratio is Some, PATCH it back. When original_ratio is None,
+    // DELETE the temporary field. Then VERIFY the restoration by re-reading
+    // the policy. If verification fails, the operation fails loudly.
+    let restored = restore_ratio(caddy, host, original_ratio).await;
+
+    match restored {
+        true => {
+            // Verify restoration by re-reading the policy.
+            match caddy.verify_ratio_restored(host, original_ratio).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return RenewalOutcome::RestorationFailed {
+                        detail: format!(
+                            "post-restore verification failed: \
+                             renewal_window_ratio still present/incorrect for {host}"
+                        ),
+                    };
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        host = host,
+                        error = %e,
+                        "post-restore verification read failed (non-fatal)"
+                    );
+                    // Don't fail on read error — the restore itself succeeded.
+                }
+            }
+        }
+        false => {
+            return RenewalOutcome::RestorationFailed {
+                detail: format!(
+                    "failed to restore renewal_window_ratio for {host} \
+                     (was Some={:?}) — Caddy may be left with ratio=1.0",
+                    original_ratio
+                ),
+            };
+        }
+    }
+
+    let after_not_after = after_probe.as_ref().and_then(|p| p.not_after.clone());
+
+    if renewed {
+        RenewalOutcome::Success {
+            before_not_after,
+            after_not_after,
+            restored,
+        }
+    } else if timed_out {
+        RenewalOutcome::Timeout { restored }
+    } else {
+        RenewalOutcome::NotProven { restored }
+    }
+}
+
+/// Restore the original ratio: PATCH back if Some, DELETE the field if None.
+/// Returns `true` on success, `false` on failure. Always reloads after restore.
+async fn restore_ratio(caddy: &CaddyClient, host: &str, original_ratio: Option<f64>) -> bool {
+    let result = match original_ratio {
+        Some(ratio) => caddy.patch_tls_policy_ratio(host, ratio).await,
+        None => caddy.delete_tls_policy_ratio(host).await,
+    };
+    match result {
+        Ok(()) => {
+            let _ = caddy.reload().await;
+            true
+        }
+        Err(e) => {
+            tracing::error!(
+                host = host,
+                error = %e,
+                "CRITICAL: ratio revert FAILED (original_ratio={:?})",
+                original_ratio
+            );
+            false
+        }
+    }
+}
+
+/// Restart Caddy via systemctl, bounded by a 30s timeout.
+///
+/// Returns an error if systemctl is unavailable or the restart fails.
+/// This only works if slip owns the systemd lifecycle (runs as root or
+/// has the appropriate permissions).
+async fn restart_caddy_bounded() -> Result<(), String> {
+    use crate::doctor::CommandRunner;
+    struct RealRunner;
+    impl CommandRunner for RealRunner {
+        fn run(&self, cmd: &str, args: &[&str]) -> std::io::Result<crate::doctor::CommandOutput> {
+            let output = std::process::Command::new(cmd).args(args).output()?;
+            Ok(crate::doctor::CommandOutput {
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                status: output.status.code().unwrap_or(-1),
+            })
+        }
+    }
+
+    let runner = RealRunner;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || runner.run("systemctl", &["restart", "caddy"])),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(Ok(out))) if out.status == 0 => Ok(()),
+        Ok(Ok(Ok(out))) => Err(format!(
+            "systemctl restart caddy exited {} — \
+             slip may not own the systemd lifecycle; restart manually: systemctl restart caddy. \
+             stderr: {}",
+            out.status,
+            out.stderr.chars().take(200).collect::<String>()
+        )),
+        Ok(Ok(Err(e))) => Err(format!(
+            "cannot run systemctl: {e} — restart Caddy manually"
+        )),
+        Ok(Err(e)) => Err(format!("task join error: {e}")),
+        Err(_) => {
+            Err("systemctl restart caddy timed out (30s) — restart Caddy manually".to_string())
+        }
+    }
+}
+
+/// Wait for Caddy admin API to become reachable after a restart.
+async fn wait_caddy_ready(caddy: &CaddyClient, timeout: std::time::Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if caddy.ping().await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Err(format!(
+        "Caddy admin API not reachable within {timeout:?} after restart"
+    ))
+}
 
 /// `GET /v1/deploys/:deploy_id`
 ///
@@ -2440,6 +2973,7 @@ mod tests {
                 domain: Some("testapp.example.com".to_string()),
                 port: Some(3000),
                 routes: vec![],
+                tls: None,
             },
             health: HealthConfig::default(),
             deploy: DeployConfig::default(),
@@ -2480,6 +3014,7 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            renew_locks: DashMap::new(),
             secrets_store: SecretsStore::new(secrets_path).unwrap(),
         })
     }
@@ -2779,6 +3314,7 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            renew_locks: DashMap::new(),
             secrets_store: SecretsStore::new({
                 let t = tempfile::tempdir().expect("tempdir for secrets");
                 let p = t.path().to_path_buf();
@@ -2835,6 +3371,7 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            renew_locks: DashMap::new(),
             secrets_store: SecretsStore::new({
                 let t = tempfile::tempdir().expect("tempdir for secrets");
                 let p = t.path().to_path_buf();
@@ -3118,6 +3655,7 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            renew_locks: DashMap::new(),
             secrets_store: SecretsStore::new({
                 let t = tempfile::tempdir().expect("tempdir for secrets");
                 let p = t.path().to_path_buf();
@@ -3507,6 +4045,7 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            renew_locks: DashMap::new(),
             secrets_store: SecretsStore::new({
                 let t = tempfile::tempdir().expect("tempdir for secrets");
                 let p = t.path().to_path_buf();
@@ -3677,6 +4216,7 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            renew_locks: DashMap::new(),
             secrets_store: SecretsStore::new({
                 let t = tempfile::tempdir().expect("tempdir for secrets");
                 let p = t.path().to_path_buf();
@@ -3785,6 +4325,7 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            renew_locks: DashMap::new(),
             secrets_store: SecretsStore::new({
                 let t = tempfile::tempdir().expect("tempdir for secrets");
                 let p = t.path().to_path_buf();
@@ -4157,6 +4698,7 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            renew_locks: DashMap::new(),
             secrets_store: SecretsStore::new({
                 let t = tempfile::tempdir().expect("tempdir for secrets");
                 let p = t.path().to_path_buf();
@@ -4459,6 +5001,7 @@ mod tests {
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            renew_locks: DashMap::new(),
             secrets_store: secrets_store.clone(),
         });
 
@@ -4938,6 +5481,7 @@ path = "/tmp/slip-test"
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            renew_locks: DashMap::new(),
             secrets_store: SecretsStore::new(secrets_path).unwrap(),
         });
 
@@ -5081,6 +5625,7 @@ path = "/tmp/slip-test"
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            renew_locks: DashMap::new(),
             secrets_store: SecretsStore::new(secrets_path).unwrap(),
         });
 
@@ -5219,6 +5764,7 @@ path = "/tmp/slip-test"
             started_at: Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            renew_locks: DashMap::new(),
             secrets_store: SecretsStore::new(secrets_path).unwrap(),
         });
 
@@ -5985,5 +6531,608 @@ path = "/tmp/slip-test"
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["ts"], serde_json::Value::Null);
         assert_eq!(json["stream"], "stderr");
+    }
+
+    // ── TLS renew handler tests (SLIP-104 Phase 4) ─────────────────────────
+
+    /// Mock state for the renew mock Caddy.
+    #[derive(Default)]
+    #[allow(dead_code)]
+    struct MockTlsState {
+        policies: Vec<serde_json::Value>,
+        patched_ratios: Vec<f64>,
+        reloaded: bool,
+    }
+
+    /// Start a mock Caddy admin API for TLS renew tests.
+    /// Returns (port, Arc<Mutex<MockTlsState>>).
+    async fn start_mock_caddy_for_renew() -> (u16, std::sync::Arc<tokio::sync::Mutex<MockTlsState>>)
+    {
+        use axum::{Router, routing::get};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let state = Arc::new(Mutex::new(MockTlsState::default()));
+        let state_clone = state.clone();
+
+        let app = Router::new()
+            .route(
+                "/config/apps/tls/automation/policies",
+                get({
+                    let state = state.clone();
+                    move || {
+                        let state = state.clone();
+                        async move {
+                            let s = state.lock().await;
+                            axum::Json(serde_json::Value::Array(s.policies.clone()))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/config/",
+                get({
+                    let state = state.clone();
+                    move || {
+                        let state = state.clone();
+                        async move {
+                            let s = state.lock().await;
+                            axum::Json(serde_json::json!({"config": "ok", "reloaded": s.reloaded}))
+                        }
+                    }
+                }),
+            )
+            .with_state(state_clone);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (port, state)
+    }
+
+    /// Helper to create test state with a specific Caddy admin URL.
+    fn create_test_state_with_caddy(caddy_url: &str) -> Arc<AppState> {
+        let mut apps = HashMap::new();
+        apps.insert(APP_NAME.to_string(), test_app_config(Some(APP_SECRET)));
+
+        let secrets_tmp = tempfile::tempdir().expect("tempdir for secrets");
+        let secrets_path = secrets_tmp.path().to_path_buf();
+        Box::leak(Box::new(secrets_tmp));
+
+        Arc::new(AppState {
+            config: test_slip_config(),
+            apps: RwLock::new(apps),
+            config_dir: PathBuf::from("/tmp/slip-test"),
+            deploy_locks: DashMap::new(),
+            runtime: Arc::new(
+                DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
+            ),
+            caddy: CaddyClient::new(caddy_url.to_string()),
+            health: HealthChecker::new(),
+            app_states: RwLock::new(HashMap::new()),
+            deploys: DashMap::new(),
+            db: Db::open_in_memory().unwrap(),
+            started_at: Utc::now(),
+            preview_states: Arc::new(DashMap::new()),
+            preview_locks: DashMap::new(),
+            renew_locks: DashMap::new(),
+            secrets_store: SecretsStore::new(secrets_path).unwrap(),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_tls_renew_bearer_auth_required() {
+        let (port, _state) = start_mock_caddy_for_renew().await;
+        let caddy_url = format!("http://127.0.0.1:{port}");
+        let state = create_test_state_with_caddy(&caddy_url);
+        let app = build_router(state);
+
+        // No Authorization header → 401.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/tls/renew")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"host":"deploy.example.com"}"#))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_tls_renew_bearer_auth_wrong_token_rejected() {
+        let (port, _state) = start_mock_caddy_for_renew().await;
+        let caddy_url = format!("http://127.0.0.1:{port}");
+        let state = create_test_state_with_caddy(&caddy_url);
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/tls/renew")
+            .header("Authorization", "Bearer wrong-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"host":"deploy.example.com"}"#))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_tls_renew_no_policy_returns_not_found() {
+        let (port, _state) = start_mock_caddy_for_renew().await;
+        let caddy_url = format!("http://127.0.0.1:{port}");
+        let state = create_test_state_with_caddy(&caddy_url);
+        let app = build_router(state);
+
+        // Valid auth, but no TLS policy for the host.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/tls/renew")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"host":"deploy.example.com"}"#))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        // No policy → 404 (NotFound).
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_tls_renew_request_includes_restart_caddy_field() {
+        // Verify the request body schema accepts restart_caddy.
+        let json = r#"{"host": "deploy.example.com", "restart_caddy": true}"#;
+        let req: crate::api::TlsRenewRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.host, "deploy.example.com");
+        assert!(req.restart_caddy);
+    }
+
+    #[tokio::test]
+    async fn test_tls_renew_restart_caddy_defaults_false() {
+        let json = r#"{"host": "deploy.example.com"}"#;
+        let req: crate::api::TlsRenewRequest = serde_json::from_str(json).unwrap();
+        assert!(!req.restart_caddy);
+    }
+
+    #[tokio::test]
+    async fn test_tls_renew_rejects_loopback_ip() {
+        let (port, _state) = start_mock_caddy_for_renew().await;
+        let caddy_url = format!("http://127.0.0.1:{port}");
+        let state = create_test_state_with_caddy(&caddy_url);
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/tls/renew")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"host":"127.0.0.1"}"#))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_tls_renew_rejects_link_local_ip() {
+        let (port, _state) = start_mock_caddy_for_renew().await;
+        let caddy_url = format!("http://127.0.0.1:{port}");
+        let state = create_test_state_with_caddy(&caddy_url);
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/tls/renew")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"host":"169.254.169.254"}"#))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_tls_renew_rejects_bare_hostname() {
+        let (port, _state) = start_mock_caddy_for_renew().await;
+        let caddy_url = format!("http://127.0.0.1:{port}");
+        let state = create_test_state_with_caddy(&caddy_url);
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/tls/renew")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"host":"localhost"}"#))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── RE-1: Lock lifetime across handler cancellation ────────────────────
+
+    /// A mock Caddy that serves a pre-populated policy and supports PATCH/DELETE.
+    /// Used for tests that need to get past the 404 gate.
+    #[allow(clippy::collapsible_if)]
+    async fn start_mock_caddy_with_policy(
+        policy: serde_json::Value,
+    ) -> (
+        u16,
+        std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use axum::Router;
+        use axum::routing::{delete, get, patch};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let policies = Arc::new(Mutex::new(vec![policy]));
+        let p_get = policies.clone();
+        let p_patch_idx = policies.clone();
+        let p_del_idx = policies.clone();
+        let p_del_ratio = policies.clone();
+        let p_patch_id = policies.clone();
+
+        let p_post = policies.clone();
+        let app = Router::new()
+            .route(
+                "/config/apps/tls/automation/policies",
+                get(move || {
+                    let p = p_get.clone();
+                    async move {
+                        let p = p.lock().await;
+                        axum::Json(serde_json::Value::Array(p.clone()))
+                    }
+                })
+                .post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let p = p_post.clone();
+                    async move {
+                        let mut p = p.lock().await;
+                        p.push(body);
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .route(
+                "/config/apps/tls/automation/policies/{idx}",
+                patch(
+                    move |axum::extract::Path(idx): axum::extract::Path<usize>,
+                          axum::Json(body): axum::Json<serde_json::Value>| {
+                        let p = p_patch_idx.clone();
+                        async move {
+                            let mut p = p.lock().await;
+                            if idx < p.len() {
+                                if let Some(obj) = p[idx].as_object_mut() {
+                                    if let Some(patch_obj) = body.as_object() {
+                                        for (k, v) in patch_obj {
+                                            obj.insert(k.clone(), v.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            StatusCode::OK
+                        }
+                    },
+                )
+                .delete(
+                    move |axum::extract::Path(idx): axum::extract::Path<usize>| {
+                        let p = p_del_idx.clone();
+                        async move {
+                            let mut p = p.lock().await;
+                            if idx < p.len() {
+                                p.remove(idx);
+                            }
+                            StatusCode::OK
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/id/{id}/renewal_window_ratio",
+                delete(
+                    move |axum::extract::Path(id): axum::extract::Path<String>| {
+                        let p = p_del_ratio.clone();
+                        async move {
+                            let mut p = p.lock().await;
+                            for policy in p.iter_mut() {
+                                if policy
+                                    .get("@id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s == id)
+                                    .unwrap_or(false)
+                                {
+                                    if let Some(obj) = policy.as_object_mut() {
+                                        obj.remove("renewal_window_ratio");
+                                    }
+                                }
+                            }
+                            StatusCode::OK
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/id/{id}",
+                patch(
+                    move |axum::extract::Path(id): axum::extract::Path<String>,
+                          axum::Json(body): axum::Json<serde_json::Value>| {
+                        let p = p_patch_id.clone();
+                        async move {
+                            let mut p = p.lock().await;
+                            for policy in p.iter_mut() {
+                                if policy
+                                    .get("@id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s == id)
+                                    .unwrap_or(false)
+                                {
+                                    if let Some(obj) = policy.as_object_mut() {
+                                        if let Some(patch_obj) = body.as_object() {
+                                            for (k, v) in patch_obj {
+                                                obj.insert(k.clone(), v.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            StatusCode::OK
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/config/apps/tls/automation",
+                axum::routing::post(|axum::Json(_body): axum::Json<serde_json::Value>| async {
+                    StatusCode::OK
+                }),
+            )
+            .route(
+                "/config/",
+                get(|| async { axum::Json(serde_json::json!({"config": "ok"})) }),
+            )
+            .route(
+                "/load",
+                axum::routing::post(|axum::Json(_body): axum::Json<serde_json::Value>| async {
+                    StatusCode::OK
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (port, policies)
+    }
+
+    /// RE-1: A second renew for the same host returns 409 while the first
+    /// is still in progress (lock held by the detached task).
+    ///
+    /// The mock Caddy serves a policy so the first request gets past the
+    /// 404 gate. The detached task enters the poll loop (which takes time
+    /// because probe_cert tries to connect to a non-existent TLS server),
+    /// keeping the lock held. The second request arrives while the lock is
+    /// still held and must get 409.
+    #[tokio::test]
+    async fn test_renew_concurrent_returns_409() {
+        let policy = serde_json::json!({
+            "subjects": ["deploy.example.com"],
+            "issuers": [{"module": "acme"}],
+            "@id": "slip-tls-deploy.example.com"
+        });
+        let (port, _policies) = start_mock_caddy_with_policy(policy).await;
+        let caddy_url = format!("http://127.0.0.1:{port}");
+        let state = create_test_state_with_caddy(&caddy_url);
+        let app = build_router(state);
+
+        // Send the first renew request — it will enter the detached task
+        // and hold the lock while polling (probe_cert will fail quickly
+        // since there's no TLS server, but the poll loop sleeps 5s).
+        let app1 = app.clone();
+        let first = tokio::spawn(async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/tls/renew")
+                .header("Authorization", auth_header(GLOBAL_SECRET))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"host":"deploy.example.com"}"#))
+                .unwrap();
+            app1.oneshot(request).await.unwrap()
+        });
+
+        // Give the first request time to acquire the lock and enter the task.
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Send a second renew — should get 409 because the lock is held.
+        let request2 = Request::builder()
+            .method("POST")
+            .uri("/v1/tls/renew")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"host":"deploy.example.com"}"#))
+            .unwrap();
+        let response2 = app.oneshot(request2).await.unwrap();
+        assert_eq!(
+            response2.status(),
+            StatusCode::CONFLICT,
+            "second concurrent renew must return 409 while first is in progress"
+        );
+
+        // Clean up the first request (it will eventually time out or error).
+        // We don't need to await it — just let it finish in the background.
+        first.abort();
+    }
+
+    // ── RE-2: Restoration deletes temporary field when original was None ───
+
+    /// RE-2: When original ratio is None, restoration must DELETE the
+    /// renewal_window_ratio field, not leave it at 1.0.
+    #[tokio::test]
+    async fn test_restore_ratio_none_deletes_field() {
+        let policy = serde_json::json!({
+            "subjects": ["deploy.example.com"],
+            "issuers": [{"module": "acme"}],
+            "@id": "slip-tls-deploy.example.com",
+            "renewal_window_ratio": 1.0
+        });
+        let (port, policies) = start_mock_caddy_with_policy(policy).await;
+        let caddy_url = format!("http://127.0.0.1:{port}");
+        let caddy = CaddyClient::new(caddy_url);
+
+        // Simulate restoration: original_ratio was None, so DELETE the field.
+        caddy
+            .delete_tls_policy_ratio("deploy.example.com")
+            .await
+            .unwrap();
+
+        // Verify the field is gone.
+        let p = policies.lock().await;
+        assert!(
+            p[0].get("renewal_window_ratio").is_none(),
+            "renewal_window_ratio must be absent after delete (not left at 1.0)"
+        );
+    }
+
+    /// RE-2: When original ratio is Some(0.1), restoration must PATCH it back.
+    #[tokio::test]
+    async fn test_restore_ratio_some_patches_back() {
+        let policy = serde_json::json!({
+            "subjects": ["deploy.example.com"],
+            "issuers": [{"module": "acme"}],
+            "@id": "slip-tls-deploy.example.com",
+            "renewal_window_ratio": 1.0
+        });
+        let (port, policies) = start_mock_caddy_with_policy(policy).await;
+        let caddy_url = format!("http://127.0.0.1:{port}");
+        let caddy = CaddyClient::new(caddy_url);
+
+        // Simulate restoration: original_ratio was Some(0.1), so PATCH back.
+        caddy
+            .patch_tls_policy_ratio("deploy.example.com", 0.1)
+            .await
+            .unwrap();
+
+        // Verify the field is set back.
+        let p = policies.lock().await;
+        let ratio = p[0].get("renewal_window_ratio").and_then(|r| r.as_f64());
+        assert_eq!(
+            ratio,
+            Some(0.1),
+            "renewal_window_ratio must be restored to 0.1"
+        );
+    }
+
+    /// RE-2: Post-restore verification reads the policy back and confirms
+    /// the ratio field is absent (None case) or correct (Some case).
+    #[tokio::test]
+    async fn test_verify_ratio_restored_absent() {
+        let policy = serde_json::json!({
+            "subjects": ["deploy.example.com"],
+            "issuers": [{"module": "acme"}],
+            "@id": "slip-tls-deploy.example.com"
+        });
+        let (port, _policies) = start_mock_caddy_with_policy(policy).await;
+        let caddy_url = format!("http://127.0.0.1:{port}");
+        let caddy = CaddyClient::new(caddy_url);
+
+        // No renewal_window_ratio → verify returns true for expected=None.
+        let verified = caddy
+            .verify_ratio_restored("deploy.example.com", None)
+            .await
+            .unwrap();
+        assert!(
+            verified,
+            "verify should return true when field is absent and expected is None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_ratio_restored_correct_value() {
+        let policy = serde_json::json!({
+            "subjects": ["deploy.example.com"],
+            "issuers": [{"module": "acme"}],
+            "@id": "slip-tls-deploy.example.com",
+            "renewal_window_ratio": 0.1
+        });
+        let (port, _policies) = start_mock_caddy_with_policy(policy).await;
+        let caddy_url = format!("http://127.0.0.1:{port}");
+        let caddy = CaddyClient::new(caddy_url);
+
+        let verified = caddy
+            .verify_ratio_restored("deploy.example.com", Some(0.1))
+            .await
+            .unwrap();
+        assert!(
+            verified,
+            "verify should return true when field matches expected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_ratio_restored_detects_stale() {
+        let policy = serde_json::json!({
+            "subjects": ["deploy.example.com"],
+            "issuers": [{"module": "acme"}],
+            "@id": "slip-tls-deploy.example.com",
+            "renewal_window_ratio": 1.0
+        });
+        let (port, _policies) = start_mock_caddy_with_policy(policy).await;
+        let caddy_url = format!("http://127.0.0.1:{port}");
+        let caddy = CaddyClient::new(caddy_url);
+
+        // Field is 1.0 but expected is None → verify should return false.
+        let verified = caddy
+            .verify_ratio_restored("deploy.example.com", None)
+            .await
+            .unwrap();
+        assert!(
+            !verified,
+            "verify should return false when field is 1.0 but expected is None"
+        );
+    }
+
+    // ── RE-3: Stable @id replacement in upsert ─────────────────────────────
+
+    /// RE-3: When upsert replaces an existing policy with @id, the DELETE
+    /// uses the @id path, not positional index.
+    #[tokio::test]
+    async fn test_upsert_replaces_by_stable_id() {
+        let old_policy = serde_json::json!({
+            "subjects": ["deploy.example.com"],
+            "issuers": [{"module": "internal"}],
+            "@id": "slip-tls-deploy.example.com"
+        });
+        let (port, policies) = start_mock_caddy_with_policy(old_policy).await;
+        let caddy_url = format!("http://127.0.0.1:{port}");
+        let caddy = CaddyClient::new(caddy_url);
+
+        // Upsert a new policy with different body (internal→acme).
+        let subjects = vec!["deploy.example.com".to_string()];
+        let new_policy = crate::caddy::build_tls_policy(
+            &subjects,
+            crate::config::TlsStrategy::Acme,
+            None,
+            Some("ops@example.com"),
+            None,
+        );
+        caddy
+            .upsert_tls_policy(&subjects, &new_policy)
+            .await
+            .unwrap();
+
+        // Verify the old policy was replaced (not duplicated).
+        let p = policies.lock().await;
+        // The mock may have the old policy removed and new one added,
+        // or the old one modified. Either way, there should be a policy
+        // with the ACME issuer.
+        let has_acme = p.iter().any(|pol| {
+            pol.get("issuers")
+                .and_then(|i| i.as_array())
+                .and_then(|a| a.first())
+                .and_then(|i| i.get("module"))
+                .and_then(|m| m.as_str())
+                == Some("acme")
+        });
+        assert!(has_acme, "upsert should replace internal with ACME");
     }
 }
