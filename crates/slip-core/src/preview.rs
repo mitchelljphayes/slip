@@ -1924,6 +1924,7 @@ mod tests {
                 domain: Some("testapp.example.com".to_string()),
                 port: Some(3000),
                 routes: vec![],
+                tls: None,
             },
             health: HealthConfig {
                 path: None,
@@ -3492,6 +3493,7 @@ enabled = true
             started_at: chrono::Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            renew_locks: DashMap::new(),
             secrets_store: crate::secrets::SecretsStore::new(secrets_path).unwrap(),
         })
     }

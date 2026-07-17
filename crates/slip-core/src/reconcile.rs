@@ -30,8 +30,9 @@ use tokio::time::{MissedTickBehavior, interval};
 use crate::api::AppState;
 use crate::caddy::{CaddyClient, Route, RouteInfo};
 use crate::config::AppConfig;
-use crate::config::{CaddyTlsConfig, ServerDeployConfig, ServerPreviewConfig};
+use crate::config::{CaddyTlsConfig, ServerDeployConfig, ServerPreviewConfig, TlsStrategy};
 use crate::deploy::{AppRuntimeState, AppStatus};
+use crate::doctor::CommandRunner;
 
 /// Per-tick summary reported by [`reconcile_tick`] / [`reconcile_app_routes`].
 #[derive(Debug, Default)]
@@ -71,6 +72,10 @@ pub struct ReconcileContext {
     pub deploy: Option<ServerDeployConfig>,
     /// The address slipd listens on (upstream for the deploy-webhook route).
     pub listen_addr: String,
+    /// Resolved ACME email (top-level `[caddy] acme_email` or `[caddy.tls].email` fallback).
+    pub acme_email: Option<String>,
+    /// ACME CA URL override (None = production LE).
+    pub acme_ca: Option<String>,
 }
 
 impl ReconcileContext {
@@ -87,6 +92,8 @@ impl ReconcileContext {
             caddy_tls: state.config.caddy.tls.clone(),
             deploy: state.config.deploy.clone(),
             listen_addr: state.config.server.listen.to_string(),
+            acme_email: crate::config::resolve_acme_email(&state.config),
+            acme_ca: state.config.caddy.acme_ca.clone(),
         }
     }
 }
@@ -174,6 +181,9 @@ pub async fn reconcile_tick(
                 deploy_cfg.domain.as_deref(),
                 &deploy_cfg.tls,
                 &ctx.listen_addr,
+                ctx.acme_email.as_deref(),
+                ctx.caddy_tls.as_ref(),
+                ctx.acme_ca.as_deref(),
             )
             .await
     {
@@ -187,7 +197,12 @@ pub async fn reconcile_tick(
     }
 
     // ── 2. Re-apply app routes with retry + collect-and-continue ────────────
-    reconcile_app_routes(&ctx.caddy, &ctx.app_states, &ctx.apps, backoff).await
+    let summary = reconcile_app_routes(&ctx.caddy, &ctx.app_states, &ctx.apps, backoff).await;
+
+    // ── 3. Re-apply per-app TLS policies (SLIP-104 Phase 3) ─────────────────
+    reconcile_app_tls(&ctx.caddy, &ctx.app_states, &ctx.apps, ctx).await;
+
+    summary
 }
 
 /// Re-apply every running app's Caddy routes, retrying each route with
@@ -311,6 +326,167 @@ async fn reconcile_route_with_retry(
     }
 }
 
+/// Re-apply per-app TLS automation policies based on routing config.
+///
+/// For each running app's route, resolves the effective `TlsStrategy`
+/// (explicit `routing.tls` / `RouteEntry.tls` > auto-internal classification
+/// for non-public absent-TLS > leave untouched for public absent-TLS) and
+/// upserts the TLS policy. DNS-01 strategies are preflighted via
+/// `has_dns_provider`; Tailscale strategies via `preflight_tailscale`.
+///
+/// Failures are logged and skipped (collect-and-continue), matching the
+/// route reconcile pattern.
+async fn reconcile_app_tls(
+    caddy: &CaddyClient,
+    states: &HashMap<String, AppRuntimeState>,
+    app_configs: &HashMap<String, AppConfig>,
+    ctx: &ReconcileContext,
+) {
+    for (app_name, state) in states {
+        if state.status != AppStatus::Running {
+            continue;
+        }
+        let Some(config) = app_configs.get(app_name) else {
+            continue;
+        };
+
+        for route in config.routing.effective_routes() {
+            let host = &route.hostname;
+            // Route-level tls override > routing-level tls > None (classify).
+            let explicit = route.tls.or(config.routing.tls);
+            let decision = crate::caddy::resolve_route_tls(host, explicit);
+
+            match decision {
+                crate::caddy::RouteTlsDecision::LeaveDefault => {
+                    // Public host, no explicit TLS — leave Caddy's default.
+                }
+                crate::caddy::RouteTlsDecision::Apply(strategy) => {
+                    let subjects = vec![host.clone()];
+                    let dns_config = ctx.caddy_tls.as_ref();
+                    let policy = crate::caddy::build_tls_policy(
+                        &subjects,
+                        strategy,
+                        dns_config,
+                        ctx.acme_email.as_deref(),
+                        ctx.acme_ca.as_deref(),
+                    );
+
+                    // Preflight for DNS-01: check cloudflare plugin.
+                    if strategy == TlsStrategy::CloudflareDns01 {
+                        match caddy.has_dns_provider("cloudflare").await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                tracing::warn!(
+                                    app = %app_name,
+                                    host = %host,
+                                    "cloudflare DNS plugin not found in running Caddy — \
+                                     DNS-01 policy NOT applied; \
+                                     remedy: build a Caddy binary with the DNS plugin: \
+                                     `xcaddy build --with github.com/caddy-dns/cloudflare` \
+                                     and replace the system caddy binary, then restart caddy"
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    app = %app_name,
+                                    host = %host,
+                                    error = %e,
+                                    "failed to verify cloudflare DNS plugin presence \
+                                     (both GET /modules/ and caddy list-modules failed) — \
+                                     DNS-01 policy NOT applied; \
+                                     remedy: ensure caddy is installed and reachable, \
+                                     then rebuild with: \
+                                     xcaddy build --with github.com/caddy-dns/cloudflare"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Preflight for Tailscale: check prerequisites.
+                    // The preflight shells out to systemctl/tailscale (blocking
+                    // calls inside an async function). Run in a spawned task
+                    // with tokio::time::timeout so blocking shells don't stall
+                    // the reconcile executor thread (SEC-9 fix).
+                    if strategy == TlsStrategy::Tailscale {
+                        let runner = RealCommandRunner;
+                        let caddy_clone = caddy.clone();
+                        let host_clone = host.clone();
+                        let preflight_handle = tokio::spawn(async move {
+                            crate::tailscale::preflight_tailscale(
+                                &runner,
+                                &caddy_clone,
+                                &host_clone,
+                            )
+                            .await
+                        });
+                        let preflight_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(15),
+                            preflight_handle,
+                        )
+                        .await;
+                        match preflight_result {
+                            Ok(Ok(Ok(_))) => {}
+                            Ok(Ok(Err(e))) => {
+                                tracing::warn!(
+                                    app = %app_name,
+                                    host = %host,
+                                    check = e.check,
+                                    remedy = %e.remedy,
+                                    "Tailscale preflight failed — policy not applied"
+                                );
+                                continue;
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    app = %app_name,
+                                    host = %host,
+                                    error = %e,
+                                    "Tailscale preflight task panicked — policy not applied"
+                                );
+                                continue;
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    app = %app_name,
+                                    host = %host,
+                                    "Tailscale preflight timed out (15s) — policy not applied"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    if let Err(e) = caddy.upsert_tls_policy(&subjects, &policy).await {
+                        tracing::warn!(
+                            app = %app_name,
+                            host = %host,
+                            strategy = %strategy,
+                            error = %e,
+                            "failed to upsert TLS policy (will retry next tick)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Real command runner that shells out via `std::process::Command`.
+struct RealCommandRunner;
+
+impl CommandRunner for RealCommandRunner {
+    fn run(&self, cmd: &str, args: &[&str]) -> std::io::Result<crate::doctor::CommandOutput> {
+        let output = std::process::Command::new(cmd).args(args).output()?;
+        Ok(crate::doctor::CommandOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            status: output.status.code().unwrap_or(-1),
+        })
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -337,6 +513,7 @@ mod tests {
                 domain: Some(domain.to_string()),
                 port: Some(80),
                 routes: vec![],
+                tls: None,
             },
             health: HealthConfig::default(),
             deploy: DeployConfig::default(),
@@ -783,7 +960,14 @@ mod tests {
 
         // Configure deploy-webhook via bootstrap_deploy.
         caddy
-            .bootstrap_deploy(Some("deploy.example.com"), "internal", "127.0.0.1:7890")
+            .bootstrap_deploy(
+                Some("deploy.example.com"),
+                &TlsStrategy::Internal,
+                "127.0.0.1:7890",
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -796,10 +980,12 @@ mod tests {
             caddy_tls: None,
             deploy: Some(ServerDeployConfig {
                 domain: Some("deploy.example.com".to_string()),
-                tls: "internal".to_string(),
+                tls: TlsStrategy::Internal,
                 ..Default::default()
             }),
             listen_addr: "127.0.0.1:7890".to_string(),
+            acme_email: None,
+            acme_ca: None,
         };
 
         // Verify the webhook route exists after bootstrap_deploy.

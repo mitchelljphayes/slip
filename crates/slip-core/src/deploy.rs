@@ -2433,6 +2433,7 @@ mod tests {
                 domain: Some("testapp.example.com".to_string()),
                 port: Some(3000),
                 routes: vec![],
+                tls: None,
             },
             health: HealthConfig {
                 // No health path — check always passes without any HTTP call.
@@ -3468,6 +3469,7 @@ container = "web"
                 domain: Some("testapp.example.com".to_string()),
                 port: Some(3000),
                 routes: vec![],
+                tls: None,
             },
             health: HealthConfig::default(),
             deploy: DeployConfig::default(),
@@ -3507,6 +3509,7 @@ container = "web"
                 domain: Some("testapp.example.com".to_string()),
                 port: Some(3000),
                 routes: vec![],
+                tls: None,
             },
             health: HealthConfig::default(),
             deploy: DeployConfig::default(),
@@ -3542,6 +3545,7 @@ container = "web"
                 domain: Some("testapp.example.com".to_string()),
                 port: Some(3000),
                 routes: vec![],
+                tls: None,
             },
             health: HealthConfig::default(),
             deploy: DeployConfig::default(),
@@ -3572,6 +3576,7 @@ container = "web"
                 domain: Some("testapp.example.com".to_string()),
                 port: Some(3000),
                 routes: vec![],
+                tls: None,
             },
             health: HealthConfig::default(),
             deploy: DeployConfig::default(),
@@ -4193,6 +4198,7 @@ container = "web"
             domain: None,
             port: None,
             routes: vec![],
+            tls: None,
         };
         let mut apps = HashMap::new();
         apps.insert("testapp".to_string(), app_config);
@@ -4270,6 +4276,7 @@ container = "web"
             started_at: chrono::Utc::now(),
             preview_states: Arc::new(DashMap::new()),
             preview_locks: DashMap::new(),
+            renew_locks: DashMap::new(),
             secrets_store: crate::secrets::SecretsStore::new(secrets_path).unwrap(),
         })
     }

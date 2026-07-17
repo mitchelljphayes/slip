@@ -32,6 +32,10 @@ getrandom = { workspace = true }
 json-patch = { workspace = true }
 backon = { workspace = true }
 tokio-stream = "0.1"
+x509-parser = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

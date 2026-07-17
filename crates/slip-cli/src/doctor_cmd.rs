@@ -595,7 +595,7 @@ fn check_caddy_dns_plugin(runner: &dyn CommandRunner, cfg: &DoctorConfig) -> Ver
         }
     };
 
-    let status = parse_caddy_modules(&modules_text, required);
+    let status = parse_caddy_modules(&modules_text, required.as_deref());
     match status {
         CheckStatus::Skipped => VerificationCheck::new(
             "caddy.dns_plugin",
@@ -610,12 +610,12 @@ fn check_caddy_dns_plugin(runner: &dyn CommandRunner, cfg: &DoctorConfig) -> Ver
             CheckStatus::Pass,
             format!(
                 "caddy has dns.providers.{} compiled in",
-                required.unwrap_or("")
+                required.as_deref().unwrap_or("")
             ),
             None,
         ),
         CheckStatus::Fail => {
-            let provider = required.unwrap_or("");
+            let provider = required.as_deref().unwrap_or("");
             VerificationCheck::new(
                 "caddy.dns_plugin",
                 "Caddy DNS-01 plugin",
@@ -639,17 +639,16 @@ fn check_caddy_dns_plugin(runner: &dyn CommandRunner, cfg: &DoctorConfig) -> Ver
 }
 
 /// Determine the required DNS provider from config (caddy.tls.dns_provider
-/// OR deploy.tls ending in `-dns01`).
-fn required_dns_provider(cfg: &DoctorConfig) -> Option<&str> {
+/// OR deploy strategy being `CloudflareDns01`).
+fn required_dns_provider(cfg: &DoctorConfig) -> Option<String> {
     if let Some(slip) = &cfg.slip_toml {
         if let Some(tls) = &slip.caddy.tls {
-            return Some(tls.dns_provider.as_str());
+            return Some(tls.dns_provider.clone());
         }
         if let Some(deploy) = &slip.deploy
-            && deploy.tls.ends_with("-dns01")
+            && deploy.tls == slip_core::config::TlsStrategy::CloudflareDns01
         {
-            // e.g. "cloudflare-dns01" → "cloudflare"
-            return Some(deploy.tls.strip_suffix("-dns01").unwrap_or(&deploy.tls));
+            return Some("cloudflare".to_string());
         }
     }
     None
@@ -813,7 +812,7 @@ pub async fn run_slipd_checks(
     checks.extend(check_registry(cfg, timeout_secs).await);
 
     // TLS checks.
-    checks.extend(check_tls(cfg, &caddy_admin, timeout_secs).await);
+    checks.extend(check_tls(cfg, &caddy_admin, timeout_secs, runner).await);
 
     // DNS end-to-end probe + DNS expectation (check 2 + 8).
     checks.extend(check_dns(cfg, runner, timeout_secs).await);
@@ -1177,6 +1176,7 @@ async fn check_tls(
     cfg: &DoctorConfig,
     caddy_admin: &str,
     timeout_secs: u64,
+    runner: &dyn CommandRunner,
 ) -> Vec<VerificationCheck> {
     let mut out = Vec::with_capacity(3);
 
@@ -1308,10 +1308,182 @@ async fn check_tls(
         "tls.acme_stuck",
         "TLS stuck ACME orders",
         CheckStatus::Skipped,
-        String::from("stuck ACME order detection not yet implemented — \
-         Caddy's admin API does not expose ACME order state (api.rs:2126 comment)"),
-        Some(String::from("check `journalctl -u caddy` for ACME errors; `slip tls renew <host>` is a planned follow-up (SLIP-102 direction)")),
+        String::from(
+            "stuck ACME order detection is not available via Caddy's admin API — \
+             Caddy does not expose ACME order state (api.rs comment)",
+        ),
+        Some(String::from(
+            "run: slip tls renew <host> to force reissue \
+             (non-destructive: bumps renewal_window_ratio then reverts it)",
+        )),
     ));
+
+    // ── Tailscale doctor checks (additive, print only) ────────────────────
+    // Run when any host has tls="tailscale" OR any .ts.net host exists.
+    let has_tailscale_strategy = slip
+        .deploy
+        .as_ref()
+        .map(|d| d.tls == slip_core::config::TlsStrategy::Tailscale)
+        .unwrap_or(false)
+        || cfg.apps.values().any(|a| {
+            a.routing.tls == Some(slip_core::config::TlsStrategy::Tailscale)
+                || a.routing
+                    .routes
+                    .iter()
+                    .any(|r| r.tls == Some(slip_core::config::TlsStrategy::Tailscale))
+        });
+    let ts_net_hosts: Vec<String> = hosts
+        .iter()
+        .filter(|h| slip_core::config::is_ts_net_host(h))
+        .cloned()
+        .collect();
+
+    if has_tailscale_strategy || !ts_net_hosts.is_empty() {
+        // tailscale.daemon — tailscaled active + socket present
+        let daemon_active = runner
+            .run("systemctl", &["is-active", "tailscaled"])
+            .map(|o| o.status == 0 && o.stdout.trim() == "active")
+            .unwrap_or(false);
+        let socket_present = std::path::Path::new(slip_core::tailscale::TAILSCALED_SOCKET).exists();
+
+        if daemon_active && socket_present {
+            out.push(VerificationCheck::new(
+                "tailscale.daemon",
+                "Tailscale daemon",
+                CheckStatus::Pass,
+                String::from("tailscaled is active and socket is present"),
+                None,
+            ));
+        } else {
+            let mut detail = String::from("tailscaled not running or socket missing");
+            if !daemon_active {
+                detail.push_str(" — daemon is not active");
+            }
+            if !socket_present {
+                detail.push_str(" — socket not found");
+            }
+            out.push(VerificationCheck::new(
+                "tailscale.daemon",
+                "Tailscale daemon",
+                CheckStatus::Fail,
+                detail,
+                Some(String::from(
+                    "run: systemctl start tailscaled \
+                     (socket: /var/run/tailscale/tailscaled.sock)",
+                )),
+            ));
+        }
+
+        // tailscale.https — CertDomains non-empty
+        let status_out = runner.run("tailscale", &["status", "--json"]);
+        let cert_domains = status_out
+            .ok()
+            .filter(|o| o.status == 0)
+            .map(|o| slip_core::tailscale::parse_cert_domains(&o.stdout))
+            .unwrap_or_default();
+
+        if !cert_domains.is_empty() {
+            out.push(VerificationCheck::new(
+                "tailscale.https",
+                "Tailscale HTTPS certificates",
+                CheckStatus::Pass,
+                format!("HTTPS enabled — CertDomains: {}", cert_domains.join(", ")),
+                None,
+            ));
+        } else {
+            out.push(VerificationCheck::new(
+                "tailscale.https",
+                "Tailscale HTTPS certificates",
+                CheckStatus::Fail,
+                String::from(
+                    "HTTPS certificates not enabled for tailnet — \
+                     tailscale status --json reports no CertDomains",
+                ),
+                Some(String::from(
+                    "enable MagicDNS + HTTPS Certificates at \
+                     https://login.tailscale.com/admin/dns",
+                )),
+            ));
+        }
+
+        // tailscale.caddy_user — TS_PERMIT_CERT_UID for non-root Caddy
+        // Delegate to the shared core implementation (RE-5 fix — no duplication).
+        let permitted = slip_core::tailscale::check_caddy_user_permission();
+
+        if permitted {
+            out.push(VerificationCheck::new(
+                "tailscale.caddy_user",
+                "Tailscale Caddy user permission",
+                CheckStatus::Pass,
+                String::from("Caddy user can access tailscaled socket"),
+                None,
+            ));
+        } else {
+            out.push(VerificationCheck::new(
+                "tailscale.caddy_user",
+                "Tailscale Caddy user permission",
+                CheckStatus::Fail,
+                String::from(
+                    "Caddy user 'caddy' cannot access tailscaled socket — \
+                     TS_PERMIT_CERT_UID not set in /etc/default/tailscaled",
+                ),
+                Some(String::from(
+                    "set TS_PERMIT_CERT_UID=caddy in /etc/default/tailscaled, \
+                     then: systemctl restart tailscaled. \
+                     See https://tailscale.com/docs/integrations/web-servers/caddy/caddy-certificates",
+                )),
+            ));
+        }
+
+        // tailscale.manager_module — Caddy has the Tailscale manager
+        let has_manager = caddy.has_cert_manager("tailscale").await.unwrap_or(false);
+        if has_manager {
+            out.push(VerificationCheck::new(
+                "tailscale.manager_module",
+                "Tailscale Caddy certificate manager",
+                CheckStatus::Pass,
+                String::from("tls.get_certificate.tailscale found in Caddy module inventory"),
+                None,
+            ));
+        } else {
+            out.push(VerificationCheck::new(
+                "tailscale.manager_module",
+                "Tailscale Caddy certificate manager",
+                CheckStatus::Fail,
+                String::from(
+                    "Tailscale certificate manager not found in Caddy — \
+                     Caddy v2.5+ required for built-in Tailscale manager",
+                ),
+                Some(String::from("upgrade Caddy to v2.5 or later")),
+            ));
+        }
+
+        // tailscale.hostname_match — per .ts.net host
+        for ts_host in &ts_net_hosts {
+            let matches = slip_core::tailscale::host_matches_cert_domains(ts_host, &cert_domains);
+            if matches {
+                out.push(VerificationCheck::new(
+                    "tailscale.hostname_match",
+                    format!("Tailscale hostname match: {ts_host}"),
+                    CheckStatus::Pass,
+                    format!("{ts_host} matches a tailscaled CertDomain"),
+                    None,
+                ));
+            } else {
+                out.push(VerificationCheck::new(
+                    "tailscale.hostname_match",
+                    format!("Tailscale hostname match: {ts_host}"),
+                    CheckStatus::Fail,
+                    format!("{ts_host} does not match any tailscaled CertDomain"),
+                    Some(
+                        "rename the node: tailscale set --hostname <node>, \
+                         or use a *.ts.net subject that matches this machine"
+                            .to_string(),
+                    ),
+                ));
+            }
+        }
+    }
 
     out
 }
@@ -1328,10 +1500,16 @@ async fn check_tls(
 /// (tailnet/home-server origins) but documented here so a future ticket
 /// can refine it (e.g. by checking the resolved IP against RFC 1918/CGNAT).
 fn is_private_hostname(host: &str) -> bool {
-    host.ends_with(".local")
-        || host.ends_with(".ts.net")
-        || host.ends_with(".internal")
-        || host.split('.').count() == 1 // bare name, no domain
+    // Reuse the config allowlist for consistency with auto-internal classification.
+    // `.ts.net` is NOT classified as private here — it uses real LE certs via
+    // the Tailscale manager, so an internal issuer on a .ts.net host IS a
+    // mismatch worth warning about.
+    for tld in slip_core::config::NON_PUBLIC_TLDS {
+        if host.ends_with(tld) {
+            return true;
+        }
+    }
+    host.split('.').count() == 1 // bare name, no domain
 }
 
 /// Check 2 + 8: DNS probe (getent ahosts) + DNS expectation classification.
@@ -2045,6 +2223,8 @@ mod tests {
                         propagation_delay: String::from("2m"),
                         staging: false,
                     }),
+                    acme_email: None,
+                    acme_ca: None,
                     reconcile: slip_core::ReconcileConfig::default(),
                 },
                 auth: slip_core::AuthConfig {
@@ -2058,7 +2238,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(required_dns_provider(&cfg), Some("cloudflare"));
+        assert_eq!(required_dns_provider(&cfg), Some("cloudflare".to_string()));
     }
 
     #[test]
@@ -2069,6 +2249,8 @@ mod tests {
                 caddy: slip_core::CaddyConfig {
                     admin_api: String::from("http://localhost:2019"),
                     tls: None,
+                    acme_email: None,
+                    acme_ca: None,
                     reconcile: slip_core::ReconcileConfig::default(),
                 },
                 auth: slip_core::AuthConfig {
@@ -2082,12 +2264,12 @@ mod tests {
                     timeout: std::time::Duration::from_secs(60),
                     preview_timeout: std::time::Duration::from_secs(60),
                     domain: Some(String::from("deploy.example")),
-                    tls: String::from("cloudflare-dns01"),
+                    tls: slip_core::config::TlsStrategy::CloudflareDns01,
                 }),
             }),
             ..Default::default()
         };
-        assert_eq!(required_dns_provider(&cfg), Some("cloudflare"));
+        assert_eq!(required_dns_provider(&cfg), Some("cloudflare".to_string()));
     }
 
     #[test]
@@ -2165,6 +2347,8 @@ mod tests {
                         propagation_delay: String::from("2m"),
                         staging: false,
                     }),
+                    acme_email: None,
+                    acme_ca: None,
                     reconcile: slip_core::ReconcileConfig::default(),
                 },
                 auth: slip_core::AuthConfig {
@@ -2201,6 +2385,8 @@ mod tests {
                         propagation_delay: String::from("2m"),
                         staging: false,
                     }),
+                    acme_email: None,
+                    acme_ca: None,
                     reconcile: slip_core::ReconcileConfig::default(),
                 },
                 auth: slip_core::AuthConfig {
@@ -2276,7 +2462,9 @@ mod tests {
 
     #[test]
     fn is_private_hostname_detects_tailnet() {
-        assert!(is_private_hostname("foo.ts.net"));
+        // .ts.net is NOT classified as private — it uses real LE certs via
+        // the Tailscale manager, so an internal issuer on .ts.net IS a mismatch.
+        assert!(!is_private_hostname("foo.ts.net"));
         assert!(is_private_hostname("bar.local"));
         assert!(is_private_hostname("baz.internal"));
         assert!(!is_private_hostname("deploy.example.com"));
@@ -2744,6 +2932,8 @@ mod tests {
             caddy: slip_core::CaddyConfig {
                 admin_api: String::from("http://localhost:2019"),
                 tls: None,
+                acme_email: None,
+                acme_ca: None,
                 reconcile: slip_core::ReconcileConfig::default(),
             },
             auth: slip_core::AuthConfig {
@@ -2757,7 +2947,9 @@ mod tests {
                 timeout: std::time::Duration::from_secs(60),
                 preview_timeout: std::time::Duration::from_secs(60),
                 domain: Some(domain.to_string()),
-                tls: tls.to_string(),
+                tls: tls
+                    .parse()
+                    .unwrap_or(slip_core::config::TlsStrategy::Internal),
             }),
         }
     }

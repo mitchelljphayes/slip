@@ -190,8 +190,18 @@ async fn main() -> anyhow::Result<()> {
     // ── SLIP-87: Bootstrap deploy-webhook ingress ─────────────────────────────
     if let Some(deploy_cfg) = &slip_config.deploy {
         let upstream = slip_config.server.listen.to_string();
+        let acme_email = slip_core::config::resolve_acme_email(&slip_config);
+        let ca_url = slip_config.caddy.acme_ca.as_deref();
+        let dns_config = slip_config.caddy.tls.as_ref();
         match caddy
-            .bootstrap_deploy(deploy_cfg.domain.as_deref(), &deploy_cfg.tls, &upstream)
+            .bootstrap_deploy(
+                deploy_cfg.domain.as_deref(),
+                &deploy_cfg.tls,
+                &upstream,
+                acme_email.as_deref(),
+                dns_config,
+                ca_url,
+            )
             .await
         {
             Ok(()) => {
@@ -292,6 +302,7 @@ async fn main() -> anyhow::Result<()> {
         started_at: Utc::now(),
         preview_states,
         preview_locks: DashMap::new(),
+        renew_locks: DashMap::new(),
         secrets_store,
     });
 
