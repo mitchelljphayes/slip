@@ -92,6 +92,11 @@ pub struct RepoHealthConfig {
     pub retries: Option<u32>,
     #[serde(default, with = "option_duration_serde")]
     pub start_period: Option<Duration>,
+    /// HTTP status codes that count as healthy (see `docs/health.md`). Parsed
+    /// at config load — an invalid spec fails `parse_repo_config` before any
+    /// deploy. Defaults to `200-399` at probe time when unset.
+    #[serde(default)]
+    pub expect_status: Option<crate::status_expectation::StatusExpectation>,
 }
 
 /// A single route entry in the repo-side routing config.
@@ -773,5 +778,58 @@ container = "web"
 "#;
         let cfg = parse_repo_config(toml.as_bytes()).unwrap();
         assert_eq!(cfg.routing.routes[0].kind, "http");
+    }
+
+    // ── expect_status parsing ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_repo_config_with_expect_status() {
+        let toml = r#"
+[app]
+name = "myapp"
+
+[health]
+path = "/healthz"
+expect_status = "200,204"
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        let expect = cfg.health.expect_status.expect("expect_status set");
+        assert_eq!(expect.canonical(), "200,204");
+        assert!(expect.accepts(200));
+        assert!(expect.accepts(204));
+        assert!(!expect.accepts(307));
+    }
+
+    #[test]
+    fn parse_repo_config_without_expect_status_defaults_to_none() {
+        let toml = r#"
+[app]
+name = "myapp"
+
+[health]
+path = "/healthz"
+"#;
+        let cfg = parse_repo_config(toml.as_bytes()).unwrap();
+        assert!(
+            cfg.health.expect_status.is_none(),
+            "expect_status must be None when absent — preserves back-compat"
+        );
+    }
+
+    #[test]
+    fn parse_repo_config_invalid_expect_status_errors() {
+        let toml = r#"
+[app]
+name = "myapp"
+
+[health]
+expect_status = "99"
+"#;
+        let err = parse_repo_config(toml.as_bytes()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("100-599"),
+            "prescriptive out-of-range message: {msg}"
+        );
     }
 }

@@ -39,6 +39,8 @@ struct PushableHealth {
     timeout_secs: Option<f64>,
     retries: Option<u32>,
     start_period_secs: Option<f64>,
+    /// Canonical string form (e.g. `"200-399"`), or `None` when unset.
+    expect_status: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +81,11 @@ fn repo_pushable(cfg: &RepoConfig) -> Pushable {
             timeout_secs: cfg.health.timeout.map(|d| d.as_secs_f64()),
             retries: cfg.health.retries,
             start_period_secs: cfg.health.start_period.map(|d| d.as_secs_f64()),
+            expect_status: cfg
+                .health
+                .expect_status
+                .as_ref()
+                .map(crate::status_expectation::StatusExpectation::canonical),
         },
         resources: PushableResources {
             memory: cfg
@@ -139,6 +146,11 @@ fn server_pushable(resp: &AppResponse) -> Pushable {
             timeout_secs: Some(resp.health.timeout.as_secs_f64()),
             retries: Some(resp.health.retries),
             start_period_secs: Some(resp.health.start_period.as_secs_f64()),
+            expect_status: resp
+                .health
+                .expect_status
+                .as_ref()
+                .map(crate::status_expectation::StatusExpectation::canonical),
         },
         resources: PushableResources {
             memory: resp.resources.memory.clone(),
@@ -206,6 +218,9 @@ fn normalize_server_to_repo(repo: &Pushable, server: &mut Pushable) {
     }
     if repo.health.start_period_secs.is_none() {
         server.health.start_period_secs = None;
+    }
+    if repo.health.expect_status.is_none() {
+        server.health.expect_status = None;
     }
     // Resources: if repo has None, server should also be None
     if repo.resources.memory.is_none() {
@@ -437,6 +452,7 @@ pub fn build_update_payload(repo: &RepoConfig) -> Value {
         || repo.health.timeout.is_some()
         || repo.health.retries.is_some()
         || repo.health.start_period.is_some()
+        || repo.health.expect_status.is_some()
     {
         let mut h = serde_json::json!({});
         if let Some(ref path) = repo.health.path {
@@ -462,6 +478,9 @@ pub fn build_update_payload(repo: &RepoConfig) -> Value {
                 serde_json::Number::from_f64(start.as_secs_f64())
                     .unwrap_or(serde_json::Number::from_f64(0.0).unwrap()),
             );
+        }
+        if let Some(ref expect) = repo.health.expect_status {
+            h["expect_status"] = Value::String(expect.canonical());
         }
         health = Some(h);
     }
@@ -577,6 +596,7 @@ pub fn build_create_payload(repo: &RepoConfig) -> Result<Value, String> {
         || repo.health.timeout.is_some()
         || repo.health.retries.is_some()
         || repo.health.start_period.is_some()
+        || repo.health.expect_status.is_some()
     {
         let mut h = serde_json::json!({});
         if let Some(ref path) = repo.health.path {
@@ -602,6 +622,9 @@ pub fn build_create_payload(repo: &RepoConfig) -> Result<Value, String> {
                 serde_json::Number::from_f64(start.as_secs_f64())
                     .unwrap_or(serde_json::Number::from_f64(0.0).unwrap()),
             );
+        }
+        if let Some(ref expect) = repo.health.expect_status {
+            h["expect_status"] = Value::String(expect.canonical());
         }
         health = Some(h);
     }
@@ -847,6 +870,75 @@ mod tests {
         });
         let payload = build_update_payload(&repo);
         assert_eq!(payload["health"]["path"], "/healthz");
+    }
+
+    #[test]
+    fn build_update_payload_contains_expect_status() {
+        let repo = make_repo(|r| {
+            r.health.expect_status =
+                Some(crate::status_expectation::StatusExpectation::parse("200,204").unwrap());
+        });
+        let payload = build_update_payload(&repo);
+        assert_eq!(payload["health"]["expect_status"], "200,204");
+    }
+
+    #[test]
+    fn build_create_payload_contains_expect_status() {
+        let repo = make_repo(|r| {
+            r.app.image = Some("ghcr.io/org/app:latest".to_string());
+            r.routing.domain = Some("app.example.com".to_string());
+            r.health.expect_status =
+                Some(crate::status_expectation::StatusExpectation::parse("200-299,503").unwrap());
+        });
+        let payload = build_create_payload(&repo).unwrap();
+        assert_eq!(payload["health"]["expect_status"], "200-299,503");
+    }
+
+    /// Highest-risk regression guard (Q3): a repo *without* `expect_status`
+    /// applied against a server *with* one must NOT produce a diff — the
+    /// `normalize_server_to_repo` step nulls the server's field when the repo
+    /// leaves it unset.
+    #[test]
+    fn apply_repo_without_expect_status_against_server_with_one_has_no_diff() {
+        let repo = make_repo(|r| {
+            r.health.path = Some("/healthz".to_string());
+        });
+        let server = make_server(|s| {
+            s.health.path = Some("/healthz".to_string());
+            s.health.expect_status =
+                Some(crate::status_expectation::StatusExpectation::parse("200,204").unwrap());
+        });
+        let diff = compute_diff(&repo, &server).unwrap();
+        if diff.changed {
+            for op in &diff.ops {
+                eprintln!("  unexpected op: path={:?}", op.path());
+            }
+        }
+        assert!(
+            !diff.changed,
+            "repo without expect_status must not diff against a server with one"
+        );
+    }
+
+    /// When the repo *does* set `expect_status`, a diff is produced against a
+    /// server with a different (or absent) expectation.
+    #[test]
+    fn expect_status_change_shows_replace() {
+        let repo = make_repo(|r| {
+            r.health.path = Some("/healthz".to_string());
+            r.health.expect_status =
+                Some(crate::status_expectation::StatusExpectation::parse("200").unwrap());
+        });
+        let server = make_server(|s| {
+            s.health.path = Some("/healthz".to_string());
+            s.health.expect_status =
+                Some(crate::status_expectation::StatusExpectation::parse("200-399").unwrap());
+        });
+        let diff = compute_diff(&repo, &server).unwrap();
+        assert!(diff.changed);
+        assert!(diff.ops.iter().any(|op| {
+            matches!(op, json_patch::PatchOperation::Replace(r) if r.path == "/health/expect_status")
+        }));
     }
 
     #[test]

@@ -2865,10 +2865,21 @@ async fn main() -> anyhow::Result<()> {
             rollback(&server, &token, &app, to).await?;
         }
         Commands::Validate { path, strict } => {
+            let json = cli.json;
             let content = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("✗ Failed to read '{}': {}", path, e);
+                    if json {
+                        // Stable JSON envelope for read failures (SLIP-86).
+                        let envelope = serde_json::json!({
+                            "ok": false,
+                            "errors": [{"message": format!("Failed to read '{}': {}", path, e)}],
+                            "warnings": [],
+                        });
+                        println!("{}", serde_json::to_string(&envelope).unwrap());
+                    } else {
+                        eprintln!("✗ Failed to read '{}': {}", path, e);
+                    }
                     std::process::exit(1);
                 }
             };
@@ -2881,41 +2892,56 @@ async fn main() -> anyhow::Result<()> {
             let (config, result) =
                 slip_core::validate::parse_and_validate(&content, &base_dir, strict);
 
-            // Print warnings
-            for warning in &result.warnings {
-                println!("⚠ {}", warning);
+            if json {
+                // Stable JSON envelope (SLIP-86). Schema: `slip.validate/v1`.
+                // Field names are frozen on first release — additive-only.
+                let envelope = serde_json::json!({
+                    "ok": result.is_valid(),
+                    "errors": result.errors.iter().map(|e| {
+                        serde_json::json!({"message": e.to_string()})
+                    }).collect::<Vec<_>>(),
+                    "warnings": result.warnings,
+                });
+                println!("{}", serde_json::to_string(&envelope).unwrap());
+            } else {
+                // Print warnings (existing human behavior preserved).
+                for warning in &result.warnings {
+                    println!("⚠ {}", warning);
+                }
+
+                // Print errors (existing human behavior preserved).
+                for error in &result.errors {
+                    eprintln!("✗ {}", error);
+                }
+
+                // Print success summary (existing human behavior preserved).
+                if result.is_valid()
+                    && let Some(cfg) = config
+                {
+                    println!("✓ Valid repo config");
+                    println!("  app:  {}", cfg.app.name);
+                    println!("  kind: {}", cfg.app.kind);
+
+                    if let Some(ref manifest) = cfg.app.manifest {
+                        println!("  manifest: {}", manifest);
+                    }
+
+                    if let Some(ref preview) = cfg.preview {
+                        println!(
+                            "  preview: {}",
+                            if preview.enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        );
+                    }
+                }
             }
 
-            // Print errors
-            for error in &result.errors {
-                eprintln!("✗ {}", error);
-            }
-
-            // Exit if errors
+            // Exit if errors — exit behavior unchanged by --json (SLIP-86).
             if !result.is_valid() {
                 std::process::exit(1);
-            }
-
-            // Print success summary
-            if let Some(cfg) = config {
-                println!("✓ Valid repo config");
-                println!("  app:  {}", cfg.app.name);
-                println!("  kind: {}", cfg.app.kind);
-
-                if let Some(ref manifest) = cfg.app.manifest {
-                    println!("  manifest: {}", manifest);
-                }
-
-                if let Some(ref preview) = cfg.preview {
-                    println!(
-                        "  preview: {}",
-                        if preview.enabled {
-                            "enabled"
-                        } else {
-                            "disabled"
-                        }
-                    );
-                }
             }
         }
         Commands::Secrets(command) => {

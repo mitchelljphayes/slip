@@ -20,11 +20,12 @@ The HMAC is computed over the raw JSON body bytes using SHA-256.
 
 ### Health / readiness semantics
 
-The health check gates the blue-green swap. A container is considered healthy when its readiness endpoint returns HTTP 200.
+The health check gates the blue-green swap. A container is considered healthy when its readiness endpoint returns an HTTP status code in `expect_status` (default `200-399`, Kubernetes-compatible — redirects are **not** followed; the original response is evaluated).
 
 - **Do NOT use `/` as the health check path.** The root endpoint typically returns 200 even when the database or other dependencies are down, which can cause a blue-green swap to route traffic to a broken container.
 - **Implement a dedicated readiness endpoint** (e.g. `/healthz` or `/ready`) that exercises DB/ORM initialization and other critical dependencies.
-- The health check is configured in `slip.toml` under `[health]`.
+- The health check is configured in `slip.toml` under `[health]` (see `expect_status` for the full grammar).
+- See `docs/health.md` for the full contract: timeout arithmetic, blue-green gating, migration patterns, redirects, and dependency checks.
 
 ### Blue-green rules
 

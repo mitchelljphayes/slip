@@ -115,7 +115,7 @@ Each app gets its own TOML file in `/etc/slip/apps/`. This is the **server-side*
 
 ### Simple single-container app (blue-green)
 
-Each app is a single `[app]` table (not `[[apps]]`). The `[health]` section is required — omit `path` to skip the HTTP probe and health-check on "container running" instead.
+Each app is a single `[app]` table (not `[[apps]]`). The `[health]` section is required — omit `path` to skip the HTTP probe and health-check on "container running" instead. See `docs/health.md` for the full health semantics (readiness patterns, `expect_status` grammar, timeout arithmetic, redirects).
 
 ```bash
 sudo tee /etc/slip/apps/my-app.toml > /dev/null << 'EOF'
@@ -453,7 +453,7 @@ Your slip-deployed containers can then reach `postgres:5432` by name. See [docs/
 
 - **`slipd --check` fails** — check TOML syntax, app names match image config
 - **Container won't start** — `journalctl -u slipd -f` shows the deploy log
-- **Health check fails** — verify your app's `/health` endpoint works inside the container
+- **Health check fails** — verify your app's `/health` endpoint works inside the container. See `docs/health.md` for readiness patterns and the `expect_status` grammar.
 - **Caddy route not created** — check `sudo journalctl -u slipd | grep caddy`, ensure Caddy admin API is on `:2019`
 - **Permission denied on Podman socket** — ensure the `slip` user is in the `podman` group, or use Docker's `/var/run/docker.sock`
 - **Webhook 401** — verify the HMAC signature matches. The signing key is either the **global** `[auth].secret` from `slip.toml` or the **per-app** `[app] secret` from the app TOML. `slip secrets set <app> SLIP_SECRET=...` does **not** affect webhook auth — it injects the value as a container env var only. See §6 for the full distinction.

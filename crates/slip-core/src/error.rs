@@ -69,6 +69,20 @@ pub enum ConfigError {
 pub enum HealthError {
     #[error("unhealthy after {retries} attempts at {url}")]
     Unhealthy { retries: u32, url: String },
+    /// At least one probe attempt received an HTTP response whose status was
+    /// not in `expect_status`. Carries the canonical `expected` string, the
+    /// `actual` status code of the last attempt that received a response, the
+    /// probe `url`, and the number of `attempts` made. **No response bodies or
+    /// headers are ever stored** (SLIP-103 D6).
+    #[error(
+        "health check failed: expected {expected}, got {actual} at {url} after {attempts} attempts"
+    )]
+    UnexpectedStatus {
+        expected: String,
+        actual: u16,
+        url: String,
+        attempts: u32,
+    },
 }
 
 /// Errors that can occur when communicating with the Caddy admin API.

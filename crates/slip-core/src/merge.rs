@@ -69,6 +69,9 @@ pub fn merge_config(server: &AppConfig, repo: &RepoConfig) -> Result<MergedConfi
     if merged.health.path.is_none() {
         merged.health.path = repo.health.path.clone();
     }
+    if merged.health.expect_status.is_none() {
+        merged.health.expect_status = repo.health.expect_status.clone();
+    }
 
     // ── Resources: repo provides defaults if server left them None ───────────
     if let Some(ref defaults) = repo.defaults.resources {
@@ -252,6 +255,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
                 retries: 5,
                 start_period: Duration::from_secs(10),
+                expect_status: None,
             },
             deploy: DeployConfig {
                 strategy: "blue-green".to_string(),
@@ -771,5 +775,58 @@ mod tests {
 
         assert_eq!(merged.routes.len(), 1);
         assert_eq!(merged.routes[0].kind, "http");
+    }
+
+    // ── expect_status merge ──────────────────────────────────────────────────
+
+    #[test]
+    fn merge_uses_repo_expect_status_when_server_none() {
+        let server = base_server_config();
+        let mut repo = minimal_repo_config("testapp");
+        repo.health.expect_status =
+            Some(crate::status_expectation::StatusExpectation::parse("200,204").unwrap());
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        let expect = merged
+            .app
+            .health
+            .expect_status
+            .as_ref()
+            .expect("repo expect_status should fill in");
+        assert_eq!(expect.canonical(), "200,204");
+    }
+
+    #[test]
+    fn merge_server_expect_status_wins_when_both_set() {
+        let mut server = base_server_config();
+        server.health.expect_status =
+            Some(crate::status_expectation::StatusExpectation::parse("200").unwrap());
+        let mut repo = minimal_repo_config("testapp");
+        repo.health.expect_status =
+            Some(crate::status_expectation::StatusExpectation::parse("200-399").unwrap());
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        let expect = merged
+            .app
+            .health
+            .expect_status
+            .as_ref()
+            .expect("expect_status present");
+        assert_eq!(expect.canonical(), "200", "server wins");
+    }
+
+    #[test]
+    fn merge_neither_side_sets_expect_status_leaves_none() {
+        let server = base_server_config();
+        let repo = minimal_repo_config("testapp");
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        assert!(
+            merged.app.health.expect_status.is_none(),
+            "absent on both sides → None (default 200-399 applied at probe time)"
+        );
     }
 }
