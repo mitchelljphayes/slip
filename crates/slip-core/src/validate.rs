@@ -180,6 +180,20 @@ pub fn validate_repo_config(config: &RepoConfig, base_dir: &Path) -> ValidationR
         result.merge(validate_volumes(&config.volumes));
     }
 
+    // ── Health: warn on root-path readiness anti-pattern ──────────────────────
+    // `/` typically returns 200 even when DB/dependencies are down (static SPA,
+    // catch-all router, auth middleware 307, CDN cache). A dedicated readiness
+    // endpoint that exercises dependencies is strongly preferred. See
+    // docs/health.md for the canonical rationale.
+    if config.health.path.as_deref() == Some("/") {
+        result.add_warning(
+            "health.path = \"/\" does not prove readiness — the root endpoint often returns 200 \
+             even when DB/dependencies are down. Set a dedicated readiness endpoint (e.g. \
+             /healthz) that pings your DB/ORM pool. See docs/health.md."
+                .to_string(),
+        );
+    }
+
     result
 }
 
@@ -1348,6 +1362,71 @@ name = "multiapp"
                 .iter()
                 .any(|w| w.contains("has neither port nor container")),
             "should warn about empty route entry"
+        );
+    }
+
+    // ── Health path validation ───────────────────────────────────────────────
+
+    #[test]
+    fn validate_warns_on_root_health_path() {
+        let temp = TempDir::new().unwrap();
+        let toml = r#"
+[app]
+name = "myapp"
+
+[health]
+path = "/"
+"#;
+        let (config, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(result.is_valid(), "root path is a warning, not an error");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("does not prove readiness") && w.contains("docs/health.md")),
+            "should warn about root-path with doc link: {:?}",
+            result.warnings
+        );
+        let cfg = config.expect("config parsed");
+        assert_eq!(cfg.health.path.as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn validate_does_not_warn_on_healthz_path() {
+        let temp = TempDir::new().unwrap();
+        let toml = r#"
+[app]
+name = "myapp"
+
+[health]
+path = "/healthz"
+"#;
+        let (_, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(result.is_valid());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|w| !w.contains("does not prove readiness")),
+            "/healthz should not trigger the root-path warning"
+        );
+    }
+
+    #[test]
+    fn validate_no_warning_when_health_path_absent() {
+        let temp = TempDir::new().unwrap();
+        let toml = r#"
+[app]
+name = "myapp"
+"#;
+        let (_, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(result.is_valid());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|w| !w.contains("does not prove readiness")),
+            "no health path → no root-path warning"
         );
     }
 }

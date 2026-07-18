@@ -2055,8 +2055,12 @@ async fn handle_app_status(
             )
             .await;
 
+            // Use the shared matcher so the sync probe and the deploy checker
+            // apply the same `expect_status` policy (SLIP-103 D5). The probe
+            // client is the no-redirect one from `HealthChecker::new`.
+            let expectation = health_cfg.expect_status.as_ref();
             let health_status = match probe_result {
-                Ok(Ok(resp)) if resp.status().is_success() => "healthy",
+                Ok(Ok(resp)) if crate::health::status_matches(&resp, expectation) => "healthy",
                 Ok(Ok(_)) => "unhealthy",
                 Ok(Err(_)) => "unhealthy",
                 Err(_) => "unhealthy",
@@ -6263,6 +6267,131 @@ path = "/tmp/slip-test"
         assert!(
             payload["health"]["last_check"].is_string(),
             "last_check should be timestamped"
+        );
+    }
+
+    /// Sync probe respects `expect_status = "200"` and rejects an initial 307
+    /// (no redirects followed). AC12 — single shared policy.
+    #[tokio::test]
+    async fn status_app_respects_expect_status_200_rejects_307() {
+        let state = create_test_state();
+        let port = {
+            let app = axum::Router::new().route(
+                "/healthz",
+                axum::routing::get(|| async { axum::http::StatusCode::TEMPORARY_REDIRECT }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            port
+        };
+
+        // Set the app config to point at the mock server with expect_status="200".
+        {
+            let mut apps = state.apps.write().await;
+            let cfg = apps.get_mut(APP_NAME).expect("test app exists");
+            cfg.health = HealthConfig {
+                path: Some("/healthz".to_string()),
+                expect_status: Some(
+                    crate::status_expectation::StatusExpectation::parse("200").unwrap(),
+                ),
+                ..Default::default()
+            };
+        }
+
+        {
+            let mut app_states = state.app_states.write().await;
+            app_states.insert(
+                APP_NAME.to_string(),
+                AppRuntimeState {
+                    status: AppStatus::Running,
+                    current_tag: Some("v1.0.0".to_string()),
+                    current_container_id: Some("abc123".to_string()),
+                    current_port: Some(port),
+                    deployed_at: Some(Utc::now()),
+                    kind: Some("container".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let app = build_router(state);
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/status"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["health"]["status"], "unhealthy");
+    }
+
+    /// Sync probe default (no `expect_status`) accepts 307 — the default
+    /// `200-399` is applied at probe time. AC12 / AC7.
+    #[tokio::test]
+    async fn status_app_default_accepts_307() {
+        let state = create_test_state();
+        let port = {
+            let app = axum::Router::new().route(
+                "/healthz",
+                axum::routing::get(|| async { axum::http::StatusCode::TEMPORARY_REDIRECT }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            port
+        };
+
+        {
+            let mut apps = state.apps.write().await;
+            let cfg = apps.get_mut(APP_NAME).expect("test app exists");
+            cfg.health = HealthConfig {
+                path: Some("/healthz".to_string()),
+                expect_status: None, // → default 200-399 at probe time
+                ..Default::default()
+            };
+        }
+        {
+            let mut app_states = state.app_states.write().await;
+            app_states.insert(
+                APP_NAME.to_string(),
+                AppRuntimeState {
+                    status: AppStatus::Running,
+                    current_tag: Some("v1.0.0".to_string()),
+                    current_container_id: Some("abc123".to_string()),
+                    current_port: Some(port),
+                    deployed_at: Some(Utc::now()),
+                    kind: Some("container".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let app = build_router(state);
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/apps/{APP_NAME}/status"))
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            payload["health"]["status"], "healthy",
+            "default 200-399 must accept 307 — no redirect chasing"
         );
     }
 

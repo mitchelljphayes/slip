@@ -660,6 +660,13 @@ pub struct HealthConfig {
     pub retries: u32,
     #[serde(default = "default_health_start_period", with = "duration_serde")]
     pub start_period: Duration,
+    /// HTTP status codes that count as healthy. Accepts a single code (`"200"`),
+    /// a list (`"200,204"`), a range (`"200-299"`), or mixed (`"200-299,503"`).
+    /// Codes must be in 100-599 (RFC 9110 §15). Defaults to `200-399`
+    /// (Kubernetes-compatible) when unset — applied at probe time. Redirects
+    /// are NOT followed. See `docs/health.md` for the full grammar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_status: Option<crate::status_expectation::StatusExpectation>,
 }
 
 impl Default for HealthConfig {
@@ -670,6 +677,7 @@ impl Default for HealthConfig {
             timeout: default_health_timeout(),
             retries: default_health_retries(),
             start_period: default_health_start_period(),
+            expect_status: None,
         }
     }
 }
@@ -1474,8 +1482,64 @@ port = 8080
         assert_eq!(cfg.deploy.drain_timeout, Duration::from_secs(30));
         assert_eq!(cfg.network.name, "slip");
         assert!(cfg.env.is_empty());
+        assert!(
+            cfg.health.expect_status.is_none(),
+            "expect_status must default to None (no diff drift on absent field)"
+        );
         assert!(cfg.env_file.is_none());
         assert!(cfg.resources.memory.is_none());
+    }
+
+    // ── expect_status parsing ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_app_config_with_expect_status() {
+        let toml = r#"
+[app]
+name = "svc"
+image = "example.com/svc:v1"
+
+[routing]
+domain = "svc.example.com"
+port = 8080
+
+[health]
+path = "/healthz"
+expect_status = "200,204"
+
+[deploy]
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        let expect = cfg.health.expect_status.expect("expect_status set");
+        assert_eq!(expect.canonical(), "200,204");
+        assert!(expect.accepts(200));
+        assert!(expect.accepts(204));
+        assert!(!expect.accepts(201));
+    }
+
+    #[test]
+    fn parse_app_config_invalid_expect_status_errors() {
+        let toml = r#"
+[app]
+name = "svc"
+image = "example.com/svc:v1"
+
+[routing]
+domain = "svc.example.com"
+port = 8080
+
+[health]
+path = "/healthz"
+expect_status = "400-200"
+
+[deploy]
+"#;
+        let err = toml::from_str::<AppConfig>(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("range start must be"),
+            "prescriptive message: {msg}"
+        );
     }
 
     // ── Volume config parsing ────────────────────────────────────────────────

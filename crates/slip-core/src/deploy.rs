@@ -13,9 +13,36 @@ use crate::api::AppState;
 use crate::caddy::ReverseProxy;
 use crate::config::{AppConfig, SlipConfig};
 use crate::db::Db;
+use crate::error::HealthError;
 use crate::health::HealthCheck;
 use crate::runtime::{RegistryCredentials, RuntimeBackend};
 use crate::state;
+
+/// Format a [`HealthError`] into a SLIP-91 terminal-tagged reason string.
+///
+/// - `UnexpectedStatus` → `[health_unexpected_status] health check failed:
+///   expected {expected}, got {actual} at {url} after {attempts} attempts`.
+///   Carries no response bodies or headers (SLIP-103 D6).
+/// - `Unhealthy` → `[health_check_failed] health check failed: {e}` (existing
+///   behavior — transport/timeout failures, no response ever received).
+///
+/// Exit code stays 5 (`output::DEPLOY_FAILED`).
+pub fn format_health_reason(e: &HealthError) -> String {
+    match e {
+        HealthError::UnexpectedStatus {
+            expected,
+            actual,
+            url,
+            attempts,
+        } => format!(
+            "[health_unexpected_status] health check failed: expected {expected}, \
+             got {actual} at {url} after {attempts} attempts"
+        ),
+        HealthError::Unhealthy { .. } => {
+            format!("[health_check_failed] health check failed: {e}")
+        }
+    }
+}
 
 // ─── Status types ─────────────────────────────────────────────────────────────
 
@@ -700,7 +727,7 @@ async fn execute_blue_green_deploy_container(
             if let Some(ref id) = ctx.new_container_id {
                 let _ = runtime.stop_and_remove(id).await;
             }
-            ctx.fail(&format!("[health_check_failed] health check failed: {e}"));
+            ctx.fail(&format_health_reason(&e));
             record_deploy(shared, ctx);
             set_app_failed(shared.app_states, app_name);
             return;
@@ -1015,6 +1042,9 @@ async fn execute_blue_green_deploy_pod(
         // Iterate over routes and check per-container health.
         let mut http_route_ports: Vec<(String, u16)> = Vec::new();
         let mut any_http_failure = false;
+        // Track the last health-check error so the deploy reason can carry the
+        // structured `health_unexpected_status` detail when applicable.
+        let mut last_http_error: Option<HealthError> = None;
 
         for route in &merged_cfg.routes {
             let container = route.container.as_deref().unwrap_or("web");
@@ -1073,6 +1103,7 @@ async fn execute_blue_green_deploy_pod(
                                 error = %e,
                                 "HTTP health check failed"
                             );
+                            last_http_error = Some(e);
                             any_http_failure = true;
                         } else {
                             http_route_ports.push((route.hostname.clone(), host_port));
@@ -1096,7 +1127,12 @@ async fn execute_blue_green_deploy_pod(
             if let Err(te) = runtime.teardown_pod(&manifest_path).await {
                 tracing::warn!(app = app_name, error = %te, "failed to teardown pod after health check failure (non-fatal)");
             }
-            ctx.fail("[health_check_failed] health check failed for one or more HTTP containers");
+            let reason = match &last_http_error {
+                Some(e) => format_health_reason(e),
+                None => "[health_check_failed] health check failed for one or more HTTP containers"
+                    .to_string(),
+            };
+            ctx.fail(&reason);
             record_deploy(shared, ctx);
             set_app_failed(shared.app_states, app_name);
             return;
@@ -2360,6 +2396,9 @@ mod tests {
         ok: bool,
         /// If true, `check` returns a future that never completes (for timeout tests).
         hung: bool,
+        /// When `ok == false`, return this error variant instead of the default
+        /// `Unhealthy` (used to exercise the `health_unexpected_status` reason).
+        unexpected_status: bool,
     }
 
     impl MockHealth {
@@ -2367,6 +2406,7 @@ mod tests {
             Self {
                 ok: true,
                 hung: false,
+                unexpected_status: false,
             }
         }
 
@@ -2374,6 +2414,17 @@ mod tests {
             Self {
                 ok: false,
                 hung: false,
+                unexpected_status: false,
+            }
+        }
+
+        /// Return `HealthError::UnexpectedStatus` from `check` — used to
+        /// exercise the `[health_unexpected_status]` deploy reason tag.
+        fn unexpected_status() -> Self {
+            Self {
+                ok: false,
+                hung: false,
+                unexpected_status: true,
             }
         }
     }
@@ -2395,6 +2446,13 @@ mod tests {
             }
             let result = if self.ok {
                 Ok(())
+            } else if self.unexpected_status {
+                Err(HealthError::UnexpectedStatus {
+                    expected: "200".to_string(),
+                    actual: 307,
+                    url: "http://127.0.0.1:54321/health".to_string(),
+                    attempts: 3,
+                })
             } else {
                 Err(HealthError::Unhealthy {
                     retries: 3,
@@ -2442,6 +2500,7 @@ mod tests {
                 timeout: Duration::from_millis(10),
                 retries: 1,
                 start_period: Duration::ZERO,
+                expect_status: None,
             },
             deploy: DeployConfig {
                 strategy: "blue-green".to_string(),
@@ -2689,6 +2748,61 @@ mod tests {
         assert!(
             states.get("testapp").is_none(),
             "app state should not have been set"
+        );
+    }
+
+    /// `HealthError::UnexpectedStatus` propagates as the
+    /// `[health_unexpected_status]` SLIP-91 terminal tag (AC11). Exit code
+    /// stays 5 (DEPLOY_FAILED) — unchanged by this test, exercised in CLI tests.
+    #[tokio::test]
+    async fn test_health_unexpected_status_propagates_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+        let mut apps = HashMap::new();
+        apps.insert("testapp".to_string(), test_app_config());
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps);
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        let docker = MockDocker::new();
+        let stop_count = docker.stop_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::unexpected_status();
+
+        execute_deploy_inner(
+            make_shared(&config, &apps, &app_states, &deploys),
+            &docker,
+            &caddy,
+            &health,
+            &mut test_deploy_ctx(),
+        )
+        .await;
+
+        // New container should have been stopped (rollback).
+        assert_eq!(
+            stop_count.load(Ordering::SeqCst),
+            1,
+            "new container should be stopped"
+        );
+
+        // Deploy should be Failed and the error must carry the new tag.
+        let recorded = deploys.get("testapp").unwrap();
+        assert_eq!(recorded.status, DeployStatus::Failed);
+        let err = recorded.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("[health_unexpected_status]"),
+            "must carry health_unexpected_status tag, got: {err}"
+        );
+        // Structured detail (no bodies/headers).
+        assert!(err.contains("expected 200"), "must carry expected: {err}");
+        assert!(err.contains("got 307"), "must carry actual: {err}");
+        assert!(
+            err.contains("after 3 attempts"),
+            "must carry attempts: {err}"
+        );
+        assert!(
+            !err.contains("body") && !err.contains("header"),
+            "must not leak bodies or headers: {err}"
         );
     }
 

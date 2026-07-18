@@ -245,6 +245,15 @@ fn init_in_tempdir_writes_three_files() {
     // Health guidance should steer away from /
     assert!(slip_toml.contains(r#"Do NOT use path = "/""#));
     assert!(slip_toml.contains(r#"path = "/healthz""#));
+    // SLIP-103: expect_status scaffold comment + docs link.
+    assert!(
+        slip_toml.contains("expect_status"),
+        "scaffold should mention expect_status"
+    );
+    assert!(
+        slip_toml.contains("docs/health.md"),
+        "scaffold should link to docs/health.md"
+    );
     // Commented needs examples
     assert!(slip_toml.contains(r#"[needs.db]"#));
     assert!(slip_toml.contains(r#"[needs.storage]"#));
@@ -267,6 +276,15 @@ fn init_in_tempdir_writes_three_files() {
     assert!(agents_md.contains("X-Slip-Signature"));
     assert!(agents_md.contains("blue-green"));
     assert!(agents_md.contains("GET /v1/deploys/{id}"));
+    // SLIP-103: AGENTS.md template mentions expect_status + docs link.
+    assert!(
+        agents_md.contains("expect_status"),
+        "AGENTS.md scaffold should mention expect_status"
+    );
+    assert!(
+        agents_md.contains("docs/health.md"),
+        "AGENTS.md scaffold should link to docs/health.md"
+    );
 
     tmp.close().unwrap();
 }
@@ -464,6 +482,127 @@ fn init_scaffolded_slip_toml_passes_validate() {
     assert!(content.contains("slip config — managed by you"));
 
     tmp.close().unwrap();
+}
+
+// ─── slip validate (SLIP-103) ───────────────────────────────────────────────
+
+/// `slip validate --json` with a root-path config emits a stable JSON envelope
+/// with `ok: true` and the root-path warning. AC14.
+#[test]
+fn slip_validate_root_path_warning_json() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let slip_toml = r#"
+[app]
+name = "myapp"
+kind = "container"
+image = "ghcr.io/org/myapp"
+
+[routing]
+domain = "myapp.example.com"
+port = 3000
+
+[health]
+path = "/"
+
+[deploy]
+strategy = "blue-green"
+"#;
+    std::fs::write(tmp.child("slip.toml").path(), slip_toml).unwrap();
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args(["validate", "--json"])
+        .current_dir(tmp.path())
+        .assert();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert.success().code(output::OK);
+
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "validate --json stdout must be a single JSON document: {e}\nstdout: {stdout}\nstderr: {stderr}"
+        )
+    });
+    assert_eq!(parsed["ok"], true, "root-path is a warning, not an error");
+    let warnings = parsed["warnings"].as_array().expect("warnings is array");
+    assert!(
+        warnings.iter().any(|w| {
+            w.as_str()
+                .map(|s| s.contains("does not prove readiness") && s.contains("docs/health.md"))
+                .unwrap_or(false)
+        }),
+        "warnings must include the root-path warning with docs link: {warnings:?}"
+    );
+    assert!(
+        parsed["errors"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(false),
+        "errors must be empty"
+    );
+}
+
+/// `slip validate` (human mode) with a root-path config still emits the
+/// `⚠ ...` warning to stdout and exits 0. AC14.
+#[test]
+fn slip_validate_root_path_warning_human() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let slip_toml = r#"
+[app]
+name = "myapp"
+kind = "container"
+image = "ghcr.io/org/myapp"
+
+[routing]
+domain = "myapp.example.com"
+port = 3000
+
+[health]
+path = "/"
+
+[deploy]
+strategy = "blue-green"
+"#;
+    std::fs::write(tmp.child("slip.toml").path(), slip_toml).unwrap();
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd.args(["validate"]).current_dir(tmp.path()).assert();
+
+    assert
+        .success()
+        .code(output::OK)
+        .stdout(predicate::str::contains("⚠"))
+        .stdout(predicate::str::contains("does not prove readiness"))
+        .stdout(predicate::str::contains("docs/health.md"));
+}
+
+/// `slip validate --json` with an invalid config emits `ok: false`, a
+/// non-empty `errors` array, and exit 1. AC14.
+#[test]
+fn slip_validate_json_envelope_invalid_config() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    // Invalid: kind=pod with no manifest.
+    let slip_toml = r#"
+[app]
+name = "myapp"
+kind = "pod"
+"#;
+    std::fs::write(tmp.child("slip.toml").path(), slip_toml).unwrap();
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args(["validate", "--json"])
+        .current_dir(tmp.path())
+        .assert();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert.failure().code(output::GENERIC);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout is a JSON envelope");
+    assert_eq!(parsed["ok"], false);
+    let errors = parsed["errors"].as_array().expect("errors is array");
+    assert!(!errors.is_empty(), "errors must be non-empty");
 }
 
 #[test]
@@ -2088,7 +2227,7 @@ fn normalize_mock_app(mut app: Value) -> Value {
         .or_insert(serde_json::json!({"memory": null, "cpus": null}));
     obj.entry("network")
         .or_insert(serde_json::json!({"name": "slip"}));
-    obj.entry("health").or_insert(serde_json::json!({"path": null, "interval": "30s", "timeout": "5s", "retries": 3, "start_period": "0s"}));
+    obj.entry("health").or_insert(serde_json::json!({"path": null, "interval": "30s", "timeout": "5s", "retries": 3, "start_period": "0s", "expect_status": null}));
     obj.entry("deploy").or_insert(
         serde_json::json!({"strategy": "blue-green", "drain_timeout": "30s", "timeout": null}),
     );

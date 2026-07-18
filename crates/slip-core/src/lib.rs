@@ -18,6 +18,7 @@ pub mod repo_config;
 pub mod runtime;
 pub mod secrets;
 pub mod state;
+pub mod status_expectation;
 pub mod tailscale;
 pub mod validate;
 

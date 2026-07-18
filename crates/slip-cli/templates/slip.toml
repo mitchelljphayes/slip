@@ -25,6 +25,10 @@ port = 3000
 # timeout = "5s"
 # retries = 3
 # start_period = "15s"
+# expect_status = "200-399"   # HTTP status codes that count as healthy.
+#                            # Single ("200"), list ("200,204"), range ("200-399"), or mixed.
+#                            # Default "200-399" (Kubernetes-compatible). Redirects are NOT followed.
+#                            # See docs/health.md for grammar, blue-green gating, and readiness patterns.
 
 [deploy]
 # Blue-green deploys: overlapping replicas share one database.

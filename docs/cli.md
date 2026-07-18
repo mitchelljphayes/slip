@@ -19,7 +19,7 @@ slip <noun> <subcommand> [<args>] [--json] [--server <url>] [--token <token>]
 | `slip status [<app>]` | 🚧 Phase 2 | Show app or daemon status |
 | `slip logs <app>` | 🚧 Phase 2 | Tail container logs |
 | `slip rollback <app>` | ✅ Working | Roll back to the previous version |
-| `slip validate [<path>]` | ✅ Working | Validate a repo-side `slip.toml` config file |
+| `slip validate [<path>]` | ✅ Working | Validate a repo-side `slip.toml` config file. Emits a stable `--json` envelope (`{"ok","errors","warnings"}`) and warns on `health.path = "/"`. See `docs/health.md`. |
 
 ### Noun groups (subcommands)
 

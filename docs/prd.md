@@ -88,7 +88,7 @@ CI gets exactly one capability: telling slipd to deploy a specific tag of a pre-
 | F2 | **HMAC-SHA256 auth** — verify `X-Slip-Signature` header | Constant-time comparison; supports global and per-app secrets |
 | F3 | **Image pull** — pull from registry using Docker API (bollard) | Authenticates with GHCR token; rejects images not matching app config |
 | F4 | **Container lifecycle** — create, start, stop, remove containers | Injects env vars from config + env_file; attaches to `slip` Docker network; assigns ephemeral host port |
-| F5 | **Health checks** — poll container health endpoint before switching | Configurable path, interval, timeout, retries, start_period; fail → stop new container, keep old |
+| F5 | **Health checks** — poll container health endpoint before switching | Configurable path, interval, timeout, retries, start_period; `expect_status` (single/list/range/mixed, default `200-399`, no-redirect probe); fail → stop new container, keep old. See `docs/health.md` for readiness guidance. |
 | F6 | **Caddy route management** — add/update routes via admin API | Creates `slip` server block on bootstrap; updates upstream on deploy; preserves existing Caddy config |
 | F7 | **Blue-green swap** — start new → health check → switch route → drain → stop old | Zero downtime; configurable drain timeout |
 | F8 | **Config parsing** — read `slip.toml` + per-app TOML files from `/etc/slip/` | Validates config on startup; rejects invalid configs with clear errors |

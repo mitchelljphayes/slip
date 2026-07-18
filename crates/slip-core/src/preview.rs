@@ -1070,7 +1070,9 @@ pub(crate) async fn execute_preview_deploy_inner(
         if let Some(ref manifest) = manifest_path {
             let _ = runtime.teardown_pod(manifest).await;
         }
-        return Err(DeployError::Message(format!("health check failed: {e}")));
+        return Err(DeployError::Message(crate::deploy::format_health_reason(
+            &e,
+        )));
     }
 
     // ── POST-DEPLOY HOOKS (SLIP-57) ───────────────────────────────────────────
@@ -1857,15 +1859,31 @@ mod tests {
 
     struct MockHealth {
         ok: bool,
+        /// When `ok == false`, return `UnexpectedStatus` instead of `Unhealthy`.
+        unexpected_status: bool,
     }
 
     impl MockHealth {
         fn passing() -> Self {
-            Self { ok: true }
+            Self {
+                ok: true,
+                unexpected_status: false,
+            }
         }
 
         fn failing() -> Self {
-            Self { ok: false }
+            Self {
+                ok: false,
+                unexpected_status: false,
+            }
+        }
+
+        /// Return `HealthError::UnexpectedStatus` from `check`.
+        fn unexpected_status() -> Self {
+            Self {
+                ok: false,
+                unexpected_status: true,
+            }
         }
     }
 
@@ -1878,6 +1896,13 @@ mod tests {
         {
             let result = if self.ok {
                 Ok(())
+            } else if self.unexpected_status {
+                Err(HealthError::UnexpectedStatus {
+                    expected: "200".to_string(),
+                    actual: 307,
+                    url: "http://127.0.0.1:54321/health".to_string(),
+                    attempts: 3,
+                })
             } else {
                 Err(HealthError::Unhealthy {
                     retries: 3,
@@ -1932,6 +1957,7 @@ mod tests {
                 timeout: Duration::from_millis(10),
                 retries: 1,
                 start_period: Duration::ZERO,
+                expect_status: None,
             },
             deploy: DeployConfig {
                 strategy: "blue-green".to_string(),
@@ -2191,7 +2217,41 @@ enabled = {enabled}
         assert_eq!(state.status, AppStatus::Failed);
     }
 
-    // ── teardown_preview tests ────────────────────────────────────────────────
+    /// `HealthError::UnexpectedStatus` propagates as the
+    /// `[health_unexpected_status]` SLIP-91 terminal tag for preview deploys.
+    #[tokio::test]
+    async fn test_preview_deploy_unexpected_status_propagates_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_config_bytes = make_preview_repo_config_toml(true);
+        let docker = MockDocker::with_repo_config(repo_config_bytes);
+        let stop_count = docker.stop_count();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::unexpected_status();
+        let preview_states = Arc::new(DashMap::new());
+
+        let shared = make_shared(&tmp, test_app_config(), preview_states.clone());
+        let ctx = test_preview_ctx();
+
+        let result = execute_preview_deploy_inner(shared, &docker, &caddy, &health, ctx).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().message().to_string();
+        assert!(
+            err.contains("[health_unexpected_status]"),
+            "must carry the unexpected_status tag, got: {err}"
+        );
+        assert!(err.contains("got 307"), "must carry actual: {err}");
+
+        // Container should have been stopped on health failure.
+        assert_eq!(
+            stop_count.load(Ordering::SeqCst),
+            1,
+            "container should be stopped after health failure"
+        );
+
+        let state = preview_states.get("testapp:pr-42").unwrap();
+        assert_eq!(state.status, AppStatus::Failed);
+    }
 
     /// Happy path teardown: container stopped, route removed, state cleared.
     #[tokio::test]

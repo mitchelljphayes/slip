@@ -205,6 +205,16 @@ On failure:
 {"event":"failed","deploy_id":"dpl_01J...","app":"myapp","tag":"sha-abc1234","status":"failed","error":"[health_check_timeout] ...","started_at":"...","finished_at":"..."}
 ```
 
+The `error` field carries a SLIP-91 terminal reason tag. Health-related reasons:
+
+| Tag | When | Detail |
+|-----|------|--------|
+| `[health_unexpected_status]` | Probe received an HTTP response whose status was not in `expect_status` | `expected`, `actual`, `url`, `attempts` |
+| `[health_check_failed]` | Transport/timeout — no response ever received | `retries`, `url` |
+| `[health_check_timeout]` | Deploy-level hard timeout (`[deploy].timeout`) hit | the configured timeout |
+
+See `docs/health.md` for the full reason taxonomy and probe semantics.
+
 On timeout:
 
 ```

@@ -210,6 +210,13 @@ pub struct HealthConfig {
     /// Grace period before first health check. Default: "10s"
     #[serde(default = "default_health_start_period")]
     pub start_period: Duration,
+    /// HTTP status codes that count as healthy. Single ("200"), list
+    /// ("200,204"), range ("200-399"), or mixed ("200-299,503"). Codes must
+    /// be in 100-599 (RFC 9110 §15). Defaults to "200-399" (Kubernetes-
+    /// compatible) when unset — applied at probe time. Redirects are NOT
+    /// followed. See docs/health.md for the full grammar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_status: Option<StatusExpectation>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -852,14 +859,46 @@ impl CaddyClient {
 
 ### Health Check Implementation
 
+The probe client is built once with `reqwest::redirect::Policy::none()` and
+shared by the deploy checker and the `slip status <app>` sync probe (single
+policy, no duplicate). The **original** response status is evaluated against
+`expect_status` (default `200-399`, Kubernetes-compatible). See
+`docs/health.md` for the full grammar, redirect semantics, timeout arithmetic,
+and reason taxonomy.
+
 ```rust
 // ── slip-core/src/health.rs ──
+
+/// Shared probe client — no redirects. Used by the deploy checker AND the
+/// `slip status` sync probe (SLIP-103 D5: one policy, no duplicate).
+pub(crate) fn probe_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("probe client")
+}
+
+/// Shared matcher. `expected = None` → resolve to `StatusExpectation::default()`
+/// (`200-399`) at probe time.
+pub(crate) fn status_matches(
+    resp: &reqwest::Response,
+    expected: Option<&StatusExpectation>,
+) -> bool {
+    match expected {
+        Some(e) => e.accepts(resp.status().as_u16()),
+        None => StatusExpectation::default().accepts(resp.status().as_u16()),
+    }
+}
 
 pub struct HealthChecker {
     client: reqwest::Client,
 }
 
 impl HealthChecker {
+    pub fn new() -> Self {
+        Self { client: probe_client() }
+    }
+
     /// Run health checks against a container.
     /// Returns Ok(()) if healthy, Err if all retries exhausted.
     pub async fn check(
@@ -873,28 +912,37 @@ impl HealthChecker {
         };
 
         let url = format!("http://127.0.0.1:{}{}", host_port, path);
+        // Resolve the expectation at probe time: absent → default 200-399.
+        let expectation = config.expect_status.clone().unwrap_or_default();
+        let expected_canonical = expectation.canonical();
 
         // Wait for start_period before first check
         tokio::time::sleep(config.start_period).await;
+
+        let mut last_observed_status: Option<u16> = None;
 
         for attempt in 1..=config.retries {
             match tokio::time::timeout(
                 config.timeout,
                 self.client.get(&url).send(),
             ).await {
-                Ok(Ok(resp)) if resp.status().is_success() => {
-                    tracing::info!(
-                        attempt,
-                        total = config.retries,
-                        "health check passed"
-                    );
-                    return Ok(());
-                }
                 Ok(Ok(resp)) => {
+                    let status = resp.status().as_u16();
+                    last_observed_status = Some(status);
+                    if status_matches(&resp, Some(&expectation)) {
+                        tracing::info!(
+                            attempt,
+                            total = config.retries,
+                            "health check passed"
+                        );
+                        return Ok(());
+                    }
                     tracing::warn!(
                         attempt,
-                        status = %resp.status(),
-                        "health check returned non-success status"
+                        status,
+                        url,
+                        expected = %expected_canonical,
+                        "health check returned unexpected status"
                     );
                 }
                 Ok(Err(e)) => {
@@ -914,10 +962,20 @@ impl HealthChecker {
             }
         }
 
-        Err(HealthError::Unhealthy {
-            retries: config.retries,
-            url,
-        })
+        // If any attempt received an HTTP response, the failure is an
+        // unexpected status; otherwise it's transport/timeout (Unhealthy).
+        match last_observed_status {
+            Some(actual) => Err(HealthError::UnexpectedStatus {
+                expected: expected_canonical,
+                actual,
+                url,
+                attempts: config.retries,
+            }),
+            None => Err(HealthError::Unhealthy {
+                retries: config.retries,
+                url,
+            }),
+        }
     }
 }
 ```
@@ -1178,6 +1236,16 @@ pub enum CaddyError {
 pub enum HealthError {
     #[error("unhealthy after {retries} attempts at {url}")]
     Unhealthy { retries: u32, url: String },
+
+    /// At least one probe attempt received an HTTP response whose status was
+    /// not in `expect_status`. No bodies or headers are ever stored (SLIP-103 D6).
+    #[error("health check failed: expected {expected}, got {actual} at {url} after {attempts} attempts")]
+    UnexpectedStatus {
+        expected: String,   // canonical form, e.g. "200-399"
+        actual: u16,
+        url: String,
+        attempts: u32,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1291,9 +1359,10 @@ The deploy endpoint validates that the `image` field in the webhook payload exac
 
 | Module | What to test |
 |--------|-------------|
-| `config.rs` | TOML parsing, env var resolution, validation errors, default values |
+| `config.rs` | TOML parsing, env var resolution, validation errors, default values, `expect_status` parse (valid + invalid) |
 | `auth.rs` | HMAC verification (valid, invalid, missing header, wrong prefix, timing-safe) |
-| `health.rs` | Success on first try, success after retries, failure after exhausting retries, timeout, no health path configured |
+| `health.rs` | Success on first try, success after retries, failure after exhausting retries, timeout, no health path configured, `expect_status` matrix (single/list/range/mixed, 307-not-redirected, default 200-399 accepts 307, explicit "200" rejects 307, retries still apply → `UnexpectedStatus`, transport/timeout → `Unhealthy`), `Policy::none()` observed via 307 |
+| `status_expectation.rs` | Grammar (single/list/range/mixed), whitespace, duplicates/overlaps merged canonically, reversed/empty/out-of-range/trailing-garbage rejected, canonical round-trip, default 200-399 accepts 307, serde string round-trip, invalid spec fails deserialize |
 | `error.rs` | Error formatting, conversion to HTTP status codes |
 
 ### Integration Tests (with Docker)
