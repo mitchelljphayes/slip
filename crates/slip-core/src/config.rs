@@ -1133,6 +1133,306 @@ pub fn load_config(path: &Path) -> Result<(SlipConfig, HashMap<String, AppConfig
     Ok((slip_cfg, apps))
 }
 
+// ─── Config check (warn-mode) + env-file parsing (SLIP-105) ────────────────────
+
+/// Parse a systemd-style `EnvironmentFile` (`KEY=value` lines).
+///
+/// Format rules:
+/// - Lines starting with `#` are comments (ignored).
+/// - Blank lines are ignored.
+/// - `KEY=value` — surrounding whitespace on the value is trimmed; surrounding
+///   quotes (`"` or `'`) are stripped if they wrap the entire value.
+/// - **No shell sourcing**: no `export` prefix, no backtick/command substitution,
+///   no variable expansion. A line starting with `export ` is rejected (the
+///   systemd convention does not support it; this keeps the parser honest).
+///
+/// Returns a `HashMap<String, String>` of the parsed key/value pairs. Errors
+/// on malformed lines (no `=`, or `export` prefix).
+pub fn parse_env_file(path: &Path) -> Result<HashMap<String, String>, ConfigError> {
+    let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::ReadFile {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let mut out: HashMap<String, String> = HashMap::new();
+    for (lineno, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with("export ") {
+            return Err(ConfigError::Internal(format!(
+                "env file {}:{}: `export` prefix is not supported (systemd EnvironmentFile format is `KEY=value` only)",
+                path.display(),
+                lineno + 1
+            )));
+        }
+        let eq_pos = trimmed.find('=').ok_or_else(|| {
+            ConfigError::Internal(format!(
+                "env file {}:{}: missing '=' in line (expected KEY=value)",
+                path.display(),
+                lineno + 1
+            ))
+        })?;
+        let key = trimmed[..eq_pos].trim().to_string();
+        let mut value = trimmed[eq_pos + 1..].trim().to_string();
+        // Strip surrounding quotes if they wrap the entire value.
+        if value.len() >= 2 {
+            let bytes = value.as_bytes();
+            let first = bytes[0];
+            let last = bytes[bytes.len() - 1];
+            if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+                value = value[1..value.len() - 1].to_string();
+            }
+        }
+        if key.is_empty() {
+            return Err(ConfigError::Internal(format!(
+                "env file {}:{}: empty key",
+                path.display(),
+                lineno + 1
+            )));
+        }
+        out.insert(key, value);
+    }
+    Ok(out)
+}
+
+/// Load mode for `load_config_with_mode`: strict (production, hard-fail on
+/// unresolved `${ENV}`) or warn (`--check`, collect unresolved as warnings).
+#[derive(Debug, Clone, Copy)]
+pub enum ResolveMode {
+    Strict,
+    Warn,
+}
+
+/// Load the daemon config + app configs, resolving env vars in `Strict` or
+/// `Warn` mode. In `Warn` mode, unresolved `${ENV}` placeholders are collected
+/// as warnings (the placeholder is left in place) and returned; the load still
+/// succeeds (exit 0 for `--check`). In `Strict` mode, unresolved env vars
+/// hard-fail (the production behaviour, unchanged).
+///
+/// This is the shared implementation behind [`load_config`] (strict) and
+/// [`load_config_check`] (warn). Structural errors (parse fail, name mismatch,
+/// invalid strategy) always hard-fail regardless of mode.
+#[allow(clippy::type_complexity)]
+pub fn load_config_with_mode(
+    path: &Path,
+    mode: ResolveMode,
+) -> Result<(SlipConfig, HashMap<String, AppConfig>, Vec<String>), ConfigError> {
+    // ── 1. Load daemon config ────────────────────────────────────────────────
+    let slip_toml_path = path.join("slip.toml");
+    let raw = std::fs::read_to_string(&slip_toml_path).map_err(|e| ConfigError::ReadFile {
+        path: slip_toml_path.clone(),
+        source: e,
+    })?;
+    let mut slip_cfg: SlipConfig = toml::from_str(&raw).map_err(|e| ConfigError::Parse {
+        path: slip_toml_path.clone(),
+        source: e,
+    })?;
+
+    // Validate reconcile interval — must be at least 1s to avoid hot-looping.
+    if slip_cfg.caddy.reconcile.interval < Duration::from_secs(1) {
+        return Err(ConfigError::Internal(format!(
+            "[caddy.reconcile] interval must be at least 1s — got {:?}",
+            slip_cfg.caddy.reconcile.interval
+        )));
+    }
+
+    // Validate deploy TLS strategy (if [deploy] is configured).
+    let acme_email = resolve_acme_email(&slip_cfg);
+    let validation_ctx = ValidationCtx {
+        acme_email: acme_email.as_deref(),
+    };
+    if let Some(deploy_cfg) = &slip_cfg.deploy
+        && let Some(domain) = deploy_cfg.domain.as_deref()
+    {
+        validate_tls_strategy(&deploy_cfg.tls, Some(domain), &validation_ctx)?;
+    }
+
+    // Validate DNS provider config: reject literal secrets (server-level).
+    if let Some(ref tls) = slip_cfg.caddy.tls
+        && let Some(ref table) = tls.dns_provider_config
+    {
+        for (key, value) in table {
+            if is_secret_like_key(key)
+                && let Some(s) = value.as_str()
+                && (!s.starts_with("{env.") || !s.ends_with('}'))
+            {
+                return Err(ConfigError::Internal(format!(
+                    "DNS provider config key '{key}' contains a literal value — \
+                     use the {{env.*}} placeholder syntax instead, \
+                     e.g. {key} = \"{{env.CF_API_TOKEN}}\". \
+                     Slip must never POST literal secrets to Caddy."
+                )));
+            }
+        }
+    }
+
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Resolve env vars in auth.secret (strict or warn).
+    match mode {
+        ResolveMode::Strict => {
+            slip_cfg.auth.secret = resolve_env_vars(&slip_cfg.auth.secret)?;
+        }
+        ResolveMode::Warn => {
+            let (resolved, miss) = resolve_env_vars_warn(&slip_cfg.auth.secret);
+            slip_cfg.auth.secret = resolved;
+            for m in miss {
+                warnings.push(format!("auth.secret: unresolved ${{{m}}}"));
+            }
+        }
+    }
+
+    // Resolve env vars in registries.<name>.token (strict or warn).
+    for entry in slip_cfg.registries.registries.values_mut() {
+        if let Some(token) = entry.token.take() {
+            match mode {
+                ResolveMode::Strict => {
+                    entry.token = Some(resolve_env_vars(&token)?);
+                }
+                ResolveMode::Warn => {
+                    let (resolved, miss) = resolve_env_vars_warn(&token);
+                    entry.token = Some(resolved);
+                    for m in miss {
+                        warnings.push(format!(
+                            "registries.{}.token: unresolved ${{{m}}}",
+                            entry.url
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 2. Load app configs ──────────────────────────────────────────────────
+    let apps_dir = path.join("apps");
+    let mut apps: HashMap<String, AppConfig> = HashMap::new();
+
+    // `apps/` directory is optional — if it doesn't exist we just return empty.
+    if apps_dir.is_dir() {
+        let entries = std::fs::read_dir(&apps_dir).map_err(|e| ConfigError::ReadFile {
+            path: apps_dir.clone(),
+            source: e,
+        })?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| ConfigError::ReadFile {
+                path: apps_dir.clone(),
+                source: e,
+            })?;
+            let entry_path = entry.path();
+
+            // Only process *.toml files
+            if entry_path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+
+            let filename_stem = entry_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_owned();
+
+            let raw = std::fs::read_to_string(&entry_path).map_err(|e| ConfigError::ReadFile {
+                path: entry_path.clone(),
+                source: e,
+            })?;
+            let mut app_cfg: AppConfig = toml::from_str(&raw).map_err(|e| ConfigError::Parse {
+                path: entry_path.clone(),
+                source: e,
+            })?;
+
+            // Validate: filename stem must match app.name
+            if app_cfg.app.name != filename_stem {
+                return Err(ConfigError::NameMismatch {
+                    filename: filename_stem,
+                    config_name: app_cfg.app.name.clone(),
+                });
+            }
+
+            // Resolve env vars in env values (strict or warn).
+            for value in app_cfg.env.values_mut() {
+                match mode {
+                    ResolveMode::Strict => {
+                        *value = resolve_env_vars(value)?;
+                    }
+                    ResolveMode::Warn => {
+                        let (resolved, miss) = resolve_env_vars_warn(value);
+                        *value = resolved;
+                        for m in miss {
+                            warnings.push(format!(
+                                "apps.{}.env: unresolved ${{{m}}}",
+                                app_cfg.app.name
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Resolve env vars in app.secret (strict or warn).
+            if let Some(secret) = app_cfg.app.secret.take() {
+                match mode {
+                    ResolveMode::Strict => {
+                        app_cfg.app.secret = Some(resolve_env_vars(&secret)?);
+                    }
+                    ResolveMode::Warn => {
+                        let (resolved, miss) = resolve_env_vars_warn(&secret);
+                        app_cfg.app.secret = Some(resolved);
+                        for m in miss {
+                            warnings.push(format!(
+                                "apps.{}.app.secret: unresolved ${{{m}}}",
+                                app_cfg.app.name
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Validate deploy strategy
+            validate_deploy_strategy(&app_cfg.deploy)?;
+
+            // Validate TLS strategies on routing and route entries.
+            if let Some(routing_tls) = &app_cfg.routing.tls {
+                validate_tls_strategy(routing_tls, None, &validation_ctx)?;
+                // For inherited routing.tls = Tailscale, validate EVERY effective
+                // route hostname is .ts.net (not just routes with explicit tls).
+                if *routing_tls == TlsStrategy::Tailscale {
+                    for route in app_cfg.routing.effective_routes() {
+                        if !is_ts_net_host(&route.hostname) {
+                            return Err(ConfigError::Internal(format!(
+                                "tailscale strategy requires a *.ts.net host — \
+                                 route '{host}' is not a Tailscale certificate domain; \
+                                 use 'internal' or 'acme' instead",
+                                host = route.hostname
+                            )));
+                        }
+                    }
+                }
+            }
+            for route in &app_cfg.routing.routes {
+                if let Some(route_tls) = &route.tls {
+                    validate_tls_strategy(route_tls, Some(&route.hostname), &validation_ctx)?;
+                }
+            }
+
+            apps.insert(app_cfg.app.name.clone(), app_cfg);
+        }
+    }
+
+    Ok((slip_cfg, apps, warnings))
+}
+
+/// `--check` variant of [`load_config`]: resolves env vars in `Warn` mode,
+/// returning `(config, apps, warnings)`. Unresolved `${ENV}` placeholders are
+/// collected as warnings (left in place) rather than erroring. Structural
+/// errors (parse fail, name mismatch, invalid strategy) still hard-fail.
+#[allow(clippy::type_complexity)]
+pub fn load_config_check(
+    path: &Path,
+) -> Result<(SlipConfig, HashMap<String, AppConfig>, Vec<String>), ConfigError> {
+    load_config_with_mode(path, ResolveMode::Warn)
+}
+
 // ─── [app] secret migration ────────────────────────────────────────────────────
 
 /// Migrate deprecated `[app] secret` values from TOML into the secrets store.
@@ -2697,5 +2997,220 @@ secret = "s"
         std::fs::create_dir(dir.path().join("apps")).unwrap();
         let (cfg, _) = load_config(dir.path()).unwrap();
         assert!(cfg.caddy.tls.is_some());
+    }
+
+    // ── parse_env_file ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_env_file_basic() {
+        let dir = setup_config_dir();
+        let env_path = dir.path().join("slip.env");
+        write_file(
+            dir.path(),
+            "slip.env",
+            "# A comment\n\
+             SLIP_SECRET=hunter2\n\
+             GHCR_TOKEN=ghp_abc123\n\
+             \n\
+             QUOTED=\"with spaces\"\n\
+             SINGLE='single quoted'\n",
+        );
+        let vars = parse_env_file(&env_path).unwrap();
+        assert_eq!(vars.get("SLIP_SECRET").unwrap(), "hunter2");
+        assert_eq!(vars.get("GHCR_TOKEN").unwrap(), "ghp_abc123");
+        assert_eq!(vars.get("QUOTED").unwrap(), "with spaces");
+        assert_eq!(vars.get("SINGLE").unwrap(), "single quoted");
+        // Comment + blank line ignored.
+        assert_eq!(vars.len(), 4);
+    }
+
+    #[test]
+    fn parse_env_file_rejects_export() {
+        let dir = setup_config_dir();
+        let env_path = dir.path().join("slip.env");
+        write_file(dir.path(), "slip.env", "export FOO=bar\n");
+        let err = parse_env_file(&env_path).unwrap_err();
+        assert!(err.to_string().contains("export"), "reject `export` prefix");
+    }
+
+    #[test]
+    fn parse_env_file_rejects_missing_equals() {
+        let dir = setup_config_dir();
+        let env_path = dir.path().join("slip.env");
+        write_file(dir.path(), "slip.env", "NO_EQUALS_HERE\n");
+        let err = parse_env_file(&env_path).unwrap_err();
+        assert!(err.to_string().contains("missing '='"));
+    }
+
+    #[test]
+    fn parse_env_file_comments_and_blanks() {
+        let dir = setup_config_dir();
+        let env_path = dir.path().join("slip.env");
+        write_file(
+            dir.path(),
+            "slip.env",
+            "# header\n\
+             \n\
+             KEY=val\n",
+        );
+        let vars = parse_env_file(&env_path).unwrap();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars.get("KEY").unwrap(), "val");
+    }
+
+    // ── load_config_check (warn-mode) ────────────────────────────────────────
+
+    #[test]
+    fn load_config_check_warns_on_unresolved_env() {
+        let dir = setup_config_dir();
+        // Override slip.toml with an env-ref secret that is NOT set.
+        // SAFETY: single-threaded test.
+        unsafe { std::env::remove_var("SLIP_DEFINITELY_UNSET_FOR_CHECK") };
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+listen = "0.0.0.0:7890"
+
+[caddy]
+admin_api = "http://localhost:2019"
+
+[auth]
+secret = "${SLIP_DEFINITELY_UNSET_FOR_CHECK}"
+
+[storage]
+path = "/tmp/slip-test"
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let (cfg, _apps, warnings) = load_config_check(dir.path()).unwrap();
+        // Warn-mode: placeholder left in place, warning collected, no error.
+        assert_eq!(cfg.auth.secret, "${SLIP_DEFINITELY_UNSET_FOR_CHECK}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("SLIP_DEFINITELY_UNSET_FOR_CHECK")),
+            "warning should mention the unresolved var: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn load_config_check_resolves_with_env_var_set() {
+        let dir = setup_config_dir();
+        // SAFETY: single-threaded test.
+        unsafe { std::env::set_var("SLIP_TEST_CHECK_VAR", "resolved-val") };
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+listen = "0.0.0.0:7890"
+
+[caddy]
+admin_api = "http://localhost:2019"
+
+[auth]
+secret = "${SLIP_TEST_CHECK_VAR}"
+
+[storage]
+path = "/tmp/slip-test"
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let (cfg, _apps, warnings) = load_config_check(dir.path()).unwrap();
+        assert_eq!(cfg.auth.secret, "resolved-val");
+        assert!(
+            warnings.is_empty(),
+            "no warnings when env is set: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn load_config_check_registry_token_warns() {
+        let dir = setup_config_dir();
+        // SAFETY: single-threaded test.
+        unsafe { std::env::remove_var("SLIP_REG_TOKEN_UNSET") };
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registries.ghcr]
+url = "ghcr.io"
+token = "${SLIP_REG_TOKEN_UNSET}"
+
+[storage]
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let (cfg, _apps, warnings) = load_config_check(dir.path()).unwrap();
+        // Placeholder left in place.
+        assert_eq!(
+            cfg.registries.registries["ghcr"].token.as_deref(),
+            Some("${SLIP_REG_TOKEN_UNSET}")
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("SLIP_REG_TOKEN_UNSET")),
+            "warning should mention the registry token var: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn load_config_check_structural_error_still_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // A config that fails to parse (missing required [auth] table).
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[storage]
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let err = load_config_check(dir.path()).unwrap_err();
+        // Structural errors hard-fail even in warn mode.
+        assert!(
+            err.to_string().contains("auth") || err.to_string().contains("missing"),
+            "structural parse error should hard-fail: {err}"
+        );
+    }
+
+    #[test]
+    fn load_config_with_mode_strict_still_hard_fails() {
+        // Production strict mode must still hard-fail on unresolved env.
+        let dir = setup_config_dir();
+        // SAFETY: single-threaded test.
+        unsafe { std::env::remove_var("SLIP_STRICT_UNSET_XYZ") };
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "${SLIP_STRICT_UNSET_XYZ}"
+
+[storage]
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let err = load_config_with_mode(dir.path(), ResolveMode::Strict).unwrap_err();
+        assert!(
+            err.to_string().contains("SLIP_STRICT_UNSET_XYZ"),
+            "strict mode should hard-fail on unresolved env: {err}"
+        );
     }
 }

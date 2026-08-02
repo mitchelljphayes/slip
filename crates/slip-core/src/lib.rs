@@ -35,10 +35,11 @@ pub use caddy::{
 pub use config::{
     AppConfig, AppInfo, AppPreviewConfig, AuthConfig, CaddyConfig, CaddyTlsConfig, DeployConfig,
     EnvFileConfig, HealthConfig, NetworkConfig, ReconcileConfig, RegistriesConfig, RegistryEntry,
-    ResourceConfig, RouteEntry, RoutingConfig, RuntimeConfig, ServerConfig, ServerDeployConfig,
-    ServerPreviewConfig, SlipConfig, StorageConfig, TlsStrategy, VolumeConfig, is_ts_net_host,
-    load_config, normalize_registry_url, resolve_acme_email, resolve_env_vars,
-    resolve_env_vars_warn, validate_tls_strategy,
+    ResolveMode, ResourceConfig, RouteEntry, RoutingConfig, RuntimeConfig, ServerConfig,
+    ServerDeployConfig, ServerPreviewConfig, SlipConfig, StorageConfig, TlsStrategy, VolumeConfig,
+    is_ts_net_host, load_config, load_config_check, load_config_with_mode, normalize_registry_url,
+    parse_env_file, resolve_acme_email, resolve_env_vars, resolve_env_vars_warn,
+    validate_tls_strategy,
 };
 pub use db::Db;
 pub use deploy::{
