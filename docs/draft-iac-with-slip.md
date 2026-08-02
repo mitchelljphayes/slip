@@ -285,8 +285,9 @@ imperative commands, and app config drifts if you copy it around.
 - Maintain the **workaround-retirement checklist** (in SLIP-116): what you can
   delete when each ticket ships —
   `caddy-manual-routes.py`/`.service` → SLIP-87/99/110 · manual GHCR
-  package↔repo linking → SLIP-105/111 · `--insecure` webhook curl → SLIP-87 ·
-  hand-invented HMAC secrets → SLIP-89/93.
+  package↔repo linking → SLIP-105/111 (see `docs/registry-runbook.md` for the
+  `slip registry login` + `[registries.<name>]` workflow that replaces it) ·
+  `--insecure` webhook curl → SLIP-87 · hand-invented HMAC secrets → SLIP-89/93.
 - Put every secret you mint today into 1Password *now*, named the way you'd
   reference it later — makes the SLIP-118 migration a rename, not a hunt.
 
