@@ -15,7 +15,7 @@ use crate::config::{AppConfig, SlipConfig};
 use crate::db::Db;
 use crate::error::HealthError;
 use crate::health::HealthCheck;
-use crate::runtime::{RegistryCredentials, RuntimeBackend};
+use crate::runtime::RuntimeBackend;
 use crate::state;
 
 /// Format a [`HealthError`] into a SLIP-91 terminal-tagged reason string.
@@ -264,7 +264,10 @@ pub(crate) struct DeploySharedState<'a> {
     pub deploys: &'a DashMap<String, DeployContext>,
     /// Persistent deploy-history database. `Db` is `Arc`-backed, so cloning is cheap.
     pub db: Db,
-    pub credentials: Option<RegistryCredentials>,
+    /// Merged registry table (TOML + store creds), built fresh per-deploy so
+    /// `slip registry login` takes effect without a daemon restart. Resolved
+    /// per-image at each pull via [`crate::registry::resolve_registry_credential`].
+    pub registries: Vec<crate::registry::ResolvedRegistry>,
     pub secrets_store: Option<&'a crate::secrets::SecretsStore>,
 }
 
@@ -294,7 +297,7 @@ pub async fn execute_deploy(state: Arc<AppState>, mut ctx: DeployContext) {
         app_states: &state.app_states,
         deploys: &state.deploys,
         db: state.db.clone(),
-        credentials: state.registry_credentials(),
+        registries: crate::registry::merged_registry_table(&state.config, &state.secrets_store),
         secrets_store: Some(&state.secrets_store),
     };
 
@@ -399,7 +402,11 @@ pub(crate) async fn execute_deploy_inner(
     );
 
     if let Err(e) = runtime
-        .pull_image(&ctx.image, &ctx.tag, shared.credentials.clone())
+        .pull_image(
+            &ctx.image,
+            &ctx.tag,
+            crate::registry::resolve_registry_credential(&ctx.image, &shared.registries),
+        )
         .await
     {
         ctx.fail(&format!("[pull_failed] image pull failed: {e}"));
@@ -419,7 +426,11 @@ pub(crate) async fn execute_deploy_inner(
             "pulling sidecar image"
         );
         if let Err(e) = runtime
-            .pull_image(sidecar_image, sidecar_tag, shared.credentials.clone())
+            .pull_image(
+                sidecar_image,
+                sidecar_tag,
+                crate::registry::resolve_registry_credential(full_ref, &shared.registries),
+            )
             .await
         {
             ctx.fail(&format!(
@@ -2540,7 +2551,7 @@ mod tests {
             app_states,
             deploys,
             db: Db::open_in_memory().expect("in-memory db for tests"),
-            credentials: None,
+            registries: Vec::new(),
             secrets_store: None,
         }
     }
@@ -2560,7 +2571,7 @@ mod tests {
             app_states,
             deploys,
             db,
-            credentials: None,
+            registries: Vec::new(),
             secrets_store: None,
         }
     }

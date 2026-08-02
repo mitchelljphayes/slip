@@ -26,7 +26,7 @@ use crate::preview::{
     PreviewDeployContext, PreviewState, execute_preview_deploy, resolve_preview_domain,
     teardown_preview,
 };
-use crate::runtime::{ContainerInfo, RegistryCredentials, RuntimeBackend};
+use crate::runtime::{ContainerInfo, RuntimeBackend};
 use crate::secrets::{SecretsStore, validate_secret_key};
 
 // ─── Request / Response types ─────────────────────────────────────────────────
@@ -557,29 +557,6 @@ impl AppState {
         });
         // Update in-memory cache (synchronous, always succeeds)
         self.deploys.insert(ctx.app.clone(), ctx.clone());
-    }
-
-    /// Build registry credentials for a pull, from the configured registries.
-    ///
-    /// Phase 1 stub: returns the single declared registry's credential if
-    /// exactly one registry is configured with a `token`, else `None`. This
-    /// preserves the pre-SLIP-105 single-cred-per-pull behaviour while the
-    /// per-image longest-prefix resolver lands in Phase 3.
-    pub fn registry_credentials(&self) -> Option<RegistryCredentials> {
-        let mut found = None;
-        for entry in self.config.registries.registries.values() {
-            if let Some(token) = &entry.token {
-                if found.is_some() {
-                    // Multiple declared tokens — defer to Phase 3 resolver.
-                    return None;
-                }
-                found = Some(RegistryCredentials {
-                    username: entry.username.clone().unwrap_or_else(|| "slip".to_string()),
-                    password: token.clone(),
-                });
-            }
-        }
-        found
     }
 }
 
