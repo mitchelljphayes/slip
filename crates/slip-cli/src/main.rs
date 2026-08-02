@@ -285,8 +285,24 @@ enum TlsCommands {
 
 #[derive(Subcommand)]
 enum RegistryCommands {
-    /// Log in to a container registry.
-    Login,
+    /// Log in to a container registry (store a credential with slipd).
+    Login {
+        /// Registry URL (host[:port], no scheme, no path — e.g. ghcr.io).
+        url: String,
+        /// Username for the registry. Optional (anonymous pull if absent).
+        #[arg(long)]
+        username: Option<String>,
+        /// Read the token/password from stdin instead of prompting.
+        #[arg(long)]
+        token_stdin: bool,
+    },
+    /// Log out of a container registry (remove the stored credential).
+    Logout {
+        /// Registry URL (host[:port]).
+        url: String,
+    },
+    /// List configured + stored registries (never prints tokens).
+    List,
 }
 
 /// Deprecated `slip apps` subcommands (hidden, still functional).
@@ -1469,6 +1485,241 @@ fn parse_gh_repo_slug(url: &str) -> Option<String> {
         return Some(rest.to_string());
     }
     None
+}
+
+// ─── Registry commands (SLIP-105) ─────────────────────────────────────────────
+
+/// Reject a registry URL containing a path component (host[:port] only).
+/// Exits with USAGE (2) and a prescriptive message if invalid.
+fn validate_registry_url_cli(url: &str) {
+    // Reuse the core normalizer; on error exit USAGE with the remedy.
+    if let Err(e) = slip_core::normalize_registry_url(url) {
+        output::fail(
+            output::USAGE,
+            &format!("invalid registry url '{url}': {e}"),
+            "use host[:port] only (e.g. ghcr.io) — see `slip registry login --help`",
+        );
+    }
+}
+
+/// Read the token from stdin (preferred) or prompt interactively (TTY only).
+fn read_registry_token(url: &str, token_stdin: bool) -> String {
+    if token_stdin {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("failed to read token from stdin")
+            .unwrap_or_else(|e| {
+                output::fail(
+                    output::GENERIC,
+                    &format!("could not read token from stdin: {e}"),
+                    "pipe the token: `echo $TOKEN | slip registry login ghcr.io --token-stdin`",
+                )
+            });
+        // Strip trailing newline (common when piping `echo`).
+        buf.trim_end().to_string()
+    } else {
+        // Interactive prompt via dialoguer (already a dep).
+        use dialoguer::Password;
+        Password::new()
+            .with_prompt(format!("Token for {url}"))
+            .allow_empty_password(false)
+            .interact()
+            .unwrap_or_else(|e| {
+                output::fail(
+                    output::GENERIC,
+                    &format!("could not read token interactively: {e}"),
+                    "pipe the token: `echo $TOKEN | slip registry login ghcr.io --token-stdin`",
+                )
+            })
+    }
+}
+
+/// `slip registry login <url> [--username <u>] [--token-stdin]`.
+async fn registry_login(
+    server: &str,
+    token: &str,
+    url: &str,
+    username: Option<&str>,
+    token_stdin: bool,
+    json: bool,
+) {
+    // URL already validated by `validate_registry_url_cli` in the dispatch.
+
+    let password = read_registry_token(url, token_stdin);
+    if password.is_empty() {
+        output::fail(
+            output::USAGE,
+            "empty token",
+            "provide a non-empty token via --token-stdin or the interactive prompt",
+        );
+    }
+
+    let client = create_client();
+    let endpoint = format!("{server}/v1/registries/{url}");
+    let body = serde_json::json!({
+        "username": username,
+        "password": password,
+    });
+
+    let resp = match api_request(
+        &client,
+        reqwest::Method::PUT,
+        &endpoint,
+        token,
+        Some(&serde_json::to_value(&body).unwrap()),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("{e}");
+            if msg.contains("400") {
+                output::fail(
+                    output::USAGE,
+                    &format!("invalid registry url '{url}'"),
+                    "use host[:port] only (e.g. ghcr.io) — no scheme, no path",
+                );
+            }
+            if msg.contains("401") || msg.contains("403") {
+                output::fail(
+                    output::AUTH,
+                    "auth failed",
+                    "check your admin token (--token or SLIP_TOKEN)",
+                );
+            }
+            if msg.contains("404") {
+                output::fail(
+                    output::NOT_FOUND,
+                    &format!("registry endpoint not found at {server}"),
+                    "is slipd up to date? this endpoint requires SLIP-105",
+                );
+            }
+            if msg.contains("HTTP request failed") {
+                output::fail(
+                    output::GENERIC,
+                    &format!("can't reach slipd at {server} — is it running?"),
+                    "run `slip link` to confirm the server address",
+                );
+            }
+            output::fail(output::GENERIC, &msg, "");
+        }
+    };
+
+    let data: slip_core::api::SetRegistryCredResponse = resp
+        .json()
+        .await
+        .context("failed to parse registry login response")
+        .unwrap_or_else(|e| output::fail(output::GENERIC, &format!("{e}"), ""));
+
+    if json {
+        let out = serde_json::json!({
+            "ok": true,
+            "url": data.url,
+            "username": data.username,
+        });
+        println!("{out}");
+    } else {
+        println!("Login Succeeded");
+        println!("  url:      {}", data.url);
+        if let Some(u) = data.username {
+            println!("  username: {u}");
+        }
+    }
+}
+
+/// `slip registry logout <url>`.
+async fn registry_logout(server: &str, token: &str, url: &str, json: bool) {
+    // URL already validated by `validate_registry_url_cli` in the dispatch.
+
+    let client = create_client();
+    let endpoint = format!("{server}/v1/registries/{url}");
+
+    if let Err(e) = api_request(&client, reqwest::Method::DELETE, &endpoint, token, None).await {
+        let msg = format!("{e}");
+        if msg.contains("401") || msg.contains("403") {
+            output::fail(
+                output::AUTH,
+                "auth failed",
+                "check your admin token (--token or SLIP_TOKEN)",
+            );
+        }
+        if msg.contains("404") {
+            output::fail(
+                output::NOT_FOUND,
+                &format!("no credential stored for '{url}'"),
+                "run `slip registry list` to see stored registries",
+            );
+        }
+        if msg.contains("HTTP request failed") {
+            output::fail(
+                output::GENERIC,
+                &format!("can't reach slipd at {server} — is it running?"),
+                "run `slip link` to confirm the server address",
+            );
+        }
+        output::fail(output::GENERIC, &msg, "");
+    }
+
+    if json {
+        println!("{}", serde_json::json!({"ok": true, "url": url}));
+    } else {
+        println!("Logged out: {url}");
+    }
+}
+
+/// `slip registry list` — list configured + stored registries (no tokens).
+async fn registry_list(server: &str, token: &str, json: bool) {
+    let client = create_client();
+    let endpoint = format!("{server}/v1/registries");
+
+    let resp = match api_request(&client, reqwest::Method::GET, &endpoint, token, None).await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("{e}");
+            if msg.contains("401") || msg.contains("403") {
+                output::fail(
+                    output::AUTH,
+                    "auth failed",
+                    "check your admin token (--token or SLIP_TOKEN)",
+                );
+            }
+            if msg.contains("HTTP request failed") {
+                output::fail(
+                    output::GENERIC,
+                    &format!("can't reach slipd at {server} — is it running?"),
+                    "run `slip link` to confirm the server address",
+                );
+            }
+            output::fail(output::GENERIC, &msg, "");
+        }
+    };
+
+    let entries: Vec<slip_core::api::RegistryListResponse> = resp
+        .json()
+        .await
+        .context("failed to parse registry list response")
+        .unwrap_or_else(|e| output::fail(output::GENERIC, &format!("{e}"), ""));
+
+    if json {
+        println!("{}", serde_json::to_string(&entries).unwrap());
+    } else {
+        if entries.is_empty() {
+            println!("No registries configured. Run `slip registry login <url>`.");
+            return;
+        }
+        println!("URL                           USERNAME              HAS CRED       SOURCE");
+        for e in &entries {
+            println!(
+                "{:<28} {:<20} {:<14} {}",
+                e.url,
+                e.username.as_deref().unwrap_or("-"),
+                if e.has_credential { "yes" } else { "no" },
+                e.credential_source,
+            );
+        }
+    }
 }
 
 // ─── Deprecation warning helper ────────────────────────────────────────────────
@@ -2809,8 +3060,36 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Registry(command) => match command {
-            RegistryCommands::Login => {
-                output::not_implemented("registry login", cli.json);
+            RegistryCommands::Login {
+                url,
+                username,
+                token_stdin,
+            } => {
+                // Validate URL before resolving the token (so a bad url exits
+                // USAGE even without --token, matching the SLIP-86 contract).
+                validate_registry_url_cli(&url);
+                let token = resolve_token(cli.token.clone());
+                let server = resolve_server(&cli.server);
+                registry_login(
+                    &server,
+                    &token,
+                    &url,
+                    username.as_deref(),
+                    token_stdin,
+                    cli.json,
+                )
+                .await;
+            }
+            RegistryCommands::Logout { url } => {
+                validate_registry_url_cli(&url);
+                let token = resolve_token(cli.token.clone());
+                let server = resolve_server(&cli.server);
+                registry_logout(&server, &token, &url, cli.json).await;
+            }
+            RegistryCommands::List => {
+                let token = resolve_token(cli.token.clone());
+                let server = resolve_server(&cli.server);
+                registry_list(&server, &token, cli.json).await;
             }
         },
         Commands::Doctor {

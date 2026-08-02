@@ -598,6 +598,12 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         )
         .route("/v1/apps/{name}/logs", axum::routing::get(handle_app_logs))
         .route("/v1/tls/renew", axum::routing::post(handle_tls_renew))
+        .route("/v1/registries", axum::routing::get(handle_list_registries))
+        .route(
+            "/v1/registries/{url}",
+            axum::routing::put(handle_set_registry_credential)
+                .delete(handle_remove_registry_credential),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             management_auth,
@@ -1320,6 +1326,168 @@ async fn handle_set_deploy_key(
             message,
         }),
     ))
+}
+
+// ─── Registry credential handlers (SLIP-105) ─────────────────────────────────
+
+/// Request body for `PUT /v1/registries/{url}`.
+#[derive(Debug, Deserialize)]
+pub struct SetRegistryCredRequest {
+    /// Username for the registry (optional — anonymous pull if absent).
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Password/token. Required (use `slip registry login` to set it).
+    pub password: String,
+}
+
+/// Response for `PUT /v1/registries/{url}`.
+///
+/// Never echoes the password.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetRegistryCredResponse {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+}
+
+/// `PUT /v1/registries/{url}` — store (or rotate) a registry credential.
+///
+/// The `{url}` path segment is host[:port] (no scheme, no path). The
+/// password is written to the secrets store under the synthetic `__registry`
+/// namespace (0o600); the `{url, username}` is recorded in the sidecar index.
+/// The response never includes the password.
+///
+/// Admin-token gated (management auth middleware).
+async fn handle_set_registry_credential(
+    State(state): State<Arc<AppState>>,
+    Path(url): Path<String>,
+    Json(req): Json<SetRegistryCredRequest>,
+) -> Result<(StatusCode, Json<SetRegistryCredResponse>), AppError> {
+    // Validate URL via normalize (rejects path components / bad shape).
+    let normalized = crate::config::normalize_registry_url(&url).map_err(|e| {
+        AppError::BadRequest(format!(
+            "invalid registry url '{url}' — {e}. \
+             Use host[:port] only (e.g. ghcr.io). See `slip registry login --help`."
+        ))
+    })?;
+
+    state
+        .secrets_store
+        .set_registry_credential(&normalized, req.username.as_deref(), &req.password)
+        .map_err(|e| AppError::Internal(format!("failed to store registry credential: {e}")))?;
+
+    info!(registry = %normalized, "registry credential set");
+
+    Ok((
+        StatusCode::OK,
+        Json(SetRegistryCredResponse {
+            url: normalized,
+            username: req.username,
+        }),
+    ))
+}
+
+/// `DELETE /v1/registries/{url}` — remove a stored registry credential.
+///
+/// 404 if no credential is stored for the (normalized) URL.
+async fn handle_remove_registry_credential(
+    State(state): State<Arc<AppState>>,
+    Path(url): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let normalized = crate::config::normalize_registry_url(&url)
+        .map_err(|e| AppError::BadRequest(format!("invalid registry url '{url}' — {e}")))?;
+    let removed = state
+        .secrets_store
+        .remove_registry_credential(&normalized)
+        .map_err(|e| AppError::Internal(format!("failed to remove registry credential: {e}")))?;
+    if removed {
+        info!(registry = %normalized, "registry credential removed");
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound(format!(
+            "no credential stored for registry '{normalized}' — \
+             run `slip registry list` to see stored registries"
+        )))
+    }
+}
+
+/// A registry entry as returned by `GET /v1/registries`.
+///
+/// `has_credential` is true if either a TOML-declared token OR a store
+/// credential exists for the URL. Never includes the password/token.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistryListResponse {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    pub has_credential: bool,
+    /// "toml" if the credential comes from slip.toml, "store" if from
+    /// `slip registry login`, "toml+store" if both (store wins at pull).
+    pub credential_source: String,
+}
+
+/// `GET /v1/registries` — list all known registries (TOML-declared + store).
+///
+/// Merges the two sources. Never includes password/token material.
+async fn handle_list_registries(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<RegistryListResponse>>, AppError> {
+    // Store creds (public metadata only).
+    let store_entries = state
+        .secrets_store
+        .list_registry_credentials()
+        .map_err(|e| AppError::Internal(format!("failed to list registry credentials: {e}")))?;
+    let store_map: std::collections::HashMap<String, Option<String>> = store_entries
+        .iter()
+        .map(|e| (e.url.clone(), e.username.clone()))
+        .collect();
+
+    // TOML-declared registries.
+    let toml_map: std::collections::HashMap<String, (Option<String>, bool)> = state
+        .config
+        .registries
+        .registries
+        .values()
+        .map(|e| {
+            let has_token = e.token.is_some();
+            (e.url.clone(), (e.username.clone(), has_token))
+        })
+        .collect();
+
+    // Merge: union of urls.
+    let mut urls: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    urls.extend(store_map.keys().cloned());
+    urls.extend(toml_map.keys().cloned());
+
+    let out: Vec<RegistryListResponse> = urls
+        .iter()
+        .map(|url| {
+            let in_store = store_map.contains_key(url);
+            let toml_entry = toml_map.get(url);
+            let toml_has_token = toml_entry.is_some_and(|(_, has)| *has);
+            let username = store_map
+                .get(url)
+                .cloned()
+                .flatten()
+                .or_else(|| toml_entry.and_then(|(u, _)| u.clone()));
+            let has_credential = in_store || toml_has_token;
+            let credential_source = match (in_store, toml_has_token) {
+                (true, true) => "toml+store".to_string(),
+                (true, false) => "store".to_string(),
+                (false, true) => "toml".to_string(),
+                (false, false) => "none".to_string(),
+            };
+            RegistryListResponse {
+                url: url.clone(),
+                username,
+                has_credential,
+                credential_source,
+            }
+        })
+        .collect();
+
+    Ok(Json(out))
 }
 
 // ─── Deploy handler ───────────────────────────────────────────────────────────
@@ -2981,6 +3149,12 @@ mod tests {
     /// Each call creates a fresh tempdir for the secrets store, avoiding
     /// interference between parallel tests.
     fn create_test_state() -> Arc<AppState> {
+        create_test_state_with_config(test_slip_config())
+    }
+
+    /// Build a test `AppState` with a custom `SlipConfig` (e.g. with declared
+    /// registries). Each call gets a fresh secrets tempdir.
+    fn create_test_state_with_config(config: SlipConfig) -> Arc<AppState> {
         let mut apps = HashMap::new();
         apps.insert(APP_NAME.to_string(), test_app_config(Some(APP_SECRET)));
 
@@ -2991,7 +3165,7 @@ mod tests {
         Box::leak(Box::new(secrets_tmp));
 
         Arc::new(AppState {
-            config: test_slip_config(),
+            config,
             apps: RwLock::new(apps),
             config_dir: PathBuf::from("/tmp/slip-test"),
             deploy_locks: DashMap::new(),
@@ -5421,6 +5595,202 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Registry credential handler tests (SLIP-105) ────────────────────────────
+
+    #[tokio::test]
+    async fn test_registry_put_creates_store_entry() {
+        let state = create_test_state();
+        let app = build_router(state.clone());
+
+        let body = serde_json::json!({
+            "username": "slip",
+            "password": "tok-secret"
+        })
+        .to_string();
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/v1/registries/ghcr.io")
+            .header("Content-Type", "application/json")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["url"], "ghcr.io");
+        assert_eq!(payload["username"], "slip");
+        assert!(
+            payload.get("password").is_none(),
+            "response must never include the password"
+        );
+
+        // Store entry created.
+        let cred = state
+            .secrets_store
+            .get_registry_credential("ghcr.io")
+            .unwrap();
+        assert_eq!(
+            cred,
+            Some((Some("slip".to_string()), "tok-secret".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_registry_put_missing_password_rejects() {
+        // The `password` field is required; a body without it fails to
+        // deserialize → 400 (axum's default Json extractor response).
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({"username": "u"}).to_string();
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/v1/registries/ghcr.io")
+            .header("Content-Type", "application/json")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "missing password should be rejected, got {}",
+            response.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_registry_delete_removes_entry() {
+        let state = create_test_state();
+        state
+            .secrets_store
+            .set_registry_credential("ghcr.io", Some("u"), "p")
+            .unwrap();
+        let app = build_router(state.clone());
+
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/v1/registries/ghcr.io")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state
+                .secrets_store
+                .get_registry_credential("ghcr.io")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_registry_delete_unknown_returns_404() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/v1/registries/ghcr.io")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_registry_list_excludes_password_and_merges_sources() {
+        let mut config = test_slip_config();
+        config.registries.registries.insert(
+            "ghcr".to_string(),
+            crate::config::RegistryEntry {
+                url: "ghcr.io".to_string(),
+                username: Some("toml-user".to_string()),
+                token: Some("toml-tok".to_string()),
+            },
+        );
+        // A second TOML registry with no token.
+        config.registries.registries.insert(
+            "public".to_string(),
+            crate::config::RegistryEntry {
+                url: "registry.example.com".to_string(),
+                username: None,
+                token: None,
+            },
+        );
+        let state = create_test_state_with_config(config);
+        // Store a cred for localhost:5000 + one for ghcr.io (store wins).
+        state
+            .secrets_store
+            .set_registry_credential("localhost:5000", Some("ci"), "store-tok")
+            .unwrap();
+        state
+            .secrets_store
+            .set_registry_credential("ghcr.io", Some("store-user"), "store-tok2")
+            .unwrap();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/registries")
+            .header("Authorization", auth_header(GLOBAL_SECRET))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = payload.as_array().expect("list is an array");
+        let by_url: std::collections::HashMap<String, serde_json::Value> = arr
+            .iter()
+            .map(|v| (v["url"].as_str().unwrap().to_string(), v.clone()))
+            .collect();
+
+        // ghcr.io: both toml+store present; store username wins; source toml+store.
+        let ghcr = &by_url["ghcr.io"];
+        assert_eq!(ghcr["username"], "store-user", "store username wins");
+        assert_eq!(ghcr["hasCredential"], true);
+        assert_eq!(ghcr["credentialSource"], "toml+store");
+        assert!(
+            !serde_json::to_string(ghcr).unwrap().contains("store-tok2"),
+            "no password leak"
+        );
+
+        // registry.example.com: toml-declared, no token.
+        let public = &by_url["registry.example.com"];
+        assert_eq!(public["hasCredential"], false);
+        assert_eq!(public["credentialSource"], "none");
+
+        // localhost:5000: store only.
+        let local = &by_url["localhost:5000"];
+        assert_eq!(local["username"], "ci");
+        assert_eq!(local["hasCredential"], true);
+        assert_eq!(local["credentialSource"], "store");
+    }
+
+    #[tokio::test]
+    async fn test_registry_routes_require_auth() {
+        let state = create_test_state();
+        let app = build_router(state);
+
+        // No Authorization header → 401.
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/registries")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     // ── Live app registration: create → immediate visibility → survive restart ──
