@@ -534,7 +534,10 @@ pub struct RegistriesConfig {
 /// Strips a leading `https?://` and any trailing `/`. Rejects URLs that
 /// contain a path component after the host (registries are host[:port] only —
 /// per-image path matching is done at pull time against the image ref, not
-/// the registry URL).
+/// the registry URL). Lowercases the result so registry hosts compare
+/// case-insensitively (Docker convention: `GHCR.io` and `ghcr.io` are the same
+/// registry). The port is preserved as written (ports are numeric → already
+/// case-insensitive).
 pub fn normalize_registry_url(url: &str) -> Result<String, ConfigError> {
     let stripped = url
         .strip_prefix("http://")
@@ -553,7 +556,8 @@ pub fn normalize_registry_url(url: &str) -> Result<String, ConfigError> {
             "registry url '{url}' is empty after normalization"
         )));
     }
-    Ok(trimmed.to_string())
+    // Lowercase for Docker-parity case-insensitive host matching.
+    Ok(trimmed.to_lowercase())
 }
 
 /// Persistent storage path.
@@ -976,161 +980,24 @@ fn is_secret_like_key(key: &str) -> bool {
 // ─── Config loading ───────────────────────────────────────────────────────────
 
 /// Loads the daemon config from `{path}/slip.toml` and all app configs from
-/// `{path}/apps/*.toml`.
+/// `{path}/apps/*.toml`, resolving env vars in **strict** mode (production:
+/// unresolved `${ENV}` hard-fails).
 ///
 /// Environment variables in `auth.secret`, each `[registries.<name>].token`,
 /// each app's `env` values, and each app's `app.secret` are resolved via
-/// [`resolve_env_vars`].
+/// [`resolve_env_vars`]. Each registry entry's `url` is validated/normalized
+/// via [`normalize_registry_url`].
+///
+/// This is the strict wrapper over [`load_config_with_mode`]; the warnings
+/// vector that function returns is always empty in strict mode (unresolved env
+/// vars error out instead of being collected). Kept as the production entry
+/// point so existing callers don't need to handle the 3-tuple. See
+/// [`load_config_check`] for the warn-mode (`--check`) variant.
 ///
 /// Returns a tuple of `(SlipConfig, HashMap<app_name, AppConfig>)`.
 pub fn load_config(path: &Path) -> Result<(SlipConfig, HashMap<String, AppConfig>), ConfigError> {
-    // ── 1. Load daemon config ────────────────────────────────────────────────
-    let slip_toml_path = path.join("slip.toml");
-    let raw = std::fs::read_to_string(&slip_toml_path).map_err(|e| ConfigError::ReadFile {
-        path: slip_toml_path.clone(),
-        source: e,
-    })?;
-    let mut slip_cfg: SlipConfig = toml::from_str(&raw).map_err(|e| ConfigError::Parse {
-        path: slip_toml_path.clone(),
-        source: e,
-    })?;
-
-    // Validate reconcile interval — must be at least 1s to avoid hot-looping.
-    if slip_cfg.caddy.reconcile.interval < Duration::from_secs(1) {
-        return Err(ConfigError::Internal(format!(
-            "[caddy.reconcile] interval must be at least 1s — got {:?}",
-            slip_cfg.caddy.reconcile.interval
-        )));
-    }
-
-    // Validate deploy TLS strategy (if [deploy] is configured).
-    let acme_email = resolve_acme_email(&slip_cfg);
-    let validation_ctx = ValidationCtx {
-        acme_email: acme_email.as_deref(),
-    };
-    if let Some(deploy_cfg) = &slip_cfg.deploy
-        && let Some(domain) = deploy_cfg.domain.as_deref()
-    {
-        validate_tls_strategy(&deploy_cfg.tls, Some(domain), &validation_ctx)?;
-    }
-
-    // Validate DNS provider config: reject literal secrets (server-level).
-    if let Some(ref tls) = slip_cfg.caddy.tls
-        && let Some(ref table) = tls.dns_provider_config
-    {
-        for (key, value) in table {
-            if is_secret_like_key(key)
-                && let Some(s) = value.as_str()
-                && (!s.starts_with("{env.") || !s.ends_with('}'))
-            {
-                return Err(ConfigError::Internal(format!(
-                    "DNS provider config key '{key}' contains a literal value — \
-                     use the {{env.*}} placeholder syntax instead, \
-                     e.g. {key} = \"{{env.CF_API_TOKEN}}\". \
-                     Slip must never POST literal secrets to Caddy."
-                )));
-            }
-        }
-    }
-
-    // Resolve env vars in auth.secret
-    slip_cfg.auth.secret = resolve_env_vars(&slip_cfg.auth.secret)?;
-
-    // Resolve env vars in registries.<name>.token (if present)
-    for entry in slip_cfg.registries.registries.values_mut() {
-        if let Some(token) = entry.token.take() {
-            entry.token = Some(resolve_env_vars(&token)?);
-        }
-    }
-
-    // ── 2. Load app configs ──────────────────────────────────────────────────
-    let apps_dir = path.join("apps");
-    let mut apps: HashMap<String, AppConfig> = HashMap::new();
-
-    // `apps/` directory is optional — if it doesn't exist we just return empty.
-    if apps_dir.is_dir() {
-        let entries = std::fs::read_dir(&apps_dir).map_err(|e| ConfigError::ReadFile {
-            path: apps_dir.clone(),
-            source: e,
-        })?;
-
-        for entry in entries {
-            let entry = entry.map_err(|e| ConfigError::ReadFile {
-                path: apps_dir.clone(),
-                source: e,
-            })?;
-            let entry_path = entry.path();
-
-            // Only process *.toml files
-            if entry_path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                continue;
-            }
-
-            let filename_stem = entry_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_owned();
-
-            let raw = std::fs::read_to_string(&entry_path).map_err(|e| ConfigError::ReadFile {
-                path: entry_path.clone(),
-                source: e,
-            })?;
-            let mut app_cfg: AppConfig = toml::from_str(&raw).map_err(|e| ConfigError::Parse {
-                path: entry_path.clone(),
-                source: e,
-            })?;
-
-            // Validate: filename stem must match app.name
-            if app_cfg.app.name != filename_stem {
-                return Err(ConfigError::NameMismatch {
-                    filename: filename_stem,
-                    config_name: app_cfg.app.name.clone(),
-                });
-            }
-
-            // Resolve env vars in env values
-            for value in app_cfg.env.values_mut() {
-                *value = resolve_env_vars(value)?;
-            }
-
-            // Resolve env vars in app.secret
-            if let Some(secret) = app_cfg.app.secret.take() {
-                app_cfg.app.secret = Some(resolve_env_vars(&secret)?);
-            }
-
-            // Validate deploy strategy
-            validate_deploy_strategy(&app_cfg.deploy)?;
-
-            // Validate TLS strategies on routing and route entries.
-            if let Some(routing_tls) = &app_cfg.routing.tls {
-                validate_tls_strategy(routing_tls, None, &validation_ctx)?;
-                // For inherited routing.tls = Tailscale, validate EVERY effective
-                // route hostname is .ts.net (not just routes with explicit tls).
-                if *routing_tls == TlsStrategy::Tailscale {
-                    for route in app_cfg.routing.effective_routes() {
-                        if !is_ts_net_host(&route.hostname) {
-                            return Err(ConfigError::Internal(format!(
-                                "tailscale strategy requires a *.ts.net host — \
-                                 route '{host}' is not a Tailscale certificate domain; \
-                                 use 'internal' or 'acme' instead",
-                                host = route.hostname
-                            )));
-                        }
-                    }
-                }
-            }
-            for route in &app_cfg.routing.routes {
-                if let Some(route_tls) = &route.tls {
-                    validate_tls_strategy(route_tls, Some(&route.hostname), &validation_ctx)?;
-                }
-            }
-
-            apps.insert(app_cfg.app.name.clone(), app_cfg);
-        }
-    }
-
-    Ok((slip_cfg, apps))
+    let (cfg, apps, _warnings) = load_config_with_mode(path, ResolveMode::Strict)?;
+    Ok((cfg, apps))
 }
 
 // ─── Config check (warn-mode) + env-file parsing (SLIP-105) ────────────────────
@@ -1281,6 +1148,18 @@ pub fn load_config_with_mode(
                 warnings.push(format!("auth.secret: unresolved ${{{m}}}"));
             }
         }
+    }
+
+    // Validate + normalize each registry entry's url (mirrors the store path's
+    // normalization on write, so a TOML-declared url with a scheme or trailing
+    // slash fails loudly at load rather than silently never matching an image
+    // ref at pull time). Errors hard-fail in both modes (an invalid url is a
+    // structural misconfiguration, not a missing env var).
+    for entry in slip_cfg.registries.registries.values_mut() {
+        entry.url = normalize_registry_url(&entry.url).map_err(|e| {
+            // Prefix with the TOML field location so the user knows where to fix.
+            ConfigError::Internal(format!("registries.<name>.url: {e}"))
+        })?;
     }
 
     // Resolve env vars in registries.<name>.token (strict or warn).
@@ -1703,6 +1582,16 @@ secret = "s"
         // Empty rejected.
         assert!(normalize_registry_url("").is_err());
         assert!(normalize_registry_url("https://").is_err());
+        // Case-insensitive: lowercased for Docker-parity host matching.
+        assert_eq!(
+            normalize_registry_url("GHCR.IO").unwrap(),
+            "ghcr.io",
+            "uppercase host should be lowercased"
+        );
+        assert_eq!(
+            normalize_registry_url("https://GHCR.IO/").unwrap(),
+            "ghcr.io"
+        );
     }
 
     // ── ReconcileConfig parsing ─────────────────────────────────────────────
@@ -3211,6 +3100,133 @@ secret = "${SLIP_STRICT_UNSET_XYZ}"
         assert!(
             err.to_string().contains("SLIP_STRICT_UNSET_XYZ"),
             "strict mode should hard-fail on unresolved env: {err}"
+        );
+    }
+
+    // ── registry url validation/normalization at load (SLIP-105 review #3) ────
+
+    #[test]
+    fn load_config_normalizes_registry_url_scheme_and_slash() {
+        // A TOML url with a scheme + trailing slash should be normalized at load
+        // so it matches image refs at pull time (review #3: silent-misconfig footgun).
+        let dir = setup_config_dir();
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registries.ghcr]
+url = "https://ghcr.io/"
+token = "tok"
+
+[storage]
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let (cfg, _apps) = load_config(dir.path()).unwrap();
+        assert_eq!(
+            cfg.registries.registries["ghcr"].url, "ghcr.io",
+            "scheme + trailing slash should be normalized at load"
+        );
+    }
+
+    #[test]
+    fn load_config_rejects_registry_url_with_path() {
+        // A TOML url with a path component must hard-fail at load (not silently
+        // never match an image ref at pull time).
+        let dir = setup_config_dir();
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registries.ghcr]
+url = "ghcr.io/team"
+token = "tok"
+
+[storage]
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let err = load_config(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("registries.<name>.url")
+                && err.to_string().contains("host[:port] only"),
+            "path-bearing url should fail loudly at load: {err}"
+        );
+    }
+
+    #[test]
+    fn load_config_check_also_validates_registry_url() {
+        // The --check (warn) path must also validate registry urls — an invalid
+        // url is a structural error, not a missing-env warning.
+        let dir = setup_config_dir();
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registries.ghcr]
+url = "ghcr.io/team"
+token = "tok"
+
+[storage]
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let err = load_config_check(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("host[:port] only"),
+            "--check should still hard-fail on invalid url: {err}"
+        );
+    }
+
+    #[test]
+    fn load_config_lowercases_registry_url() {
+        // Case-insensitive host matching (Docker convention): an uppercase host
+        // is normalized to lowercase at load.
+        let dir = setup_config_dir();
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registries.ghcr]
+url = "GHCR.IO"
+token = "tok"
+
+[storage]
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let (cfg, _apps) = load_config(dir.path()).unwrap();
+        assert_eq!(
+            cfg.registries.registries["ghcr"].url, "ghcr.io",
+            "uppercase host should be lowercased at load"
         );
     }
 }

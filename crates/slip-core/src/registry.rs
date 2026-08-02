@@ -2,13 +2,17 @@
 //!
 //! Given an image reference (e.g. `ghcr.io/me/app:1`, `nginx`, or
 //! `localhost:5000/internal/svc`) and the merged registry set (TOML-declared
-//! tokens + store creds), resolve the correct credential via
-//! **longest-path-segment-prefix match**: the registry whose normalized url
-//! is a path-segment prefix of the image's `host/path` wins, with the
-//! entry having the most path segments in its url taking precedence.
+//! tokens + store creds), resolve the correct credential via **host-equality
+//! match**: the registry whose normalized url equals the image's host wins.
+//! Registry urls are `host[:port]` only (no path components — validated at
+//! config load and on store write via `normalize_registry_url`), so there is
+//! no path-prefix matching to do; first matching entry wins (the merged table
+//! is ordered store-first, so store creds take precedence on URL collision).
 //!
 //! `host`-only entries match any image on that host. `host` and `host:443`
-//! are distinct (no grandfathering — document `docker.io` keying).
+//! are distinct (no grandfathering — document `docker.io` keying). Host
+//! comparison is case-insensitive (Docker convention); both
+//! `normalize_registry_url` and `normalize_image_ref` lowercase the host.
 
 use crate::config::SlipConfig;
 use crate::runtime::RegistryCredentials;
@@ -74,15 +78,17 @@ pub fn merged_registry_table(config: &SlipConfig, store: &SecretsStore) -> Vec<R
     out
 }
 
-/// Normalize an image ref into `(host, full_host_path)` for matching.
+/// Normalize an image ref into `(host, host/path)` for matching.
 ///
 /// - Strips tag (`:tag`) and digest (`@sha256:...`).
 /// - Bare names (`nginx`) → `docker.io` + `library/nginx` (Docker Hub convention).
 /// - Names with a single path segment (`me/app`) → `docker.io/me/app`.
 /// - `host/path:tag` → `host/path` (host is the first segment if it contains a `.` or `:` or is `localhost`).
+/// - The host is lowercased (Docker convention: registry hosts are
+///   case-insensitive; the path/repo portion keeps its case).
 ///
 /// Returns `(host, host/path)` where `host/path` is the full reference used for
-/// longest-prefix matching against registry urls.
+/// matching against registry urls.
 pub fn normalize_image_ref(image_ref: &str) -> (String, String) {
     // Strip digest first (@sha256:...).
     let without_digest = if let Some(at_pos) = image_ref.rfind('@') {
@@ -119,9 +125,9 @@ pub fn normalize_image_ref(image_ref: &str) -> (String, String) {
         let is_host =
             first_seg.contains('.') || first_seg.contains(':') || first_seg == "localhost";
         if is_host {
-            // host/path/name
-            let host = first_seg.to_string();
-            let full = without_tag.to_string();
+            // host/path/name — lowercase the host only (Docker convention).
+            let host = first_seg.to_lowercase();
+            let full = format!("{host}{}", &without_tag[first_seg.len()..]);
             (host, full)
         } else {
             // me/app → docker.io/me/app (Docker Hub implicit).
@@ -135,49 +141,34 @@ pub fn normalize_image_ref(image_ref: &str) -> (String, String) {
     }
 }
 
-/// Resolve the credential for an image ref via longest-path-segment-prefix match.
+/// Resolve the credential for an image ref via host-equality match.
 ///
-/// Walks `registries` filtered to those whose `normalized_url` is a path-segment
-/// prefix of the image's `host/path`; picks the entry with the **most path segments**
-/// in its url (tie-break: lexical for determinism). `host`-only entries match any
-/// image on that host. Returns `None` if no registry matches.
+/// Walks `registries` and picks the first entry whose normalized url equals
+/// the image's host. Registry urls are `host[:port]` only (validated at load
+/// and on store write), so there is no path-prefix matching to do; the merged
+/// table is ordered store-first so store creds win on URL collision. Returns
+/// `None` if no registry matches. The comparison is case-insensitive (both
+/// sides are lowercased by `normalize_registry_url` / `normalize_image_ref`).
 pub fn resolve_registry_credential(
     image_ref: &str,
     registries: &[ResolvedRegistry],
 ) -> Option<RegistryCredentials> {
     let (img_host, _img_full) = normalize_image_ref(image_ref);
 
-    let mut best: Option<(&ResolvedRegistry, usize)> = None;
+    // First matching entry wins. The merged table is ordered store-first, so a
+    // store cred for the same host takes precedence over a TOML token for it.
+    // Registry urls are host[:port] only (no path) — there's no longest-prefix
+    // selection to do; if path-prefixed registry urls are ever introduced,
+    // this is where segment-count comparison would go.
     for reg in registries {
-        // The registry url is host[:port]; it must match the image host exactly.
-        // (Registries declare host-only; per-path cred selection is by image path
-        // namespacing, not by registry url path — registry urls have no path.)
-        if reg.url != img_host {
-            continue;
-        }
-        // Segment count of the registry url (host = 1 segment; host:port = 1).
-        // The "longest prefix" here is really "does the host match" — since
-        // registry urls are host[:port] only (no path), the segment count is
-        // always 1. The tie-break is lexical. This satisfies the plan's
-        // "host-only entries match any image on that host" rule.
-        // (If we later allow registry urls with path prefixes, this is where
-        // the segment-count comparison would go. For now, first match wins
-        // deterministically.)
-        let seg_count = 1usize;
-        match best {
-            None => best = Some((reg, seg_count)),
-            Some((_, best_count)) if seg_count > best_count => best = Some((reg, seg_count)),
-            Some((best_reg, best_count)) if seg_count == best_count && reg.url < best_reg.url => {
-                best = Some((reg, seg_count));
-            }
-            _ => {}
+        if reg.url == img_host {
+            return Some(RegistryCredentials {
+                username: reg.username.clone().unwrap_or_else(|| "slip".to_string()),
+                password: reg.password.clone(),
+            });
         }
     }
-
-    best.map(|(reg, _)| RegistryCredentials {
-        username: reg.username.clone().unwrap_or_else(|| "slip".to_string()),
-        password: reg.password.clone(),
-    })
+    None
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -307,6 +298,26 @@ mod tests {
         let regs = vec![reg("ghcr.io", None, "t")];
         let cred = resolve_registry_credential("ghcr.io/me/app:1", &regs).unwrap();
         assert_eq!(cred.username, "slip", "absent username defaults to 'slip'");
+        assert_eq!(cred.password, "t");
+    }
+
+    // ── case-insensitive host matching (Docker convention) ──────────────────
+
+    #[test]
+    fn normalize_image_ref_lowercases_host() {
+        let (host, full) = normalize_image_ref("GHCR.IO/Me/App:1");
+        assert_eq!(host, "ghcr.io");
+        // Path/repo keeps its case; only the host is lowercased.
+        assert_eq!(full, "ghcr.io/Me/App");
+    }
+
+    #[test]
+    fn resolve_case_insensitive_host_match() {
+        // Registry url normalized to lowercase; image host normalized to
+        // lowercase → they match regardless of input case.
+        let regs = vec![reg("ghcr.io", Some("u"), "t")];
+        let cred = resolve_registry_credential("GHCR.IO/me/app:1", &regs).unwrap();
+        assert_eq!(cred.username, "u");
         assert_eq!(cred.password, "t");
     }
 }
