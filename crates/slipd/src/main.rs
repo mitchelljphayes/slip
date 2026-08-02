@@ -55,6 +55,25 @@ async fn main() -> anyhow::Result<()> {
 
     let config_path = Path::new(&args.config);
 
+    // ── --env-file without --check is a no-op (warn, don't error) ───────────
+    // --env-file pre-populates env vars before resolving config placeholders,
+    // which only matters in --check mode (the running daemon gets its env vars
+    // from its systemd unit). Without --check, the file is parsed but never
+    // used — flag that so an operator doesn't silently expect it to apply.
+    if args.env_file.is_some() && !args.check {
+        tracing::warn!(
+            env_file = %args.env_file.as_deref().unwrap_or(""),
+            "--env-file is ignored without --check (the running daemon reads env vars \
+             from its systemd unit EnvironmentFile, not from --env-file); \
+             did you mean to pass --check?"
+        );
+        eprintln!(
+            "⚠ --env-file is ignored without --check (the running daemon reads env vars \
+             from its systemd unit EnvironmentFile, not from --env-file); \
+             did you mean to pass --check?"
+        );
+    }
+
     // ── Config check mode ────────────────────────────────────────────────────
     if args.check {
         // Pre-populate env from --env-file (systemd EnvironmentFile format) so

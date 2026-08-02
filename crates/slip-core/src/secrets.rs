@@ -704,19 +704,42 @@ mod tests {
 
     #[test]
     fn test_registry_hidden_from_app_list() {
+        // The real invariant: a public app's `list("myapp")` never returns
+        // registry cred files (they live under the separate `__registry/` app
+        // dir, not under `myapp/`). Confirmed by: set a registry cred, set a
+        // real-app secret, then assert list("myapp") returns only the real-app
+        // secret and list("__registry") returns the hex cred key (documenting
+        // the namespace-internal visibility — the cred key is hex, not
+        // __-prefixed, so it IS returned by a direct list("__registry") call,
+        // but no public app sees it).
         let (_tmp, store) = make_store();
         store
             .set_registry_credential("ghcr.io", Some("slip"), "tok")
             .unwrap();
-        // The __registry namespace must not appear as an "app" with secrets.
-        // list() filters __-prefixed entries; the namespace dir itself is
-        // never listed via list(app) — but ensure list("__registry") is empty
-        // (the index + cred keys are all __-prefixed or hex, but the index is
-        // __-prefixed; the cred key is hex, not __-prefixed). The cred key IS
-        // returned by list("__registry") — that's expected (it's a hex key,
-        // not __-prefixed). The important invariant is that no public app
-        // sees these. Confirm the namespace is __-prefixed:
-        assert!(REGISTRY_NAMESPACE.starts_with("__"));
+        store.set("myapp", "API_KEY", "real-secret").unwrap();
+
+        // The public app sees only its own secret — never the registry cred.
+        let myapp_keys = store.list("myapp").unwrap();
+        assert_eq!(
+            myapp_keys,
+            vec!["API_KEY".to_string()],
+            "list(myapp) must not return registry cred files: {myapp_keys:?}"
+        );
+
+        // The registry namespace dir does contain the hex cred key (it's hex,
+        // not __-prefixed, so list() doesn't filter it). This documents the
+        // namespace-internal visibility — only the daemon reads this dir.
+        let reg_keys = store.list("__registry").unwrap();
+        assert_eq!(
+            reg_keys.len(),
+            1,
+            "list(__registry) should return the single hex cred key: {reg_keys:?}"
+        );
+        assert!(
+            reg_keys[0].chars().all(|c| c.is_ascii_hexdigit()),
+            "registry cred key should be hex (sha256[:16]): {}",
+            reg_keys[0]
+        );
     }
 
     #[test]
