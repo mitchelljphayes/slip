@@ -35,9 +35,18 @@ GitHub Actions → signed webhook → slipd → pull → health check → swap r
 curl -sSL https://raw.githubusercontent.com/mitchelljphayes/slip/main/install.sh | bash
 ```
 
-This downloads a static binary, creates a `slip` service user, sets up directories, and installs a systemd unit.
+On **Linux x86_64/aarch64** this downloads a prebuilt static (musl) binary,
+creates a `slip` service user, sets up directories, and installs a systemd
+unit.
 
-**Manual install** (if you prefer to build from source):
+On **all other hosts** (macOS today, or when no prebuilt binary exists for
+the detected OS+arch) the installer builds from source via `cargo`. That path
+requires the [Rust toolchain](https://rustup.rs) and `git` to be present —
+the script will fail with a prescriptive error naming the remedy if they're
+missing. Pass `--version <tag>` to pin a release, or run the script from
+inside a slip checkout to build the current working tree without pinning.
+
+**Manual install** (build from source, the explicit alternative):
 
 ```bash
 git clone https://github.com/mitchelljphayes/slip.git

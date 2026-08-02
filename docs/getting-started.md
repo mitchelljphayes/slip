@@ -13,7 +13,7 @@ You need on the server:
 
 1. **A container runtime** — Podman (recommended, for pod support) or Docker
 2. **Caddy** — slip manages routes via Caddy's admin API
-3. **A Rust toolchain** — to build slipd (or a pre-built binary when releases are available)
+3. **A Rust toolchain** — required on macOS (the installer builds from source there; no prebuilt binary is published for darwin). On Linux x86_64/aarch64 a prebuilt static binary is downloaded by the installer, so the toolchain is only needed if you prefer the manual build path below.
 
 ### Install Podman
 
@@ -44,7 +44,19 @@ source "$HOME/.cargo/env"
 
 ## 1. Build slipd
 
-On the server (or cross-compile locally and copy):
+The one-command installer handles both platforms:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/mitchelljphayes/slip/main/install.sh | sudo bash
+```
+
+On Linux x86_64/aarch64 it downloads the prebuilt static binary. On macOS (or
+any other host without a prebuilt binary) it builds from source via `cargo`
+— that's why the Rust toolchain prerequisite above is required on macOS.
+Pass `--version <tag>` to pin a release, or run it from inside a slip
+checkout to build the current working tree.
+
+The manual build-from-source path (the advanced alternative):
 
 ```bash
 git clone https://github.com/mitchelljphayes/slip.git
