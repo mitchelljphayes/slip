@@ -14,6 +14,7 @@ pub mod merge;
 pub mod podman;
 pub mod preview;
 pub mod reconcile;
+pub mod registry;
 pub mod repo_config;
 pub mod runtime;
 pub mod secrets;
@@ -33,10 +34,11 @@ pub use caddy::{
 };
 pub use config::{
     AppConfig, AppInfo, AppPreviewConfig, AuthConfig, CaddyConfig, CaddyTlsConfig, DeployConfig,
-    EnvFileConfig, HealthConfig, NetworkConfig, ReconcileConfig, RegistryConfig, ResourceConfig,
-    RouteEntry, RoutingConfig, RuntimeConfig, ServerConfig, ServerDeployConfig,
-    ServerPreviewConfig, SlipConfig, StorageConfig, TlsStrategy, VolumeConfig, is_ts_net_host,
-    load_config, resolve_acme_email, resolve_env_vars, resolve_env_vars_warn,
+    EnvFileConfig, HealthConfig, NetworkConfig, ReconcileConfig, RegistriesConfig, RegistryEntry,
+    ResolveMode, ResourceConfig, RouteEntry, RoutingConfig, RuntimeConfig, ServerConfig,
+    ServerDeployConfig, ServerPreviewConfig, SlipConfig, StorageConfig, TlsStrategy, VolumeConfig,
+    is_ts_net_host, load_config, load_config_check, load_config_with_mode, normalize_registry_url,
+    parse_env_file, resolve_acme_email, resolve_env_vars, resolve_env_vars_warn,
     validate_tls_strategy,
 };
 pub use db::Db;
@@ -58,6 +60,10 @@ pub use preview::{PersistedPreviewState, PreviewState};
 pub use reconcile::{
     ReconcileContext, ReconcileSummary, RouteFailure, default_backoff, reconcile_app_routes,
     reconcile_loop, reconcile_tick, run_reconcile,
+};
+pub use registry::{
+    RegistryCredSource, ResolvedRegistry, merged_registry_table, normalize_image_ref,
+    resolve_registry_credential,
 };
 pub use repo_config::{
     PreviewConfig, RemoteConfig, RepoConfig, RepoDeployConfig, RepoVolume, parse_repo_config,

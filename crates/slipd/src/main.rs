@@ -10,7 +10,8 @@ use slip_core::reconcile::reconcile_loop;
 use slip_core::runtime::RuntimeBackend;
 use slip_core::{
     AppState, CaddyClient, Db, DockerClient, HealthChecker, PodmanBackend, build_router,
-    load_app_states, load_config, load_preview_states, reconcile_preview_routes, verify_containers,
+    load_app_states, load_config, load_config_check, load_preview_states, parse_env_file,
+    reconcile_preview_routes, verify_containers,
 };
 use tokio::sync::RwLock;
 
@@ -22,9 +23,15 @@ struct Args {
     #[arg(long, default_value = "/etc/slip")]
     config: String,
 
-    /// Validate configuration and exit.
+    /// Validate configuration and exit (warn-mode: unresolved ${ENV} → warning, exit 0).
     #[arg(long)]
     check: bool,
+
+    /// Path to a systemd-style EnvironmentFile (`KEY=value`) to pre-populate
+    /// the process env before resolving config `${VAR}` placeholders in
+    /// `--check` mode. Use with `--check` so unresolved env vars clear.
+    #[arg(long)]
+    env_file: Option<String>,
 }
 
 #[tokio::main]
@@ -48,15 +55,70 @@ async fn main() -> anyhow::Result<()> {
 
     let config_path = Path::new(&args.config);
 
+    // ── --env-file without --check is a no-op (warn, don't error) ───────────
+    // --env-file pre-populates env vars before resolving config placeholders,
+    // which only matters in --check mode (the running daemon gets its env vars
+    // from its systemd unit). Without --check, the file is parsed but never
+    // used — flag that so an operator doesn't silently expect it to apply.
+    if args.env_file.is_some() && !args.check {
+        tracing::warn!(
+            env_file = %args.env_file.as_deref().unwrap_or(""),
+            "--env-file is ignored without --check (the running daemon reads env vars \
+             from its systemd unit EnvironmentFile, not from --env-file); \
+             did you mean to pass --check?"
+        );
+        eprintln!(
+            "⚠ --env-file is ignored without --check (the running daemon reads env vars \
+             from its systemd unit EnvironmentFile, not from --env-file); \
+             did you mean to pass --check?"
+        );
+    }
+
     // ── Config check mode ────────────────────────────────────────────────────
     if args.check {
-        match load_config(config_path) {
-            Ok((cfg, apps)) => {
-                println!(
-                    "✓ Configuration is valid ({} apps, listening on {})",
-                    apps.len(),
-                    cfg.server.listen
-                );
+        // Pre-populate env from --env-file (systemd EnvironmentFile format) so
+        // ${VAR} placeholders resolve. This lets `--check --env-file` fully
+        // resolve and exit 0 clean, matching the running daemon's behaviour
+        // (which gets the same vars from the systemd unit's EnvironmentFile).
+        if let Some(env_file_path) = &args.env_file {
+            match parse_env_file(Path::new(env_file_path)) {
+                Ok(vars) => {
+                    for (key, value) in vars {
+                        // SAFETY: --check is a single-process invocation that
+                        // exits before any concurrent work; env mutation is safe.
+                        unsafe { std::env::set_var(&key, &value) };
+                    }
+                }
+                Err(e) => {
+                    eprintln!("✗ Failed to parse --env-file '{env_file_path}': {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        // Warn-mode: unresolved ${ENV} → warning, exit 0 (the running daemon
+        // gets these from its systemd EnvironmentFile; a manual --check
+        // without --env-file should warn, not error — FR §3.10).
+        match load_config_check(config_path) {
+            Ok((cfg, apps, warnings)) => {
+                for w in &warnings {
+                    eprintln!("⚠ {w} (set via EnvironmentFile or systemd unit)");
+                }
+                if warnings.is_empty() {
+                    println!(
+                        "✓ Configuration is valid ({} apps, listening on {})",
+                        apps.len(),
+                        cfg.server.listen
+                    );
+                } else {
+                    println!(
+                        "✓ Configuration is structurally valid ({} apps, listening on {}); \
+                         {} unresolved env warning(s) — see above",
+                        apps.len(),
+                        cfg.server.listen,
+                        warnings.len()
+                    );
+                }
             }
             Err(e) => {
                 eprintln!("✗ Configuration validation failed: {e}");

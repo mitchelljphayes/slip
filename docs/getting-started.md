@@ -104,8 +104,10 @@ backend = "auto"          # "auto" | "docker" | "podman"
 [auth]
 secret = "${SLIP_SECRET}"  # global HMAC fallback; per-app [app] secret overrides it
 
-[registry]
-# ghcr_token = "${GHCR_TOKEN}"   # optional: token for pulling private images
+[registries.ghcr]
+url = "ghcr.io"
+# username = "slip"              # optional: anonymous pull if absent
+# token = "${GHCR_TOKEN}"       # optional: prefer `slip registry login ghcr.io`
 
 [caddy]
 admin_api = "http://localhost:2019"
@@ -115,9 +117,14 @@ path = "/var/lib/slip"
 EOF
 ```
 
-> **Required sections:** `[server]`, `[auth]`, `[registry]`, `[caddy]`,
-> `[storage]`. `[registry]` may be empty but must be present. `[auth].secret`
-> supports `${ENV}` interpolation (set `SLIP_SECRET` in slipd's systemd unit).
+> **Required sections:** `[server]`, `[auth]`, `[caddy]`, `[storage]`.
+> `[registries.<name>]` is optional (omit it for anonymous pulls); if present,
+> each entry needs a `url` (host[:port] only — no scheme, no trailing slash).
+> The preferred way to add a registry credential is
+> `slip registry login <url>` (no daemon restart needed); a TOML `token` is
+> the bootstrap fallback. `[auth].secret` supports `${ENV}` interpolation (set
+> `SLIP_SECRET` in slipd's systemd unit). See `docs/registry-runbook.md` for
+> the full registry config + GHCR PAT guide.
 >
 > **Note:** `listen = "127.0.0.1:7890"` means slip only listens on localhost. Caddy will proxy webhook traffic to it on a public-facing route (see step 5). This keeps the webhook endpoint behind TLS.
 

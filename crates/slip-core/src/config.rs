@@ -341,7 +341,8 @@ pub struct SlipConfig {
     #[serde(default)]
     pub caddy: CaddyConfig,
     pub auth: AuthConfig,
-    pub registry: RegistryConfig,
+    #[serde(default)]
+    pub registries: RegistriesConfig,
     pub storage: StorageConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
@@ -496,10 +497,67 @@ pub struct AuthConfig {
     pub secret: String,
 }
 
-/// Container registry settings.
+/// A named container registry entry in `[registries.<name>]`.
+///
+/// `url` is a registry host (optionally `:port`), no scheme, no trailing
+/// slash, no path components — see [`normalize_registry_url`]. `username` is
+/// optional (anonymous pull if absent). `token` is an env-ref like
+/// `"${GHCR_TOKEN}"` or a literal, resolved at load time via
+/// [`resolve_env_vars`]. The preferred path is `slip registry login` (writes
+/// to the daemon credential store); a TOML `token` is the bootstrap fallback.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct RegistryConfig {
-    pub ghcr_token: Option<String>,
+pub struct RegistryEntry {
+    pub url: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// Container registry settings — a named map of registries.
+///
+/// Replaces the old single-`ghcr_token` `[registry]` table (hard-migrated in
+/// SLIP-105). An empty map (no `[registries]` table) is valid — it means
+/// anonymous pulls. See [`RegistryEntry`] for per-entry semantics.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RegistriesConfig {
+    /// Named registry entries, keyed by the `<name>` in `[registries.<name>]`.
+    ///
+    /// `#[serde(flatten)]` so the TOML shape is `[registries.ghcr]` directly
+    /// (not `[registries.registries.ghcr]`).
+    #[serde(flatten)]
+    pub registries: std::collections::BTreeMap<String, RegistryEntry>,
+}
+
+/// Normalize a registry URL for storage / matching.
+///
+/// Strips a leading `https?://` and any trailing `/`. Rejects URLs that
+/// contain a path component after the host (registries are host[:port] only —
+/// per-image path matching is done at pull time against the image ref, not
+/// the registry URL). Lowercases the result so registry hosts compare
+/// case-insensitively (Docker convention: `GHCR.io` and `ghcr.io` are the same
+/// registry). The port is preserved as written (ports are numeric → already
+/// case-insensitive).
+pub fn normalize_registry_url(url: &str) -> Result<String, ConfigError> {
+    let stripped = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let trimmed = stripped.trim_end_matches('/');
+    if trimmed.contains('/') {
+        return Err(ConfigError::Internal(format!(
+            "registry url '{url}' must be host[:port] only — \
+             path components are not allowed (use the image ref for namespacing). \
+             See `slip registry login --help`."
+        )));
+    }
+    if trimmed.is_empty() {
+        return Err(ConfigError::Internal(format!(
+            "registry url '{url}' is empty after normalization"
+        )));
+    }
+    // Lowercase for Docker-parity case-insensitive host matching.
+    Ok(trimmed.to_lowercase())
 }
 
 /// Persistent storage path.
@@ -922,13 +980,111 @@ fn is_secret_like_key(key: &str) -> bool {
 // ─── Config loading ───────────────────────────────────────────────────────────
 
 /// Loads the daemon config from `{path}/slip.toml` and all app configs from
-/// `{path}/apps/*.toml`.
+/// `{path}/apps/*.toml`, resolving env vars in **strict** mode (production:
+/// unresolved `${ENV}` hard-fails).
 ///
-/// Environment variables in `auth.secret`, `registry.ghcr_token`, each app's
-/// `env` values, and each app's `app.secret` are resolved via [`resolve_env_vars`].
+/// Environment variables in `auth.secret`, each `[registries.<name>].token`,
+/// each app's `env` values, and each app's `app.secret` are resolved via
+/// [`resolve_env_vars`]. Each registry entry's `url` is validated/normalized
+/// via [`normalize_registry_url`].
+///
+/// This is the strict wrapper over [`load_config_with_mode`]; the warnings
+/// vector that function returns is always empty in strict mode (unresolved env
+/// vars error out instead of being collected). Kept as the production entry
+/// point so existing callers don't need to handle the 3-tuple. See
+/// [`load_config_check`] for the warn-mode (`--check`) variant.
 ///
 /// Returns a tuple of `(SlipConfig, HashMap<app_name, AppConfig>)`.
 pub fn load_config(path: &Path) -> Result<(SlipConfig, HashMap<String, AppConfig>), ConfigError> {
+    let (cfg, apps, _warnings) = load_config_with_mode(path, ResolveMode::Strict)?;
+    Ok((cfg, apps))
+}
+
+// ─── Config check (warn-mode) + env-file parsing (SLIP-105) ────────────────────
+
+/// Parse a systemd-style `EnvironmentFile` (`KEY=value` lines).
+///
+/// Format rules:
+/// - Lines starting with `#` are comments (ignored).
+/// - Blank lines are ignored.
+/// - `KEY=value` — surrounding whitespace on the value is trimmed; surrounding
+///   quotes (`"` or `'`) are stripped if they wrap the entire value.
+/// - **No shell sourcing**: no `export` prefix, no backtick/command substitution,
+///   no variable expansion. A line starting with `export ` is rejected (the
+///   systemd convention does not support it; this keeps the parser honest).
+///
+/// Returns a `HashMap<String, String>` of the parsed key/value pairs. Errors
+/// on malformed lines (no `=`, or `export` prefix).
+pub fn parse_env_file(path: &Path) -> Result<HashMap<String, String>, ConfigError> {
+    let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::ReadFile {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let mut out: HashMap<String, String> = HashMap::new();
+    for (lineno, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with("export ") {
+            return Err(ConfigError::Internal(format!(
+                "env file {}:{}: `export` prefix is not supported (systemd EnvironmentFile format is `KEY=value` only)",
+                path.display(),
+                lineno + 1
+            )));
+        }
+        let eq_pos = trimmed.find('=').ok_or_else(|| {
+            ConfigError::Internal(format!(
+                "env file {}:{}: missing '=' in line (expected KEY=value)",
+                path.display(),
+                lineno + 1
+            ))
+        })?;
+        let key = trimmed[..eq_pos].trim().to_string();
+        let mut value = trimmed[eq_pos + 1..].trim().to_string();
+        // Strip surrounding quotes if they wrap the entire value.
+        if value.len() >= 2 {
+            let bytes = value.as_bytes();
+            let first = bytes[0];
+            let last = bytes[bytes.len() - 1];
+            if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+                value = value[1..value.len() - 1].to_string();
+            }
+        }
+        if key.is_empty() {
+            return Err(ConfigError::Internal(format!(
+                "env file {}:{}: empty key",
+                path.display(),
+                lineno + 1
+            )));
+        }
+        out.insert(key, value);
+    }
+    Ok(out)
+}
+
+/// Load mode for `load_config_with_mode`: strict (production, hard-fail on
+/// unresolved `${ENV}`) or warn (`--check`, collect unresolved as warnings).
+#[derive(Debug, Clone, Copy)]
+pub enum ResolveMode {
+    Strict,
+    Warn,
+}
+
+/// Load the daemon config + app configs, resolving env vars in `Strict` or
+/// `Warn` mode. In `Warn` mode, unresolved `${ENV}` placeholders are collected
+/// as warnings (the placeholder is left in place) and returned; the load still
+/// succeeds (exit 0 for `--check`). In `Strict` mode, unresolved env vars
+/// hard-fail (the production behaviour, unchanged).
+///
+/// This is the shared implementation behind [`load_config`] (strict) and
+/// [`load_config_check`] (warn). Structural errors (parse fail, name mismatch,
+/// invalid strategy) always hard-fail regardless of mode.
+#[allow(clippy::type_complexity)]
+pub fn load_config_with_mode(
+    path: &Path,
+    mode: ResolveMode,
+) -> Result<(SlipConfig, HashMap<String, AppConfig>, Vec<String>), ConfigError> {
     // ── 1. Load daemon config ────────────────────────────────────────────────
     let slip_toml_path = path.join("slip.toml");
     let raw = std::fs::read_to_string(&slip_toml_path).map_err(|e| ConfigError::ReadFile {
@@ -978,12 +1134,53 @@ pub fn load_config(path: &Path) -> Result<(SlipConfig, HashMap<String, AppConfig
         }
     }
 
-    // Resolve env vars in auth.secret
-    slip_cfg.auth.secret = resolve_env_vars(&slip_cfg.auth.secret)?;
+    let mut warnings: Vec<String> = Vec::new();
 
-    // Resolve env vars in registry.ghcr_token (if present)
-    if let Some(token) = slip_cfg.registry.ghcr_token.take() {
-        slip_cfg.registry.ghcr_token = Some(resolve_env_vars(&token)?);
+    // Resolve env vars in auth.secret (strict or warn).
+    match mode {
+        ResolveMode::Strict => {
+            slip_cfg.auth.secret = resolve_env_vars(&slip_cfg.auth.secret)?;
+        }
+        ResolveMode::Warn => {
+            let (resolved, miss) = resolve_env_vars_warn(&slip_cfg.auth.secret);
+            slip_cfg.auth.secret = resolved;
+            for m in miss {
+                warnings.push(format!("auth.secret: unresolved ${{{m}}}"));
+            }
+        }
+    }
+
+    // Validate + normalize each registry entry's url (mirrors the store path's
+    // normalization on write, so a TOML-declared url with a scheme or trailing
+    // slash fails loudly at load rather than silently never matching an image
+    // ref at pull time). Errors hard-fail in both modes (an invalid url is a
+    // structural misconfiguration, not a missing env var).
+    for entry in slip_cfg.registries.registries.values_mut() {
+        entry.url = normalize_registry_url(&entry.url).map_err(|e| {
+            // Prefix with the TOML field location so the user knows where to fix.
+            ConfigError::Internal(format!("registries.<name>.url: {e}"))
+        })?;
+    }
+
+    // Resolve env vars in registries.<name>.token (strict or warn).
+    for entry in slip_cfg.registries.registries.values_mut() {
+        if let Some(token) = entry.token.take() {
+            match mode {
+                ResolveMode::Strict => {
+                    entry.token = Some(resolve_env_vars(&token)?);
+                }
+                ResolveMode::Warn => {
+                    let (resolved, miss) = resolve_env_vars_warn(&token);
+                    entry.token = Some(resolved);
+                    for m in miss {
+                        warnings.push(format!(
+                            "registries.{}.token: unresolved ${{{m}}}",
+                            entry.url
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     // ── 2. Load app configs ──────────────────────────────────────────────────
@@ -1032,14 +1229,42 @@ pub fn load_config(path: &Path) -> Result<(SlipConfig, HashMap<String, AppConfig
                 });
             }
 
-            // Resolve env vars in env values
+            // Resolve env vars in env values (strict or warn).
             for value in app_cfg.env.values_mut() {
-                *value = resolve_env_vars(value)?;
+                match mode {
+                    ResolveMode::Strict => {
+                        *value = resolve_env_vars(value)?;
+                    }
+                    ResolveMode::Warn => {
+                        let (resolved, miss) = resolve_env_vars_warn(value);
+                        *value = resolved;
+                        for m in miss {
+                            warnings.push(format!(
+                                "apps.{}.env: unresolved ${{{m}}}",
+                                app_cfg.app.name
+                            ));
+                        }
+                    }
+                }
             }
 
-            // Resolve env vars in app.secret
+            // Resolve env vars in app.secret (strict or warn).
             if let Some(secret) = app_cfg.app.secret.take() {
-                app_cfg.app.secret = Some(resolve_env_vars(&secret)?);
+                match mode {
+                    ResolveMode::Strict => {
+                        app_cfg.app.secret = Some(resolve_env_vars(&secret)?);
+                    }
+                    ResolveMode::Warn => {
+                        let (resolved, miss) = resolve_env_vars_warn(&secret);
+                        app_cfg.app.secret = Some(resolved);
+                        for m in miss {
+                            warnings.push(format!(
+                                "apps.{}.app.secret: unresolved ${{{m}}}",
+                                app_cfg.app.name
+                            ));
+                        }
+                    }
+                }
             }
 
             // Validate deploy strategy
@@ -1073,7 +1298,18 @@ pub fn load_config(path: &Path) -> Result<(SlipConfig, HashMap<String, AppConfig
         }
     }
 
-    Ok((slip_cfg, apps))
+    Ok((slip_cfg, apps, warnings))
+}
+
+/// `--check` variant of [`load_config`]: resolves env vars in `Warn` mode,
+/// returning `(config, apps, warnings)`. Unresolved `${ENV}` placeholders are
+/// collected as warnings (left in place) rather than erroring. Structural
+/// errors (parse fail, name mismatch, invalid strategy) still hard-fail.
+#[allow(clippy::type_complexity)]
+pub fn load_config_check(
+    path: &Path,
+) -> Result<(SlipConfig, HashMap<String, AppConfig>, Vec<String>), ConfigError> {
+    load_config_with_mode(path, ResolveMode::Warn)
 }
 
 // ─── [app] secret migration ────────────────────────────────────────────────────
@@ -1199,8 +1435,10 @@ admin_api = "http://localhost:2019"
 [auth]
 secret = "supersecret"
 
-[registry]
-ghcr_token = "ghp_token"
+[registries.ghcr]
+url = "ghcr.io"
+username = "slip"
+token = "ghp_token"
 
 [storage]
 path = "/tmp/slip"
@@ -1209,13 +1447,21 @@ path = "/tmp/slip"
         assert_eq!(cfg.server.listen.to_string(), "127.0.0.1:8080");
         assert_eq!(cfg.caddy.admin_api, "http://localhost:2019");
         assert_eq!(cfg.auth.secret, "supersecret");
-        assert_eq!(cfg.registry.ghcr_token.as_deref(), Some("ghp_token"));
+        let ghcr = cfg
+            .registries
+            .registries
+            .get("ghcr")
+            .expect("ghcr entry should parse");
+        assert_eq!(ghcr.url, "ghcr.io");
+        assert_eq!(ghcr.username.as_deref(), Some("slip"));
+        assert_eq!(ghcr.token.as_deref(), Some("ghp_token"));
         assert_eq!(cfg.storage.path, PathBuf::from("/tmp/slip"));
     }
 
     #[test]
     fn parse_slip_config_defaults() {
-        // Minimal valid config — only required fields supplied.
+        // Minimal valid config — only required fields supplied. No
+        // [registries] table is needed (the map defaults to empty).
         let toml = r#"
 [server]
 
@@ -1224,18 +1470,128 @@ path = "/tmp/slip"
 [auth]
 secret = "s"
 
-[registry]
-
 [storage]
 "#;
         let cfg: SlipConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.server.listen.to_string(), "0.0.0.0:7890");
         assert_eq!(cfg.caddy.admin_api, "http://localhost:2019");
         assert_eq!(cfg.storage.path, PathBuf::from("/var/lib/slip"));
-        assert!(cfg.registry.ghcr_token.is_none());
+        assert!(cfg.registries.registries.is_empty());
         assert_eq!(cfg.runtime.backend, "auto");
         // TLS config should be None by default
         assert!(cfg.caddy.tls.is_none());
+    }
+
+    #[test]
+    fn parse_registries_map_valid() {
+        // Two named registries, one with an env-ref token (resolved at load),
+        // one with a literal token, one with no token.
+        // SAFETY: single-threaded test, no concurrent env access.
+        unsafe { std::env::set_var("SLIP_TEST_REG_TOKEN", "tok_from_env") };
+        let toml = r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registries.ghcr]
+url = "ghcr.io"
+username = "slip"
+token = "${SLIP_TEST_REG_TOKEN}"
+
+[registries.local]
+url = "localhost:5000"
+
+[registries.public]
+url = "registry.example.com"
+username = "ci"
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        let map = &cfg.registries.registries;
+        assert_eq!(map.len(), 3, "three named registries should parse");
+
+        let ghcr = &map["ghcr"];
+        assert_eq!(ghcr.url, "ghcr.io");
+        assert_eq!(ghcr.username.as_deref(), Some("slip"));
+        // Token is resolved at parse time by `toml::from_str`? No — resolution
+        // happens in `load_config`. Here we only check the raw placeholder is
+        // preserved; load_config resolves it.
+        assert_eq!(ghcr.token.as_deref(), Some("${SLIP_TEST_REG_TOKEN}"));
+
+        let local = &map["local"];
+        assert_eq!(local.url, "localhost:5000");
+        assert!(local.username.is_none());
+        assert!(local.token.is_none());
+
+        let public = &map["public"];
+        assert_eq!(public.url, "registry.example.com");
+        assert_eq!(public.username.as_deref(), Some("ci"));
+        assert!(public.token.is_none());
+    }
+
+    #[test]
+    fn parse_registries_empty_ok() {
+        // Explicit empty [registries] table is valid (anonymous pulls).
+        let toml = r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registries]
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.registries.registries.is_empty());
+    }
+
+    #[test]
+    fn normalize_registry_url_cases() {
+        // Scheme strip.
+        assert_eq!(normalize_registry_url("ghcr.io").unwrap(), "ghcr.io");
+        assert_eq!(
+            normalize_registry_url("https://ghcr.io").unwrap(),
+            "ghcr.io"
+        );
+        assert_eq!(
+            normalize_registry_url("http://ghcr.io/").unwrap(),
+            "ghcr.io"
+        );
+        // host:port preserved.
+        assert_eq!(
+            normalize_registry_url("localhost:5000").unwrap(),
+            "localhost:5000"
+        );
+        assert_eq!(
+            normalize_registry_url("https://localhost:5000").unwrap(),
+            "localhost:5000"
+        );
+        // Path components rejected.
+        let err = normalize_registry_url("reg.io/team").unwrap_err();
+        assert!(
+            err.to_string().contains("host[:port] only"),
+            "path component should be rejected: {err}"
+        );
+        // Empty rejected.
+        assert!(normalize_registry_url("").is_err());
+        assert!(normalize_registry_url("https://").is_err());
+        // Case-insensitive: lowercased for Docker-parity host matching.
+        assert_eq!(
+            normalize_registry_url("GHCR.IO").unwrap(),
+            "ghcr.io",
+            "uppercase host should be lowercased"
+        );
+        assert_eq!(
+            normalize_registry_url("https://GHCR.IO/").unwrap(),
+            "ghcr.io"
+        );
     }
 
     // ── ReconcileConfig parsing ─────────────────────────────────────────────
@@ -1254,7 +1610,6 @@ interval = "30s"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -1277,7 +1632,6 @@ secret = "s"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -1305,7 +1659,6 @@ interval = "500ms"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -1338,7 +1691,6 @@ api_token = "{env.CLOUDFLARE_API_TOKEN}"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -1373,7 +1725,6 @@ dns_provider = "cloudflare"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -1404,7 +1755,6 @@ secret = "s"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -1730,7 +2080,6 @@ admin_api = "http://localhost:2019"
 [auth]
 secret = "test-secret"
 
-[registry]
 
 [storage]
 path = "/tmp/slip-test"
@@ -1836,7 +2185,6 @@ port = 8080
 [auth]
 secret = "${SLIP_TEST_SECRET_TOKEN}"
 
-[registry]
 
 [storage]
 "#,
@@ -2022,7 +2370,6 @@ hostname = "api.example.com"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 
@@ -2046,7 +2393,6 @@ preview_timeout = "15m"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -2248,7 +2594,6 @@ dns_provider = "cloudflare"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -2271,7 +2616,6 @@ dns_provider = "cloudflare"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -2293,7 +2637,6 @@ admin_api = "http://localhost:2019"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -2358,7 +2701,6 @@ acme_email = "ops@example.com"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 
@@ -2390,7 +2732,6 @@ tls = "tailscale"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 
@@ -2422,7 +2763,6 @@ tls = "acme"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 
@@ -2452,7 +2792,6 @@ tls = "tailscale"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#,
@@ -2506,7 +2845,6 @@ api_token = "literal-secret-token-value-here-1234567890"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#,
@@ -2541,7 +2879,6 @@ api_token = "{env.CF_API_TOKEN}"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#,
@@ -2549,5 +2886,347 @@ secret = "s"
         std::fs::create_dir(dir.path().join("apps")).unwrap();
         let (cfg, _) = load_config(dir.path()).unwrap();
         assert!(cfg.caddy.tls.is_some());
+    }
+
+    // ── parse_env_file ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_env_file_basic() {
+        let dir = setup_config_dir();
+        let env_path = dir.path().join("slip.env");
+        write_file(
+            dir.path(),
+            "slip.env",
+            "# A comment\n\
+             SLIP_SECRET=hunter2\n\
+             GHCR_TOKEN=ghp_abc123\n\
+             \n\
+             QUOTED=\"with spaces\"\n\
+             SINGLE='single quoted'\n",
+        );
+        let vars = parse_env_file(&env_path).unwrap();
+        assert_eq!(vars.get("SLIP_SECRET").unwrap(), "hunter2");
+        assert_eq!(vars.get("GHCR_TOKEN").unwrap(), "ghp_abc123");
+        assert_eq!(vars.get("QUOTED").unwrap(), "with spaces");
+        assert_eq!(vars.get("SINGLE").unwrap(), "single quoted");
+        // Comment + blank line ignored.
+        assert_eq!(vars.len(), 4);
+    }
+
+    #[test]
+    fn parse_env_file_rejects_export() {
+        let dir = setup_config_dir();
+        let env_path = dir.path().join("slip.env");
+        write_file(dir.path(), "slip.env", "export FOO=bar\n");
+        let err = parse_env_file(&env_path).unwrap_err();
+        assert!(err.to_string().contains("export"), "reject `export` prefix");
+    }
+
+    #[test]
+    fn parse_env_file_rejects_missing_equals() {
+        let dir = setup_config_dir();
+        let env_path = dir.path().join("slip.env");
+        write_file(dir.path(), "slip.env", "NO_EQUALS_HERE\n");
+        let err = parse_env_file(&env_path).unwrap_err();
+        assert!(err.to_string().contains("missing '='"));
+    }
+
+    #[test]
+    fn parse_env_file_comments_and_blanks() {
+        let dir = setup_config_dir();
+        let env_path = dir.path().join("slip.env");
+        write_file(
+            dir.path(),
+            "slip.env",
+            "# header\n\
+             \n\
+             KEY=val\n",
+        );
+        let vars = parse_env_file(&env_path).unwrap();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars.get("KEY").unwrap(), "val");
+    }
+
+    // ── load_config_check (warn-mode) ────────────────────────────────────────
+
+    #[test]
+    fn load_config_check_warns_on_unresolved_env() {
+        let dir = setup_config_dir();
+        // Override slip.toml with an env-ref secret that is NOT set.
+        // SAFETY: single-threaded test.
+        unsafe { std::env::remove_var("SLIP_DEFINITELY_UNSET_FOR_CHECK") };
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+listen = "0.0.0.0:7890"
+
+[caddy]
+admin_api = "http://localhost:2019"
+
+[auth]
+secret = "${SLIP_DEFINITELY_UNSET_FOR_CHECK}"
+
+[storage]
+path = "/tmp/slip-test"
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let (cfg, _apps, warnings) = load_config_check(dir.path()).unwrap();
+        // Warn-mode: placeholder left in place, warning collected, no error.
+        assert_eq!(cfg.auth.secret, "${SLIP_DEFINITELY_UNSET_FOR_CHECK}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("SLIP_DEFINITELY_UNSET_FOR_CHECK")),
+            "warning should mention the unresolved var: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn load_config_check_resolves_with_env_var_set() {
+        let dir = setup_config_dir();
+        // SAFETY: single-threaded test.
+        unsafe { std::env::set_var("SLIP_TEST_CHECK_VAR", "resolved-val") };
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+listen = "0.0.0.0:7890"
+
+[caddy]
+admin_api = "http://localhost:2019"
+
+[auth]
+secret = "${SLIP_TEST_CHECK_VAR}"
+
+[storage]
+path = "/tmp/slip-test"
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let (cfg, _apps, warnings) = load_config_check(dir.path()).unwrap();
+        assert_eq!(cfg.auth.secret, "resolved-val");
+        assert!(
+            warnings.is_empty(),
+            "no warnings when env is set: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn load_config_check_registry_token_warns() {
+        let dir = setup_config_dir();
+        // SAFETY: single-threaded test.
+        unsafe { std::env::remove_var("SLIP_REG_TOKEN_UNSET") };
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registries.ghcr]
+url = "ghcr.io"
+token = "${SLIP_REG_TOKEN_UNSET}"
+
+[storage]
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let (cfg, _apps, warnings) = load_config_check(dir.path()).unwrap();
+        // Placeholder left in place.
+        assert_eq!(
+            cfg.registries.registries["ghcr"].token.as_deref(),
+            Some("${SLIP_REG_TOKEN_UNSET}")
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("SLIP_REG_TOKEN_UNSET")),
+            "warning should mention the registry token var: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn load_config_check_structural_error_still_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // A config that fails to parse (missing required [auth] table).
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[storage]
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let err = load_config_check(dir.path()).unwrap_err();
+        // Structural errors hard-fail even in warn mode.
+        assert!(
+            err.to_string().contains("auth") || err.to_string().contains("missing"),
+            "structural parse error should hard-fail: {err}"
+        );
+    }
+
+    #[test]
+    fn load_config_with_mode_strict_still_hard_fails() {
+        // Production strict mode must still hard-fail on unresolved env.
+        let dir = setup_config_dir();
+        // SAFETY: single-threaded test.
+        unsafe { std::env::remove_var("SLIP_STRICT_UNSET_XYZ") };
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "${SLIP_STRICT_UNSET_XYZ}"
+
+[storage]
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let err = load_config_with_mode(dir.path(), ResolveMode::Strict).unwrap_err();
+        assert!(
+            err.to_string().contains("SLIP_STRICT_UNSET_XYZ"),
+            "strict mode should hard-fail on unresolved env: {err}"
+        );
+    }
+
+    // ── registry url validation/normalization at load (SLIP-105 review #3) ────
+
+    #[test]
+    fn load_config_normalizes_registry_url_scheme_and_slash() {
+        // A TOML url with a scheme + trailing slash should be normalized at load
+        // so it matches image refs at pull time (review #3: silent-misconfig footgun).
+        let dir = setup_config_dir();
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registries.ghcr]
+url = "https://ghcr.io/"
+token = "tok"
+
+[storage]
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let (cfg, _apps) = load_config(dir.path()).unwrap();
+        assert_eq!(
+            cfg.registries.registries["ghcr"].url, "ghcr.io",
+            "scheme + trailing slash should be normalized at load"
+        );
+    }
+
+    #[test]
+    fn load_config_rejects_registry_url_with_path() {
+        // A TOML url with a path component must hard-fail at load (not silently
+        // never match an image ref at pull time).
+        let dir = setup_config_dir();
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registries.ghcr]
+url = "ghcr.io/team"
+token = "tok"
+
+[storage]
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let err = load_config(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("registries.<name>.url")
+                && err.to_string().contains("host[:port] only"),
+            "path-bearing url should fail loudly at load: {err}"
+        );
+    }
+
+    #[test]
+    fn load_config_check_also_validates_registry_url() {
+        // The --check (warn) path must also validate registry urls — an invalid
+        // url is a structural error, not a missing-env warning.
+        let dir = setup_config_dir();
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registries.ghcr]
+url = "ghcr.io/team"
+token = "tok"
+
+[storage]
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let err = load_config_check(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("host[:port] only"),
+            "--check should still hard-fail on invalid url: {err}"
+        );
+    }
+
+    #[test]
+    fn load_config_lowercases_registry_url() {
+        // Case-insensitive host matching (Docker convention): an uppercase host
+        // is normalized to lowercase at load.
+        let dir = setup_config_dir();
+        write_file(
+            dir.path(),
+            "slip.toml",
+            r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registries.ghcr]
+url = "GHCR.IO"
+token = "tok"
+
+[storage]
+"#,
+        );
+        std::fs::create_dir_all(dir.path().join("apps")).unwrap();
+        let (cfg, _apps) = load_config(dir.path()).unwrap();
+        assert_eq!(
+            cfg.registries.registries["ghcr"].url, "ghcr.io",
+            "uppercase host should be lowercased at load"
+        );
     }
 }

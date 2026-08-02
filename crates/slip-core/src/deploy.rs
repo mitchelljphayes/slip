@@ -15,7 +15,7 @@ use crate::config::{AppConfig, SlipConfig};
 use crate::db::Db;
 use crate::error::HealthError;
 use crate::health::HealthCheck;
-use crate::runtime::{RegistryCredentials, RuntimeBackend};
+use crate::runtime::RuntimeBackend;
 use crate::state;
 
 /// Format a [`HealthError`] into a SLIP-91 terminal-tagged reason string.
@@ -264,7 +264,10 @@ pub(crate) struct DeploySharedState<'a> {
     pub deploys: &'a DashMap<String, DeployContext>,
     /// Persistent deploy-history database. `Db` is `Arc`-backed, so cloning is cheap.
     pub db: Db,
-    pub credentials: Option<RegistryCredentials>,
+    /// Merged registry table (TOML + store creds), built fresh per-deploy so
+    /// `slip registry login` takes effect without a daemon restart. Resolved
+    /// per-image at each pull via [`crate::registry::resolve_registry_credential`].
+    pub registries: Vec<crate::registry::ResolvedRegistry>,
     pub secrets_store: Option<&'a crate::secrets::SecretsStore>,
 }
 
@@ -294,7 +297,7 @@ pub async fn execute_deploy(state: Arc<AppState>, mut ctx: DeployContext) {
         app_states: &state.app_states,
         deploys: &state.deploys,
         db: state.db.clone(),
-        credentials: state.registry_credentials(),
+        registries: crate::registry::merged_registry_table(&state.config, &state.secrets_store),
         secrets_store: Some(&state.secrets_store),
     };
 
@@ -399,7 +402,11 @@ pub(crate) async fn execute_deploy_inner(
     );
 
     if let Err(e) = runtime
-        .pull_image(&ctx.image, &ctx.tag, shared.credentials.clone())
+        .pull_image(
+            &ctx.image,
+            &ctx.tag,
+            crate::registry::resolve_registry_credential(&ctx.image, &shared.registries),
+        )
         .await
     {
         ctx.fail(&format!("[pull_failed] image pull failed: {e}"));
@@ -419,7 +426,11 @@ pub(crate) async fn execute_deploy_inner(
             "pulling sidecar image"
         );
         if let Err(e) = runtime
-            .pull_image(sidecar_image, sidecar_tag, shared.credentials.clone())
+            .pull_image(
+                sidecar_image,
+                sidecar_tag,
+                crate::registry::resolve_registry_credential(full_ref, &shared.registries),
+            )
             .await
         {
             ctx.fail(&format!(
@@ -1863,7 +1874,7 @@ mod tests {
     use super::*;
     use crate::caddy::{ReverseProxy, Route};
     use crate::config::{
-        AppConfig, AppInfo, AuthConfig, CaddyConfig, DeployConfig, HealthConfig, RegistryConfig,
+        AppConfig, AppInfo, AuthConfig, CaddyConfig, DeployConfig, HealthConfig, RegistriesConfig,
         ResourceConfig, RoutingConfig, ServerConfig, SlipConfig, StorageConfig,
     };
     use crate::error::{CaddyError, HealthError, RuntimeError};
@@ -1912,6 +1923,11 @@ mod tests {
         teardown_count: Arc<AtomicU32>,
         /// Ordered log of method calls for ordering assertions.
         call_log: Arc<Mutex<Vec<String>>>,
+        /// Credentials passed to each `pull_image` call, in call order:
+        /// `Some(creds)` for a resolved cred, `None` for an anonymous pull.
+        /// Used by the two-registry integration test to assert per-image
+        /// resolver wiring (SLIP-105 review #4). Existing tests ignore it.
+        pulled_credentials: Arc<Mutex<Vec<Option<RegistryCredentials>>>>,
     }
 
     impl MockDocker {
@@ -1936,6 +1952,7 @@ mod tests {
                 pod_port: None,
                 teardown_count: Arc::new(AtomicU32::new(0)),
                 call_log: Arc::new(Mutex::new(Vec::new())),
+                pulled_credentials: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -2015,6 +2032,13 @@ mod tests {
         fn call_log(&self) -> Arc<Mutex<Vec<String>>> {
             self.call_log.clone()
         }
+
+        /// Accessor for the credentials recorded by each `pull_image` call
+        /// (SLIP-105 review #4). Each entry is `Some(creds)` for a resolved
+        /// cred or `None` for an anonymous pull, in call order.
+        fn pulled_credentials(&self) -> Arc<Mutex<Vec<Option<RegistryCredentials>>>> {
+            self.pulled_credentials.clone()
+        }
     }
 
     fn clone_runtime_error(e: &RuntimeError) -> RuntimeError {
@@ -2058,11 +2082,18 @@ mod tests {
             &'a self,
             _image: &'a str,
             _tag: &'a str,
-            _credentials: Option<RegistryCredentials>,
+            credentials: Option<RegistryCredentials>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a>,
         > {
             self.call_log.lock().unwrap().push("pull_image".to_string());
+            // Record the resolved credentials for the two-registry integration
+            // test (SLIP-105 review #4). Cloning is cheap (two Strings). Existing
+            // tests don't read this, so their behaviour is unchanged.
+            self.pulled_credentials
+                .lock()
+                .unwrap()
+                .push(credentials.clone());
             if self.hung {
                 // Return a future that never completes (sleeps forever).
                 // Under `start_paused = true`, this will cause the timeout to fire.
@@ -2472,7 +2503,7 @@ mod tests {
             auth: AuthConfig {
                 secret: "test-secret".to_string(),
             },
-            registry: RegistryConfig { ghcr_token: None },
+            registries: RegistriesConfig::default(),
             storage: StorageConfig { path: storage_path },
             runtime: crate::config::RuntimeConfig::default(),
             preview: None,
@@ -2540,7 +2571,7 @@ mod tests {
             app_states,
             deploys,
             db: Db::open_in_memory().expect("in-memory db for tests"),
-            credentials: None,
+            registries: Vec::new(),
             secrets_store: None,
         }
     }
@@ -2560,7 +2591,27 @@ mod tests {
             app_states,
             deploys,
             db,
-            credentials: None,
+            registries: Vec::new(),
+            secrets_store: None,
+        }
+    }
+
+    /// Build a `DeploySharedState` with a populated merged-registry table
+    /// (for the two-registry integration test, SLIP-105 review #4).
+    fn make_shared_with_registries<'a>(
+        config: &'a SlipConfig,
+        apps: &'a RwLock<HashMap<String, AppConfig>>,
+        app_states: &'a RwLock<HashMap<String, AppRuntimeState>>,
+        deploys: &'a DashMap<String, DeployContext>,
+        registries: Vec<crate::registry::ResolvedRegistry>,
+    ) -> DeploySharedState<'a> {
+        DeploySharedState {
+            config,
+            apps,
+            app_states,
+            deploys,
+            db: Db::open_in_memory().expect("in-memory db for tests"),
+            registries,
             secrets_store: None,
         }
     }
@@ -2608,6 +2659,101 @@ mod tests {
             Some("mock-container-id")
         );
         assert_eq!(app.current_port, Some(54321));
+    }
+
+    /// SLIP-105 review #4: deploy-level two-registry integration test.
+    ///
+    /// Proves `execute_deploy_inner` calls `resolve_registry_credential`
+    /// per-image and passes the resolved cred to `pull_image`: a main image
+    /// on ghcr.io + a sidecar on localhost:5000 receive distinct correct
+    /// creds in one deploy cycle. This is the CI-verifiable proof of the
+    /// ticket's #1 acceptance criterion ("two registries in one deploy cycle")
+    /// at the wiring level (not just the resolver unit level).
+    #[tokio::test]
+    async fn test_two_registries_one_deploy_cycle_distinct_creds() {
+        use crate::registry::{RegistryCredSource, ResolvedRegistry};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_slip_config(tmp.path().to_path_buf());
+
+        // App: main image on ghcr.io, sidecar on localhost:5000.
+        let mut app = test_app_config();
+        app.app.image = "ghcr.io/me/mainapp".to_string();
+        let apps_map = HashMap::from([("testapp".to_string(), app)]);
+        let apps: RwLock<HashMap<String, AppConfig>> = RwLock::new(apps_map);
+        let app_states: RwLock<HashMap<String, AppRuntimeState>> = RwLock::new(HashMap::new());
+        let deploys: DashMap<String, DeployContext> = DashMap::new();
+
+        // Merged registry table: two registries, distinct creds.
+        let registries = vec![
+            ResolvedRegistry {
+                url: "ghcr.io".to_string(),
+                username: Some("ghcr-user".to_string()),
+                password: "ghcr-tok".to_string(),
+                source: RegistryCredSource::Toml,
+            },
+            ResolvedRegistry {
+                url: "localhost:5000".to_string(),
+                username: Some("ci".to_string()),
+                password: "local-tok".to_string(),
+                source: RegistryCredSource::Toml,
+            },
+        ];
+
+        let docker = MockDocker::new();
+        let cred_log = docker.pulled_credentials();
+        let caddy = MockCaddy::success();
+        let health = MockHealth::passing();
+
+        // Deploy context: main image on ghcr.io + a sidecar on localhost:5000.
+        let mut ctx = DeployContext::new(
+            "dep_two_reg_001".to_string(),
+            "testapp".to_string(),
+            "ghcr.io/me/mainapp".to_string(),
+            "v1.0.0".to_string(),
+            TriggerSource::Webhook,
+        );
+        ctx.images.insert(
+            "sidecar".to_string(),
+            "localhost:5000/internal/svc:latest".to_string(),
+        );
+
+        execute_deploy_inner(
+            make_shared_with_registries(&config, &apps, &app_states, &deploys, registries),
+            &docker,
+            &caddy,
+            &health,
+            &mut ctx,
+        )
+        .await;
+
+        // The deploy should complete (the mock pull never fails).
+        let recorded = deploys.get("testapp").unwrap();
+        assert_eq!(
+            recorded.status,
+            DeployStatus::Completed,
+            "deploy should complete: {:?}",
+            recorded.error
+        );
+
+        // Two pull_image calls: main (ghcr.io) then sidecar (localhost:5000).
+        let pulls = cred_log.lock().unwrap();
+        assert_eq!(pulls.len(), 2, "expected exactly two pull_image calls");
+
+        // Main image pull received the ghcr.io cred.
+        let main_cred = pulls[0].as_ref().expect("main pull should have a cred");
+        assert_eq!(main_cred.username, "ghcr-user");
+        assert_eq!(main_cred.password, "ghcr-tok");
+
+        // Sidecar pull received the localhost:5000 cred — distinct from main.
+        let side_cred = pulls[1].as_ref().expect("sidecar pull should have a cred");
+        assert_eq!(side_cred.username, "ci");
+        assert_eq!(side_cred.password, "local-tok");
+
+        assert_ne!(
+            main_cred.password, side_cred.password,
+            "distinct creds per image in one deploy cycle"
+        );
     }
 
     /// First deploy: no old container to stop — `stop_and_remove` for old

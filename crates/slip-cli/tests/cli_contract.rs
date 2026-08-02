@@ -1979,6 +1979,116 @@ fn key_parse_gh_repo_slug_ssh() {
         .stderr(predicate::str::contains("can't reach slipd"));
 }
 
+// ─── Registry command (SLIP-105) ───────────────────────────────────────────────
+
+#[test]
+fn registry_login_help_lists_flags() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd.args(["registry", "login", "--help"]).assert();
+
+    assert
+        .success()
+        .code(output::OK)
+        .stdout(predicate::str::contains("--username"))
+        .stdout(predicate::str::contains("--token-stdin"))
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
+fn registry_login_missing_url_exits_usage() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd.args(["registry", "login", "--token-stdin"]).assert();
+
+    // clap rejects the missing positional <URL> with exit 2.
+    assert
+        .failure()
+        .code(output::USAGE)
+        .stderr(predicate::str::contains("required arguments"));
+}
+
+#[test]
+fn registry_login_url_with_path_exits_usage() {
+    // The CLI must reject a URL containing a path component before talking
+    // to the server (prescriptive error, exit 2).
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args(["registry", "login", "reg.io/team", "--token-stdin"])
+        .assert();
+
+    assert
+        .failure()
+        .code(output::USAGE)
+        .stderr(predicate::str::contains("host[:port]"));
+}
+
+#[test]
+fn registry_login_missing_token_exits_auth() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd.args(["registry", "login", "ghcr.io"]).assert();
+
+    // No --token / SLIP_TOKEN → auth check fires before stdin read.
+    assert
+        .failure()
+        .code(output::AUTH)
+        .stderr(predicate::str::contains("SLIP_TOKEN"));
+}
+
+#[test]
+fn registry_logout_help_lists_flags() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd.args(["registry", "logout", "--help"]).assert();
+
+    assert
+        .success()
+        .code(output::OK)
+        .stdout(predicate::str::contains("URL"));
+}
+
+#[test]
+fn registry_list_help_lists_flags() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd.args(["registry", "list", "--help"]).assert();
+
+    assert.success().code(output::OK);
+}
+
+#[test]
+fn registry_login_with_token_connection_error_exits_generic() {
+    // With a token + token-stdin piped, the command reaches the server and
+    // fails with a connection error (no live slipd in CI).
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "registry",
+            "login",
+            "ghcr.io",
+            "--token-stdin",
+            "--token",
+            "valid-admin-token",
+            "--json",
+        ])
+        .write_stdin("my-registry-token")
+        .assert();
+
+    assert
+        .failure()
+        .code(output::GENERIC)
+        .stderr(predicate::str::contains("can't reach slipd"));
+}
+
+#[test]
+fn registry_list_with_token_connection_error_exits_generic() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args(["registry", "list", "--token", "valid-admin-token", "--json"])
+        .assert();
+
+    assert
+        .failure()
+        .code(output::GENERIC)
+        .stderr(predicate::str::contains("can't reach slipd"));
+}
+
 // ─── Link command ────────────────────────────────────────────────────────────────
 
 #[test]

@@ -19,7 +19,7 @@ use crate::docker::parse_memory_limit;
 use crate::error::RuntimeError;
 use crate::health::HealthCheck;
 use crate::repo_config::RepoResourceConfig;
-use crate::runtime::{RegistryCredentials, RuntimeBackend};
+use crate::runtime::RuntimeBackend;
 use crate::state;
 
 // ─── Core state types ─────────────────────────────────────────────────────────
@@ -449,7 +449,9 @@ pub(crate) struct PreviewSharedState {
     pub app_config: AppConfig,
     pub preview_states: Arc<DashMap<String, PreviewState>>,
     pub storage_path: PathBuf,
-    pub credentials: Option<RegistryCredentials>,
+    /// Merged registry table (TOML + store creds), built fresh per-preview so
+    /// `slip registry login` takes effect without a daemon restart.
+    pub registries: Vec<crate::registry::ResolvedRegistry>,
     /// Secrets store for injecting secrets into preview env vars.
     pub secrets_store: Option<crate::secrets::SecretsStore>,
 }
@@ -520,7 +522,7 @@ pub async fn execute_preview_deploy(state: Arc<crate::api::AppState>, ctx: Previ
         app_config,
         preview_states: state.preview_states.clone(),
         storage_path: state.config.storage.path.clone(),
-        credentials: state.registry_credentials(),
+        registries: crate::registry::merged_registry_table(&state.config, &state.secrets_store),
         secrets_store: Some(state.secrets_store.clone()),
     };
 
@@ -618,7 +620,11 @@ pub(crate) async fn execute_preview_deploy_inner(
     update_preview_deploy_status(&shared.preview_states, &state_key, DeployStatus::Pulling);
 
     runtime
-        .pull_image(&ctx.image, &ctx.tag, shared.credentials.clone())
+        .pull_image(
+            &ctx.image,
+            &ctx.tag,
+            crate::registry::resolve_registry_credential(&ctx.image, &shared.registries),
+        )
         .await
         .map_err(|e| {
             fail_preview(&shared.preview_states, &state_key);
@@ -1398,7 +1404,7 @@ mod tests {
     use crate::caddy::{ReverseProxy, Route};
     use crate::config::{
         AppConfig, AppInfo, AppPreviewConfig, AuthConfig, CaddyConfig, DeployConfig, HealthConfig,
-        RegistryConfig, ResourceConfig, RoutingConfig, RuntimeConfig, ServerConfig,
+        RegistriesConfig, ResourceConfig, RoutingConfig, RuntimeConfig, ServerConfig,
         ServerPreviewConfig, SlipConfig, StorageConfig,
     };
     use crate::error::{CaddyError, HealthError, RuntimeError};
@@ -1922,7 +1928,7 @@ mod tests {
             auth: AuthConfig {
                 secret: "test-secret".to_string(),
             },
-            registry: RegistryConfig { ghcr_token: None },
+            registries: RegistriesConfig::default(),
             storage: StorageConfig { path: storage_path },
             runtime: RuntimeConfig::default(),
             // Include a default server preview config so existing tests work.
@@ -1997,7 +2003,7 @@ enabled = {enabled}
             app_config,
             preview_states,
             storage_path: tmp.path().to_path_buf(),
-            credentials: None,
+            registries: Vec::new(),
             secrets_store: None,
         }
     }
@@ -2570,7 +2576,7 @@ enabled = {enabled}
             app_config: test_app_config(),
             preview_states: preview_states.clone(),
             storage_path: tmp.path().to_path_buf(),
-            credentials: None,
+            registries: Vec::new(),
             secrets_store: None,
         };
         let ctx = test_preview_ctx(); // preview_id = "pr-42"
@@ -2621,7 +2627,7 @@ enabled = {enabled}
             app_config,
             preview_states: preview_states.clone(),
             storage_path: tmp.path().to_path_buf(),
-            credentials: None,
+            registries: Vec::new(),
             secrets_store: None,
         };
         let ctx = test_preview_ctx(); // preview_id = "pr-42"
@@ -2656,7 +2662,7 @@ enabled = {enabled}
             app_config: test_app_config(),
             preview_states: preview_states.clone(),
             storage_path: tmp.path().to_path_buf(),
-            credentials: None,
+            registries: Vec::new(),
             secrets_store: None,
         };
         let ctx = test_preview_ctx();
@@ -3099,7 +3105,7 @@ max = {max}
             app_config: test_app_config(),
             preview_states: preview_states.clone(),
             storage_path: tmp.path().to_path_buf(),
-            credentials: None,
+            registries: Vec::new(),
             secrets_store: None,
         };
         let ctx = test_preview_ctx();

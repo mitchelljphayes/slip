@@ -72,8 +72,10 @@ backend = "auto"          # auto-detects Podman or Docker
 [auth]
 secret = "${SLIP_SECRET}"  # global HMAC fallback; per-app [app] secret overrides it
 
-[registry]
-# ghcr_token = "${GHCR_TOKEN}"   # optional: token for pulling private images
+[registries.ghcr]
+url = "ghcr.io"
+# username = "slip"              # optional: anonymous pull if absent
+# token = "${GHCR_TOKEN}"        # optional: prefer `slip registry login ghcr.io`
 
 [caddy]
 admin_api = "http://localhost:2019"
@@ -83,8 +85,8 @@ path = "/var/lib/slip"
 EOF
 ```
 
-> The `[auth]` and `[registry]` sections are **required** (even if `registry` is
-> empty). `[auth].secret` is the fallback webhook secret; a per-app `[app] secret`
+> The `[auth]` section is **required**. `[registries.<name>]` is optional (omit
+> for anonymous pulls); `[auth].secret` is the fallback webhook secret; a per-app `[app] secret`
 > in the app TOML overrides it. **`slip secrets set <app> SLIP_SECRET=...` does
 > NOT affect webhook auth** — it injects the value as a container env var only.
 > See [getting-started.md §6](docs/getting-started.md) for the full distinction.
