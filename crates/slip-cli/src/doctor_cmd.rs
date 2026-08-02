@@ -254,11 +254,13 @@ fn load_config_for_doctor(config_dir: &Path) -> DoctorConfig {
     slip_cfg.auth.secret = resolved;
     unresolved.append(&mut miss);
 
-    // registry.ghcr_token
-    if let Some(token) = slip_cfg.registry.ghcr_token.take() {
-        let (resolved, mut miss) = slip_core::resolve_env_vars_warn(&token);
-        slip_cfg.registry.ghcr_token = Some(resolved);
-        unresolved.append(&mut miss);
+    // registries.<name>.token
+    for entry in slip_cfg.registries.registries.values_mut() {
+        if let Some(token) = entry.token.take() {
+            let (resolved, mut miss) = slip_core::resolve_env_vars_warn(&token);
+            entry.token = Some(resolved);
+            unresolved.append(&mut miss);
+        }
     }
 
     // Apps (load each, resolve env, collect misses).
@@ -1009,7 +1011,16 @@ async fn check_registry(cfg: &DoctorConfig, timeout_secs: u64) -> Vec<Verificati
         return out;
     }
 
-    let token_present = slip.registry.ghcr_token.is_some();
+    // Build a host → token map from the declared registries (Phase 1: simple
+    // host equality; Phase 3 adds longest-path-prefix matching). The doctor
+    // only probes reachability/auth, so a flat host match suffices here.
+    let host_tokens: std::collections::HashMap<String, String> = slip
+        .registries
+        .registries
+        .values()
+        .filter_map(|e| e.token.as_ref().map(|t| (e.url.clone(), t.clone())))
+        .collect();
+    let any_token_present = !host_tokens.is_empty();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs.min(5)))
         .build()
@@ -1042,10 +1053,10 @@ async fn check_registry(cfg: &DoctorConfig, timeout_secs: u64) -> Vec<Verificati
             reachable_any = true;
         }
 
-        // manifest HEAD (with token if present)
+        // manifest HEAD (with per-host token if declared for this host)
         let manifest_url = format!("https://{host}/v2/{repo}/manifests/{tag}");
         let mut req = client.head(&manifest_url);
-        if let Some(token) = &slip.registry.ghcr_token {
+        if let Some(token) = host_tokens.get(host) {
             req = req.header("Authorization", format!("Bearer {token}"));
         }
         let m_resp = tokio::time::timeout(std::time::Duration::from_secs(5), req.send()).await;
@@ -1088,15 +1099,19 @@ async fn check_registry(cfg: &DoctorConfig, timeout_secs: u64) -> Vec<Verificati
             "Registry auth",
             CheckStatus::Fail,
             String::from("registry returned 401/403 with the configured token"),
-            Some(String::from("rotate registry.ghcr_token in slip.toml")),
+            Some(String::from(
+                "rotate the matching [registries.<name>].token or `slip registry login`",
+            )),
         )
-    } else if !token_present {
+    } else if !any_token_present {
         VerificationCheck::new(
             "registry.auth",
             "Registry auth",
             CheckStatus::Warn,
-            String::from("no registry.ghcr_token configured — anonymous pull only"),
-            Some(String::from("set registry.ghcr_token for private repos")),
+            String::from("no registry token configured — anonymous pull only"),
+            Some(String::from(
+                "set [registries.<name>].token or run `slip registry login` for private repos",
+            )),
         )
     } else if auth_ok_any {
         VerificationCheck::new(
@@ -2230,7 +2245,7 @@ mod tests {
                 auth: slip_core::AuthConfig {
                     secret: String::from("x"),
                 },
-                registry: slip_core::RegistryConfig { ghcr_token: None },
+                registries: slip_core::RegistriesConfig::default(),
                 storage: slip_core::StorageConfig::default(),
                 runtime: slip_core::RuntimeConfig::default(),
                 preview: None,
@@ -2256,7 +2271,7 @@ mod tests {
                 auth: slip_core::AuthConfig {
                     secret: String::from("x"),
                 },
-                registry: slip_core::RegistryConfig { ghcr_token: None },
+                registries: slip_core::RegistriesConfig::default(),
                 storage: slip_core::StorageConfig::default(),
                 runtime: slip_core::RuntimeConfig::default(),
                 preview: None,
@@ -2354,7 +2369,7 @@ mod tests {
                 auth: slip_core::AuthConfig {
                     secret: String::from("x"),
                 },
-                registry: slip_core::RegistryConfig { ghcr_token: None },
+                registries: slip_core::RegistriesConfig::default(),
                 storage: slip_core::StorageConfig::default(),
                 runtime: slip_core::RuntimeConfig::default(),
                 preview: None,
@@ -2392,7 +2407,7 @@ mod tests {
                 auth: slip_core::AuthConfig {
                     secret: String::from("x"),
                 },
-                registry: slip_core::RegistryConfig { ghcr_token: None },
+                registries: slip_core::RegistriesConfig::default(),
                 storage: slip_core::StorageConfig::default(),
                 runtime: slip_core::RuntimeConfig::default(),
                 preview: None,
@@ -2939,7 +2954,7 @@ mod tests {
             auth: slip_core::AuthConfig {
                 secret: String::from("test"),
             },
-            registry: slip_core::RegistryConfig { ghcr_token: None },
+            registries: slip_core::RegistriesConfig::default(),
             storage: slip_core::StorageConfig::default(),
             runtime: slip_core::RuntimeConfig::default(),
             preview: None,

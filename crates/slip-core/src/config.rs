@@ -341,7 +341,8 @@ pub struct SlipConfig {
     #[serde(default)]
     pub caddy: CaddyConfig,
     pub auth: AuthConfig,
-    pub registry: RegistryConfig,
+    #[serde(default)]
+    pub registries: RegistriesConfig,
     pub storage: StorageConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
@@ -496,10 +497,63 @@ pub struct AuthConfig {
     pub secret: String,
 }
 
-/// Container registry settings.
+/// A named container registry entry in `[registries.<name>]`.
+///
+/// `url` is a registry host (optionally `:port`), no scheme, no trailing
+/// slash, no path components — see [`normalize_registry_url`]. `username` is
+/// optional (anonymous pull if absent). `token` is an env-ref like
+/// `"${GHCR_TOKEN}"` or a literal, resolved at load time via
+/// [`resolve_env_vars`]. The preferred path is `slip registry login` (writes
+/// to the daemon credential store); a TOML `token` is the bootstrap fallback.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct RegistryConfig {
-    pub ghcr_token: Option<String>,
+pub struct RegistryEntry {
+    pub url: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// Container registry settings — a named map of registries.
+///
+/// Replaces the old single-`ghcr_token` `[registry]` table (hard-migrated in
+/// SLIP-105). An empty map (no `[registries]` table) is valid — it means
+/// anonymous pulls. See [`RegistryEntry`] for per-entry semantics.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RegistriesConfig {
+    /// Named registry entries, keyed by the `<name>` in `[registries.<name>]`.
+    ///
+    /// `#[serde(flatten)]` so the TOML shape is `[registries.ghcr]` directly
+    /// (not `[registries.registries.ghcr]`).
+    #[serde(flatten)]
+    pub registries: std::collections::BTreeMap<String, RegistryEntry>,
+}
+
+/// Normalize a registry URL for storage / matching.
+///
+/// Strips a leading `https?://` and any trailing `/`. Rejects URLs that
+/// contain a path component after the host (registries are host[:port] only —
+/// per-image path matching is done at pull time against the image ref, not
+/// the registry URL).
+pub fn normalize_registry_url(url: &str) -> Result<String, ConfigError> {
+    let stripped = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let trimmed = stripped.trim_end_matches('/');
+    if trimmed.contains('/') {
+        return Err(ConfigError::Internal(format!(
+            "registry url '{url}' must be host[:port] only — \
+             path components are not allowed (use the image ref for namespacing). \
+             See `slip registry login --help`."
+        )));
+    }
+    if trimmed.is_empty() {
+        return Err(ConfigError::Internal(format!(
+            "registry url '{url}' is empty after normalization"
+        )));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Persistent storage path.
@@ -924,8 +978,9 @@ fn is_secret_like_key(key: &str) -> bool {
 /// Loads the daemon config from `{path}/slip.toml` and all app configs from
 /// `{path}/apps/*.toml`.
 ///
-/// Environment variables in `auth.secret`, `registry.ghcr_token`, each app's
-/// `env` values, and each app's `app.secret` are resolved via [`resolve_env_vars`].
+/// Environment variables in `auth.secret`, each `[registries.<name>].token`,
+/// each app's `env` values, and each app's `app.secret` are resolved via
+/// [`resolve_env_vars`].
 ///
 /// Returns a tuple of `(SlipConfig, HashMap<app_name, AppConfig>)`.
 pub fn load_config(path: &Path) -> Result<(SlipConfig, HashMap<String, AppConfig>), ConfigError> {
@@ -981,9 +1036,11 @@ pub fn load_config(path: &Path) -> Result<(SlipConfig, HashMap<String, AppConfig
     // Resolve env vars in auth.secret
     slip_cfg.auth.secret = resolve_env_vars(&slip_cfg.auth.secret)?;
 
-    // Resolve env vars in registry.ghcr_token (if present)
-    if let Some(token) = slip_cfg.registry.ghcr_token.take() {
-        slip_cfg.registry.ghcr_token = Some(resolve_env_vars(&token)?);
+    // Resolve env vars in registries.<name>.token (if present)
+    for entry in slip_cfg.registries.registries.values_mut() {
+        if let Some(token) = entry.token.take() {
+            entry.token = Some(resolve_env_vars(&token)?);
+        }
     }
 
     // ── 2. Load app configs ──────────────────────────────────────────────────
@@ -1199,8 +1256,10 @@ admin_api = "http://localhost:2019"
 [auth]
 secret = "supersecret"
 
-[registry]
-ghcr_token = "ghp_token"
+[registries.ghcr]
+url = "ghcr.io"
+username = "slip"
+token = "ghp_token"
 
 [storage]
 path = "/tmp/slip"
@@ -1209,13 +1268,21 @@ path = "/tmp/slip"
         assert_eq!(cfg.server.listen.to_string(), "127.0.0.1:8080");
         assert_eq!(cfg.caddy.admin_api, "http://localhost:2019");
         assert_eq!(cfg.auth.secret, "supersecret");
-        assert_eq!(cfg.registry.ghcr_token.as_deref(), Some("ghp_token"));
+        let ghcr = cfg
+            .registries
+            .registries
+            .get("ghcr")
+            .expect("ghcr entry should parse");
+        assert_eq!(ghcr.url, "ghcr.io");
+        assert_eq!(ghcr.username.as_deref(), Some("slip"));
+        assert_eq!(ghcr.token.as_deref(), Some("ghp_token"));
         assert_eq!(cfg.storage.path, PathBuf::from("/tmp/slip"));
     }
 
     #[test]
     fn parse_slip_config_defaults() {
-        // Minimal valid config — only required fields supplied.
+        // Minimal valid config — only required fields supplied. No
+        // [registries] table is needed (the map defaults to empty).
         let toml = r#"
 [server]
 
@@ -1224,18 +1291,118 @@ path = "/tmp/slip"
 [auth]
 secret = "s"
 
-[registry]
-
 [storage]
 "#;
         let cfg: SlipConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.server.listen.to_string(), "0.0.0.0:7890");
         assert_eq!(cfg.caddy.admin_api, "http://localhost:2019");
         assert_eq!(cfg.storage.path, PathBuf::from("/var/lib/slip"));
-        assert!(cfg.registry.ghcr_token.is_none());
+        assert!(cfg.registries.registries.is_empty());
         assert_eq!(cfg.runtime.backend, "auto");
         // TLS config should be None by default
         assert!(cfg.caddy.tls.is_none());
+    }
+
+    #[test]
+    fn parse_registries_map_valid() {
+        // Two named registries, one with an env-ref token (resolved at load),
+        // one with a literal token, one with no token.
+        // SAFETY: single-threaded test, no concurrent env access.
+        unsafe { std::env::set_var("SLIP_TEST_REG_TOKEN", "tok_from_env") };
+        let toml = r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registries.ghcr]
+url = "ghcr.io"
+username = "slip"
+token = "${SLIP_TEST_REG_TOKEN}"
+
+[registries.local]
+url = "localhost:5000"
+
+[registries.public]
+url = "registry.example.com"
+username = "ci"
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        let map = &cfg.registries.registries;
+        assert_eq!(map.len(), 3, "three named registries should parse");
+
+        let ghcr = &map["ghcr"];
+        assert_eq!(ghcr.url, "ghcr.io");
+        assert_eq!(ghcr.username.as_deref(), Some("slip"));
+        // Token is resolved at parse time by `toml::from_str`? No — resolution
+        // happens in `load_config`. Here we only check the raw placeholder is
+        // preserved; load_config resolves it.
+        assert_eq!(ghcr.token.as_deref(), Some("${SLIP_TEST_REG_TOKEN}"));
+
+        let local = &map["local"];
+        assert_eq!(local.url, "localhost:5000");
+        assert!(local.username.is_none());
+        assert!(local.token.is_none());
+
+        let public = &map["public"];
+        assert_eq!(public.url, "registry.example.com");
+        assert_eq!(public.username.as_deref(), Some("ci"));
+        assert!(public.token.is_none());
+    }
+
+    #[test]
+    fn parse_registries_empty_ok() {
+        // Explicit empty [registries] table is valid (anonymous pulls).
+        let toml = r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[registries]
+
+[storage]
+"#;
+        let cfg: SlipConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.registries.registries.is_empty());
+    }
+
+    #[test]
+    fn normalize_registry_url_cases() {
+        // Scheme strip.
+        assert_eq!(normalize_registry_url("ghcr.io").unwrap(), "ghcr.io");
+        assert_eq!(
+            normalize_registry_url("https://ghcr.io").unwrap(),
+            "ghcr.io"
+        );
+        assert_eq!(
+            normalize_registry_url("http://ghcr.io/").unwrap(),
+            "ghcr.io"
+        );
+        // host:port preserved.
+        assert_eq!(
+            normalize_registry_url("localhost:5000").unwrap(),
+            "localhost:5000"
+        );
+        assert_eq!(
+            normalize_registry_url("https://localhost:5000").unwrap(),
+            "localhost:5000"
+        );
+        // Path components rejected.
+        let err = normalize_registry_url("reg.io/team").unwrap_err();
+        assert!(
+            err.to_string().contains("host[:port] only"),
+            "path component should be rejected: {err}"
+        );
+        // Empty rejected.
+        assert!(normalize_registry_url("").is_err());
+        assert!(normalize_registry_url("https://").is_err());
     }
 
     // ── ReconcileConfig parsing ─────────────────────────────────────────────
@@ -1254,7 +1421,6 @@ interval = "30s"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -1277,7 +1443,6 @@ secret = "s"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -1305,7 +1470,6 @@ interval = "500ms"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -1338,7 +1502,6 @@ api_token = "{env.CLOUDFLARE_API_TOKEN}"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -1373,7 +1536,6 @@ dns_provider = "cloudflare"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -1404,7 +1566,6 @@ secret = "s"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -1730,7 +1891,6 @@ admin_api = "http://localhost:2019"
 [auth]
 secret = "test-secret"
 
-[registry]
 
 [storage]
 path = "/tmp/slip-test"
@@ -1836,7 +1996,6 @@ port = 8080
 [auth]
 secret = "${SLIP_TEST_SECRET_TOKEN}"
 
-[registry]
 
 [storage]
 "#,
@@ -2022,7 +2181,6 @@ hostname = "api.example.com"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 
@@ -2046,7 +2204,6 @@ preview_timeout = "15m"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -2248,7 +2405,6 @@ dns_provider = "cloudflare"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -2271,7 +2427,6 @@ dns_provider = "cloudflare"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -2293,7 +2448,6 @@ admin_api = "http://localhost:2019"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#;
@@ -2358,7 +2512,6 @@ acme_email = "ops@example.com"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 
@@ -2390,7 +2543,6 @@ tls = "tailscale"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 
@@ -2422,7 +2574,6 @@ tls = "acme"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 
@@ -2452,7 +2603,6 @@ tls = "tailscale"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#,
@@ -2506,7 +2656,6 @@ api_token = "literal-secret-token-value-here-1234567890"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#,
@@ -2541,7 +2690,6 @@ api_token = "{env.CF_API_TOKEN}"
 [auth]
 secret = "s"
 
-[registry]
 
 [storage]
 "#,

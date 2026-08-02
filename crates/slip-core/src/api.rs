@@ -559,16 +559,27 @@ impl AppState {
         self.deploys.insert(ctx.app.clone(), ctx.clone());
     }
 
-    /// Build registry credentials from the configured GHCR token, if any.
+    /// Build registry credentials for a pull, from the configured registries.
+    ///
+    /// Phase 1 stub: returns the single declared registry's credential if
+    /// exactly one registry is configured with a `token`, else `None`. This
+    /// preserves the pre-SLIP-105 single-cred-per-pull behaviour while the
+    /// per-image longest-prefix resolver lands in Phase 3.
     pub fn registry_credentials(&self) -> Option<RegistryCredentials> {
-        self.config
-            .registry
-            .ghcr_token
-            .as_ref()
-            .map(|token| RegistryCredentials {
-                username: "slip".to_string(),
-                password: token.clone(),
-            })
+        let mut found = None;
+        for entry in self.config.registries.registries.values() {
+            if let Some(token) = &entry.token {
+                if found.is_some() {
+                    // Multiple declared tokens — defer to Phase 3 resolver.
+                    return None;
+                }
+                found = Some(RegistryCredentials {
+                    username: entry.username.clone().unwrap_or_else(|| "slip".to_string()),
+                    password: token.clone(),
+                });
+            }
+        }
+        found
     }
 }
 
@@ -2935,7 +2946,7 @@ mod tests {
     use crate::caddy::CaddyClient;
     use crate::config::{
         AppConfig, AppInfo, AuthConfig, CaddyConfig, DeployConfig, HealthConfig, NetworkConfig,
-        RegistryConfig, ResourceConfig, RoutingConfig, RuntimeConfig, ServerConfig, SlipConfig,
+        RegistriesConfig, ResourceConfig, RoutingConfig, RuntimeConfig, ServerConfig, SlipConfig,
         StorageConfig,
     };
     use crate::db::Db;
@@ -2957,7 +2968,7 @@ mod tests {
             auth: AuthConfig {
                 secret: GLOBAL_SECRET.to_string(),
             },
-            registry: RegistryConfig { ghcr_token: None },
+            registries: RegistriesConfig::default(),
             storage: StorageConfig::default(),
             runtime: RuntimeConfig::default(),
             preview: None,

@@ -1398,7 +1398,7 @@ mod tests {
     use crate::caddy::{ReverseProxy, Route};
     use crate::config::{
         AppConfig, AppInfo, AppPreviewConfig, AuthConfig, CaddyConfig, DeployConfig, HealthConfig,
-        RegistryConfig, ResourceConfig, RoutingConfig, RuntimeConfig, ServerConfig,
+        RegistriesConfig, ResourceConfig, RoutingConfig, RuntimeConfig, ServerConfig,
         ServerPreviewConfig, SlipConfig, StorageConfig,
     };
     use crate::error::{CaddyError, HealthError, RuntimeError};
@@ -1922,7 +1922,7 @@ mod tests {
             auth: AuthConfig {
                 secret: "test-secret".to_string(),
             },
-            registry: RegistryConfig { ghcr_token: None },
+            registries: RegistriesConfig::default(),
             storage: StorageConfig { path: storage_path },
             runtime: RuntimeConfig::default(),
             // Include a default server preview config so existing tests work.

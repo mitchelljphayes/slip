@@ -7,8 +7,10 @@ backend = "auto"          # "auto" | "docker" | "podman"
 [auth]
 secret = "${SLIP_SECRET}"  # global HMAC fallback; per-app secrets override it
 
-[registry]
-# ghcr_token = "${GHCR_TOKEN}"   # optional: token for pulling private images
+# [registries.ghcr]
+# url = "ghcr.io"
+# username = "slip"
+# token = "${GHCR_TOKEN}"   # optional: token for pulling private images
 
 [caddy]
 admin_api = "http://localhost:2019"
