@@ -10,6 +10,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::api::AppResponse;
+use crate::config::format_duration;
 use crate::repo_config::RepoConfig;
 
 // ─── Pushable subset ──────────────────────────────────────────────────────────
@@ -459,25 +460,16 @@ pub fn build_update_payload(repo: &RepoConfig) -> Value {
             h["path"] = Value::String(path.clone());
         }
         if let Some(interval) = repo.health.interval {
-            h["interval"] = Value::Number(
-                serde_json::Number::from_f64(interval.as_secs_f64())
-                    .unwrap_or(serde_json::Number::from_f64(0.0).unwrap()),
-            );
+            h["interval"] = Value::String(format_duration(&interval));
         }
         if let Some(timeout) = repo.health.timeout {
-            h["timeout"] = Value::Number(
-                serde_json::Number::from_f64(timeout.as_secs_f64())
-                    .unwrap_or(serde_json::Number::from_f64(0.0).unwrap()),
-            );
+            h["timeout"] = Value::String(format_duration(&timeout));
         }
         if let Some(retries) = repo.health.retries {
             h["retries"] = Value::Number(retries.into());
         }
         if let Some(start) = repo.health.start_period {
-            h["start_period"] = Value::Number(
-                serde_json::Number::from_f64(start.as_secs_f64())
-                    .unwrap_or(serde_json::Number::from_f64(0.0).unwrap()),
-            );
+            h["start_period"] = Value::String(format_duration(&start));
         }
         if let Some(ref expect) = repo.health.expect_status {
             h["expect_status"] = Value::String(expect.canonical());
@@ -507,16 +499,10 @@ pub fn build_update_payload(repo: &RepoConfig) -> Value {
             dep["strategy"] = Value::String(strategy.clone());
         }
         if let Some(dt) = d.drain_timeout {
-            dep["drain_timeout"] = Value::Number(
-                serde_json::Number::from_f64(dt.as_secs_f64())
-                    .unwrap_or(serde_json::Number::from_f64(0.0).unwrap()),
-            );
+            dep["drain_timeout"] = Value::String(format_duration(&dt));
         }
         if let Some(t) = d.timeout {
-            dep["timeout"] = Value::Number(
-                serde_json::Number::from_f64(t.as_secs_f64())
-                    .unwrap_or(serde_json::Number::from_f64(0.0).unwrap()),
-            );
+            dep["timeout"] = Value::String(format_duration(&t));
         }
         payload["deploy"] = dep;
     }
@@ -603,25 +589,16 @@ pub fn build_create_payload(repo: &RepoConfig) -> Result<Value, String> {
             h["path"] = Value::String(path.clone());
         }
         if let Some(interval) = repo.health.interval {
-            h["interval"] = Value::Number(
-                serde_json::Number::from_f64(interval.as_secs_f64())
-                    .unwrap_or(serde_json::Number::from_f64(0.0).unwrap()),
-            );
+            h["interval"] = Value::String(format_duration(&interval));
         }
         if let Some(timeout) = repo.health.timeout {
-            h["timeout"] = Value::Number(
-                serde_json::Number::from_f64(timeout.as_secs_f64())
-                    .unwrap_or(serde_json::Number::from_f64(0.0).unwrap()),
-            );
+            h["timeout"] = Value::String(format_duration(&timeout));
         }
         if let Some(retries) = repo.health.retries {
             h["retries"] = Value::Number(retries.into());
         }
         if let Some(start) = repo.health.start_period {
-            h["start_period"] = Value::Number(
-                serde_json::Number::from_f64(start.as_secs_f64())
-                    .unwrap_or(serde_json::Number::from_f64(0.0).unwrap()),
-            );
+            h["start_period"] = Value::String(format_duration(&start));
         }
         if let Some(ref expect) = repo.health.expect_status {
             h["expect_status"] = Value::String(expect.canonical());
@@ -651,16 +628,10 @@ pub fn build_create_payload(repo: &RepoConfig) -> Result<Value, String> {
             dep["strategy"] = Value::String(strategy.clone());
         }
         if let Some(dt) = d.drain_timeout {
-            dep["drain_timeout"] = Value::Number(
-                serde_json::Number::from_f64(dt.as_secs_f64())
-                    .unwrap_or(serde_json::Number::from_f64(0.0).unwrap()),
-            );
+            dep["drain_timeout"] = Value::String(format_duration(&dt));
         }
         if let Some(t) = d.timeout {
-            dep["timeout"] = Value::Number(
-                serde_json::Number::from_f64(t.as_secs_f64())
-                    .unwrap_or(serde_json::Number::from_f64(0.0).unwrap()),
-            );
+            dep["timeout"] = Value::String(format_duration(&t));
         }
         payload["deploy"] = dep;
     }
@@ -952,6 +923,54 @@ mod tests {
         });
         let payload = build_update_payload(&repo);
         assert_eq!(payload["deploy"]["strategy"], "blue-green");
+    }
+
+    /// Durations must go over the wire as strings, not floats.
+    ///
+    /// Regression test for the `slip apply` 422: the CLI emitted
+    /// `"drain_timeout": 30.0` while `DeployConfig` deserializes durations
+    /// through `duration_serde`, which reads a string. Every payload the CLI
+    /// builds must deserialize into the request types the daemon uses, so this
+    /// asserts the round-trip rather than just the wire shape.
+    #[test]
+    fn build_payloads_emit_durations_the_daemon_can_deserialize() {
+        let repo = make_repo(|r| {
+            r.app.image = Some("nginx:latest".to_string());
+            r.routing.domain = Some("testapp.example.com".to_string());
+            r.routing.port = Some(8080);
+            r.health.path = Some("/healthz".to_string());
+            r.health.interval = Some(std::time::Duration::from_secs(2));
+            r.health.timeout = Some(std::time::Duration::from_secs(5));
+            r.health.start_period = Some(std::time::Duration::from_millis(1500));
+            r.deploy = Some(crate::repo_config::RepoDeployConfig {
+                strategy: Some("blue-green".to_string()),
+                drain_timeout: Some(std::time::Duration::from_secs(30)),
+                timeout: Some(std::time::Duration::from_secs(600)),
+            });
+        });
+
+        let update = build_update_payload(&repo);
+        assert_eq!(update["deploy"]["drain_timeout"], "30s");
+        assert_eq!(update["deploy"]["timeout"], "600s");
+        assert_eq!(update["health"]["interval"], "2s");
+        assert_eq!(update["health"]["start_period"], "1500ms");
+
+        let parsed: crate::api::UpdateAppRequest = serde_json::from_value(update)
+            .expect("update payload must deserialize into UpdateAppRequest");
+        let deploy = parsed.deploy.expect("deploy present");
+        assert_eq!(deploy.drain_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(deploy.timeout, Some(std::time::Duration::from_secs(600)));
+        let health = parsed.health.expect("health present");
+        assert_eq!(health.interval, std::time::Duration::from_secs(2));
+        assert_eq!(health.start_period, std::time::Duration::from_millis(1500));
+
+        let create = build_create_payload(&repo).expect("create payload builds");
+        let parsed: crate::api::CreateAppRequest = serde_json::from_value(create)
+            .expect("create payload must deserialize into CreateAppRequest");
+        assert_eq!(
+            parsed.deploy.expect("deploy present").drain_timeout,
+            std::time::Duration::from_secs(30)
+        );
     }
 
     #[test]

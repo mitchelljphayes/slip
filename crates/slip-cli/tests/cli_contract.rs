@@ -36,7 +36,7 @@ fn bad_flag_exits_usage() {
 #[test]
 fn status_without_token_exits_auth() {
     let mut cmd = Command::cargo_bin("slip").unwrap();
-    let assert = cmd.arg("status").assert();
+    let assert = cmd.env_remove("SLIP_TOKEN").arg("status").assert();
 
     assert
         .failure()
@@ -642,7 +642,7 @@ fn logs_short_follow_flag_accepted() {
 #[test]
 fn apply_stub_exits_nonzero() {
     let mut cmd = Command::cargo_bin("slip").unwrap();
-    let assert = cmd.arg("apply").assert();
+    let assert = cmd.env_remove("SLIP_TOKEN").arg("apply").assert();
 
     // apply is now a real command; without a token it exits AUTH
     assert
@@ -1923,10 +1923,39 @@ fn key_help_lists_flags() {
         .stdout(predicate::str::contains("--json"));
 }
 
+/// `--token` is not the only way in: the help text and docs promise a
+/// `SLIP_TOKEN` env fallback, which `resolve_token` never read (GitHub #51).
+/// With it set, the command must get past the auth gate — here it proceeds to
+/// the server and fails on the connection instead.
+#[test]
+fn key_reads_token_from_slip_token_env() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .env("SLIP_TOKEN", "t".repeat(64))
+        .args(["key", "myapp", "--server", "http://127.0.0.1:1"])
+        .assert();
+
+    assert
+        .failure()
+        .stderr(predicate::str::contains("no admin token").not());
+}
+
+/// An exported-but-empty `SLIP_TOKEN` must not be sent as a bearer token.
+#[test]
+fn empty_slip_token_env_still_exits_auth() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd.env("SLIP_TOKEN", "   ").args(["key", "myapp"]).assert();
+
+    assert
+        .failure()
+        .code(output::AUTH)
+        .stderr(predicate::str::contains("no admin token"));
+}
+
 #[test]
 fn key_missing_token_exits_auth() {
     let mut cmd = Command::cargo_bin("slip").unwrap();
-    let assert = cmd.args(["key", "myapp"]).assert();
+    let assert = cmd.env_remove("SLIP_TOKEN").args(["key", "myapp"]).assert();
 
     assert
         .failure()
@@ -2024,7 +2053,10 @@ fn registry_login_url_with_path_exits_usage() {
 #[test]
 fn registry_login_missing_token_exits_auth() {
     let mut cmd = Command::cargo_bin("slip").unwrap();
-    let assert = cmd.args(["registry", "login", "ghcr.io"]).assert();
+    let assert = cmd
+        .env_remove("SLIP_TOKEN")
+        .args(["registry", "login", "ghcr.io"])
+        .assert();
 
     // No --token / SLIP_TOKEN → auth check fires before stdin read.
     assert
@@ -2119,6 +2151,7 @@ fn link_missing_server_exits_usage() {
 fn link_missing_token_exits_auth() {
     let mut cmd = Command::cargo_bin("slip").unwrap();
     let assert = cmd
+        .env_remove("SLIP_TOKEN")
         .args(["link", "--server", "http://localhost:7890"])
         .assert();
 

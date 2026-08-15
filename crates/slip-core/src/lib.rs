@@ -37,9 +37,9 @@ pub use config::{
     EnvFileConfig, HealthConfig, NetworkConfig, ReconcileConfig, RegistriesConfig, RegistryEntry,
     ResolveMode, ResourceConfig, RouteEntry, RoutingConfig, RuntimeConfig, ServerConfig,
     ServerDeployConfig, ServerPreviewConfig, SlipConfig, StorageConfig, TlsStrategy, VolumeConfig,
-    is_ts_net_host, load_config, load_config_check, load_config_with_mode, normalize_registry_url,
-    parse_env_file, resolve_acme_email, resolve_env_vars, resolve_env_vars_warn,
-    validate_tls_strategy,
+    format_duration, is_ts_net_host, load_config, load_config_check, load_config_with_mode,
+    normalize_registry_url, parse_env_file, resolve_acme_email, resolve_env_vars,
+    resolve_env_vars_warn, validate_tls_strategy,
 };
 pub use db::Db;
 pub use deploy::{

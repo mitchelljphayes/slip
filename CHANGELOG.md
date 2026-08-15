@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed (breaking)
 
+- **`[deploy] tls` now defaults to `acme`, was `internal` (#53).** The deploy
+  webhook is called from CI, and `internal` issues a Caddy self-signed
+  certificate that public runners cannot verify — so the default configuration
+  was incompatible with the workflow slip exists to serve. The new default
+  issues a publicly trusted Let's Encrypt certificate.
+
+  Current behaviour replaced: `[deploy] domain` with no `tls` set produced a
+  self-signed certificate. It now attempts ACME issuance, which requires the
+  domain to resolve to the host with ports 80/443 reachable, and requires
+  `[caddy] acme_email` — slipd refuses to start without it rather than falling
+  back to self-signed. Hosts that cannot satisfy that must set `tls`
+  explicitly: `cloudflare-dns01` (no inbound reachability needed),
+  `tailscale` (`*.ts.net` hosts), or `internal` (local/private use).
+
+  `slip server init --tls` defaults to `acme` to match. See
+  `docs/getting-started.md` §5 for the strategy table.
+
 - **`[registry]` → `[registries.<name>]` (SLIP-105).** The single
   `[registry] ghcr_token` field is **removed**. Replace it with a named
   `[registries.<name>]` table:
@@ -31,7 +48,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[registries]` table) is valid — anonymous pulls. Multiple named registries
   are supported. See `docs/registry-runbook.md` and `slip registry login --help`.
 
+### Fixed
+
+- **`slip apply` 422 on any config with a duration (#52).** The CLI serialized
+  durations as floats (`"drain_timeout": 30.0`) while the daemon deserializes
+  them through `duration_serde`, which reads a string (`"30s"`) — so a
+  `slip.toml` that passed `slip validate` could not be pushed. Create and
+  update payloads now emit the canonical string form. This affected
+  `deploy.drain_timeout`, `deploy.timeout`, and `health.interval` /
+  `health.timeout` / `health.start_period`.
+- **`SLIP_TOKEN` is now read (#51).** `resolve_token` only ever checked the
+  `--token` flag, while the help text, `docs/cli.md`, and
+  `docs/getting-started.md` all documented an env fallback. An
+  exported-but-empty `SLIP_TOKEN` still fails the auth check rather than
+  sending an empty bearer token.
+- **Sub-second durations survive serialization.** `duration_serde` serialized
+  via `as_secs()`, so a `500ms` health interval came back as `"0s"`. Values
+  below a second now render as milliseconds, so `slip apply` no longer reports
+  drift that cannot converge.
+- **`acme` / `cloudflare-dns01` on a `*.ts.net` host now fail at config load**
+  with a pointer to `tls = "tailscale"`, instead of failing later at issuance:
+  a public CA cannot validate a Tailscale domain.
+
 ### Added
+
+- `slip_core::format_duration(&Duration) -> String` — renders the canonical
+  wire form (`"30s"`, `"1500ms"`) that `parse_duration` accepts.
 
 - `slip_core::RegistriesConfig` / `RegistryEntry` config types (replace
   `RegistryConfig`).

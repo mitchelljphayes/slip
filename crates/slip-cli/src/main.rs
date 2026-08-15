@@ -195,8 +195,8 @@ enum ServerCommands {
         /// Deploy webhook domain (e.g. deploy.example.com).
         #[arg(long)]
         domain: Option<String>,
-        /// TLS strategy [default: internal] [possible values: internal, acme, cloudflare-dns01, tailscale].
-        #[arg(long, default_value = "internal", value_parser = clap::builder::PossibleValuesParser::new(["internal", "acme", "cloudflare-dns01", "tailscale"]))]
+        /// TLS strategy [default: acme] [possible values: internal, acme, cloudflare-dns01, tailscale].
+        #[arg(long, default_value = "acme", value_parser = clap::builder::PossibleValuesParser::new(["internal", "acme", "cloudflare-dns01", "tailscale"]))]
         tls: String,
         /// Container runtime backend [default: auto] [possible values: auto, docker, podman].
         #[arg(long, default_value = "auto")]
@@ -1780,13 +1780,17 @@ fn resolve_app(explicit: Option<String>) -> String {
 /// now requires the admin token by default (for `--apply`). For commands that
 /// don't have `--no-apply`, the mention is harmless.
 fn resolve_token(cli_token: Option<String>) -> String {
-    cli_token.unwrap_or_else(|| {
-        output::fail(
+    if let Some(token) = cli_token {
+        return token;
+    }
+    match std::env::var("SLIP_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => token,
+        _ => output::fail(
             output::AUTH,
             "no admin token",
             "set --token or the SLIP_TOKEN env var, or use --no-apply to skip config application",
-        );
-    })
+        ),
+    }
 }
 
 // ─── Link command implementation ───────────────────────────────────────────────

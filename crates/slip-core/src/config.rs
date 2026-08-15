@@ -131,8 +131,7 @@ mod duration_serde {
     where
         S: Serializer,
     {
-        let secs = duration.as_secs();
-        serializer.serialize_str(&format!("{secs}s"))
+        serializer.serialize_str(&super::format_duration(duration))
     }
 
     pub(super) fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -199,11 +198,25 @@ mod duration_serde_option {
     {
         match duration {
             None => serializer.serialize_none(),
-            Some(dur) => {
-                let secs = dur.as_secs();
-                serializer.serialize_some(&format!("{secs}s"))
-            }
+            Some(dur) => serializer.serialize_some(&super::format_duration(dur)),
         }
+    }
+}
+
+/// Formats a `Duration` in the canonical wire form accepted by `parse_duration`.
+///
+/// Whole seconds render as `"30s"`; anything with a sub-second remainder renders
+/// as milliseconds (`"1500ms"`), which keeps the output integral and lossless at
+/// the millisecond granularity the duration grammar supports. Sub-millisecond
+/// remainders are truncated — they cannot be expressed in config either.
+///
+/// This is the inverse of `parse_duration`, so every value slip emits over the
+/// API or writes to TOML parses back to the same `Duration`.
+pub fn format_duration(duration: &Duration) -> String {
+    if duration.subsec_nanos() == 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
     }
 }
 
@@ -254,7 +267,7 @@ fn default_network_name() -> String {
 }
 
 fn default_deploy_tls() -> TlsStrategy {
-    TlsStrategy::Internal
+    TlsStrategy::Acme
 }
 
 fn default_env() -> HashMap<String, String> {
@@ -314,11 +327,18 @@ pub struct ServerDeployConfig {
     pub domain: Option<String>,
     /// TLS strategy for the deploy webhook domain.
     ///
-    /// Defaults to `internal` (Caddy local CA, self-signed — works on
-    /// tailnet-only hosts with `--insecure` callers). Other strategies:
-    /// `acme` (HTTP-01/TLS-ALPN-01), `cloudflare-dns01` (DNS-01 via
-    /// `caddy-dns/cloudflare`), `tailscale` (built-in manager, `.ts.net`
-    /// only).
+    /// Defaults to `acme` (HTTP-01/TLS-ALPN-01), which yields a publicly
+    /// trusted certificate so CI runners can call the webhook without
+    /// disabling verification. It requires the domain to resolve to this host
+    /// and ports 80/443 to be reachable from the internet; issuance fails on
+    /// hosts that are not publicly reachable.
+    ///
+    /// Other strategies, for hosts where `acme` cannot work:
+    /// `cloudflare-dns01` (DNS-01 via `caddy-dns/cloudflare` — publicly
+    /// trusted without inbound reachability), `tailscale` (built-in manager,
+    /// `.ts.net` only — publicly trusted, reachable only on the tailnet), and
+    /// `internal` (Caddy local CA, self-signed — callers must trust the local
+    /// CA or pass `--insecure`).
     #[serde(default = "default_deploy_tls")]
     pub tls: TlsStrategy,
 }
@@ -923,6 +943,18 @@ pub fn validate_tls_strategy(
     match s {
         TlsStrategy::Internal => Ok(()),
         TlsStrategy::Acme | TlsStrategy::CloudflareDns01 => {
+            // A public CA cannot validate a *.ts.net name: HTTP-01 is not
+            // reachable off-tailnet and the DNS zone is not yours to solve
+            // DNS-01 against. Catch it here rather than at issuance time.
+            if let Some(h) = host
+                && is_ts_net_host(h)
+            {
+                return Err(ConfigError::Internal(format!(
+                    "TLS strategy '{s}' cannot issue for the *.ts.net host '{h}' — \
+                     a public CA cannot validate a Tailscale domain; \
+                     use tls = \"tailscale\" instead"
+                )));
+            }
             if ctx.acme_email.is_none() {
                 return Err(ConfigError::Internal(format!(
                     "TLS strategy '{s}' requires [caddy] acme_email — \
@@ -2576,6 +2608,78 @@ tls = "bogus-strategy"
             msg.contains("*.ts.net"),
             "error must mention the remedy: {msg}"
         );
+    }
+
+    /// The deploy webhook is called from CI, so the default must produce a
+    /// publicly trusted certificate. `internal` was the old default and left
+    /// runners unable to verify the endpoint (GitHub issue #53).
+    #[test]
+    fn deploy_webhook_tls_defaults_to_acme() {
+        assert_eq!(ServerDeployConfig::default().tls, TlsStrategy::Acme);
+
+        let cfg: SlipConfig = toml::from_str(
+            r#"
+[server]
+
+[caddy]
+
+[auth]
+secret = "s"
+
+[storage]
+
+[deploy]
+domain = "deploy.example.com"
+"#,
+        )
+        .expect("config parses");
+        assert_eq!(cfg.deploy.expect("[deploy] present").tls, TlsStrategy::Acme);
+    }
+
+    #[test]
+    fn validate_tls_strategy_acme_rejects_ts_net_host() {
+        let ctx = ValidationCtx {
+            acme_email: Some("ops@example.com"),
+        };
+        let err = validate_tls_strategy(&TlsStrategy::Acme, Some("box.tailnet.ts.net"), &ctx)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tailscale"),
+            "error must name the remedy: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_duration_round_trips_through_parse_duration() {
+        for original in [
+            Duration::from_secs(0),
+            Duration::from_secs(30),
+            Duration::from_secs(600),
+            Duration::from_millis(500),
+            Duration::from_millis(1500),
+        ] {
+            let rendered = format_duration(&original);
+            let parsed = duration_serde::parse_duration(&rendered)
+                .unwrap_or_else(|e| panic!("'{rendered}' must parse back: {e}"));
+            assert_eq!(parsed, original, "round-trip failed for '{rendered}'");
+        }
+    }
+
+    /// Sub-second durations must survive serialization. The old serializer used
+    /// `as_secs()`, so a 500ms health interval came back as `"0s"` and made
+    /// `slip apply` report drift that could never converge.
+    #[test]
+    fn duration_serialize_preserves_sub_second_precision() {
+        let cfg = HealthConfig {
+            interval: Duration::from_millis(500),
+            ..HealthConfig::default()
+        };
+        let json = serde_json::to_value(&cfg).expect("serializes");
+        assert_eq!(json["interval"], "500ms");
+
+        let back: HealthConfig = serde_json::from_value(json).expect("round-trips");
+        assert_eq!(back.interval, Duration::from_millis(500));
     }
 
     #[test]

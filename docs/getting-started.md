@@ -2,10 +2,10 @@
 
 This guide walks through setting up slip on a Linux VPS (e.g. Arakeen) to deploy your first app.
 
-> **Note:** This guide describes the current manual setup process. The target UX
-> (one-command `slip init`, per-app deploy keys, slip-owned webhook ingress) is
-> tracked in the [v1.0 roadmap project](https://linear.app/mitchelljphayes/project/slip-v1-0-roadmap-3b6e6e0b0b0b).
-> The interim steps below will be replaced as those features ship.
+> **Note:** This guide sets the server up by hand, which is the explicit path.
+> `slip server init` performs steps 2 through 5 in one command, and `slip init`
+> scaffolds the repo side. Remaining work is tracked in the
+> [v1.0 roadmap project](https://linear.app/mitchelljphayes/project/slip-v10-agent-ready-paas-b99757b85655).
 
 ## Prerequisites
 
@@ -226,63 +226,59 @@ mount_path = "/app/catalog"
 EOF
 ```
 
-## 5. Configure Caddy to proxy the webhook endpoint
+## 5. Expose the webhook endpoint
 
-slip listens on localhost. To receive webhooks from CI over the public internet, add a Caddy reverse proxy.
+slipd listens on localhost. For CI to reach it, the webhook needs a public
+hostname and a certificate. slipd handles both: set `domain` under `[deploy]`
+and it registers the Caddy route and the TLS policy itself on startup.
 
-> **⚠️ WARNING — Caddyfile site blocks are incompatible with slipd on Caddy ≥ 2.11**
->
-> slipd creates a Caddy server named `slip` listening on `:443`. Any Caddyfile site block
-> (`deploy.yourdomain.com { … }`) adapts into a *separate* server (e.g. `srv0`) also on
-> `:443`. Caddy ≥ 2.11 rejects two servers claiming the same listener:
-> `listener address repeated: tcp/:443 (already claimed by server 'slip')`. This causes
-> slipd's bootstrap to fail and the daemon to **crash-loop** (`Restart=on-failure`).
->
-> **Do not add the deploy webhook route to your Caddyfile.** Use the admin API instead
-> (see below). A permanent fix is tracked in [SLIP-87](https://linear.app/mitchelljphayes/issue/SLIP-87)
-> — slipd will own the webhook route itself, making this interim pattern unnecessary.
+```toml
+[caddy]
+acme_email = "you@example.com"
 
-### Interim pattern: add the route via Caddy's admin API
-
-Use `curl` to add a single route into slipd's existing `slip` server, with a non-`slip-`
-`@id` so slipd's own reconciliation never deletes it:
-
-```bash
-# 1. Add the reverse-proxy route
-curl -X POST http://localhost:2019/config/apps/http/servers/slip/routes \
-  -H "Content-Type: application/json" \
-  -d '{
-    "@id": "manual-deploy-webhook",
-    "match": [{"host": ["deploy.yourdomain.com"]}],
-    "handle": [{
-      "handler": "reverse_proxy",
-      "upstreams": [{"dial": "127.0.0.1:7890"}]
-    }]
-  }'
-
-# 2. Add a TLS automation policy (required for tailnet-only / non-public hosts)
-#    For a public host with a real domain, Caddy's default ACME issuer works.
-#    For a tailnet-only host (grey-cloud DNS → Tailscale IP), use the internal CA:
-curl -X POST http://localhost:2019/config/apps/tls/automation/policies \
-  -H "Content-Type: application/json" \
-  -d '{
-    "subjects": ["deploy.yourdomain.com"],
-    "issuers": [{ "module": "internal" }]
-  }'
+[deploy]
+domain = "deploy.yourdomain.com"
+# tls = "acme"   # the default; see the table below
 ```
 
-> **Why two steps?** The route tells Caddy where to send traffic; the TLS policy tells
-> Caddy *how to get a certificate* for that host. Without an explicit policy, Caddy
-> falls back to public ACME (HTTP-01 / TLS-ALPN-01), which **cannot validate a
-> tailnet-only IP** — the TLS handshake fails with `tlsv1 alert internal error` and
-> the webhook caller's `--insecure` flag can't help because the server aborts before
-> cert verification. The `internal` issuer uses Caddy's self-signed local CA, which
-> matches the `--insecure` intent and works on any network.
->
-> **Persistence:** Admin-API routes are lost on Caddy restart. If you restart Caddy,
-> re-run the two `curl` commands above (or script them into a oneshot systemd service
-> that runs after `caddy.service`). This is another reason SLIP-87 (slipd owning the
-> webhook route) is the permanent fix.
+That is the whole step. No `curl` calls against the admin API, and nothing to
+re-apply after a Caddy restart — slipd reconciles the route on every boot.
+
+> **Do not add the webhook to your Caddyfile.** slipd creates a Caddy server
+> named `slip` on `:443`. A Caddyfile site block (`deploy.yourdomain.com { … }`)
+> adapts into a *separate* server on the same port, and Caddy ≥ 2.11 rejects
+> the second one: `listener address repeated: tcp/:443 (already claimed by
+> server 'slip')`. slipd's bootstrap then fails and the daemon crash-loops
+> under `Restart=on-failure`. Configure `[deploy] domain` instead.
+
+### Choosing a TLS strategy
+
+CI runners verify the certificate like any other client, so the default is
+`acme` — a publicly trusted Let's Encrypt certificate. Pick a different
+strategy only when `acme` cannot work on your host:
+
+| `tls` | Use when | Certificate | Reachable from |
+|-------|----------|-------------|----------------|
+| `acme` (default) | The domain resolves to this host and ports 80/443 are open to the internet | Publicly trusted | Anywhere |
+| `cloudflare-dns01` | Cloudflare DNS, and the host has no inbound reachability (CGNAT, firewalled) | Publicly trusted | Anywhere the host is routable |
+| `tailscale` | Tailnet-only host with a `*.ts.net` name | Publicly trusted | Tailnet only |
+| `internal` | Local development, or a private network where you control every caller | Self-signed (Caddy local CA) | Anywhere, but callers must trust the CA |
+
+`acme` and `cloudflare-dns01` require `[caddy] acme_email`; slipd refuses to
+start without it rather than falling back to a self-signed certificate.
+
+**If your host is tailnet-only**, `acme` cannot issue for it — Let's Encrypt
+has no route to complete the challenge. slipd rejects `acme` on a `*.ts.net`
+domain at config load with a pointer to `tls = "tailscale"`. Note that the
+certificate being publicly trusted does not make the host publicly reachable:
+a GitHub-hosted runner still cannot route to a `100.x` tailnet address, so the
+workflow must join the tailnet (`tailscale/github-action`) before calling the
+webhook.
+
+**`internal` and CI do not mix.** A self-signed certificate makes every public
+CI call fail verification, and `--insecure` in a deploy workflow throws away
+the authentication that the signed webhook exists to provide. Use `internal`
+for local work, not for a runner-facing endpoint.
 
 ### Verify the route
 
@@ -290,7 +286,19 @@ curl -X POST http://localhost:2019/config/apps/tls/automation/policies \
 curl -s http://localhost:2019/config/apps/http/servers/slip/routes | python3 -m json.tool
 ```
 
-You should see your `manual-deploy-webhook` route alongside slipd's `slip-<app>-<n>` routes.
+You should see a `slip-deploy-webhook` route alongside slipd's `slip-<app>-<n>`
+routes. To confirm the certificate is one CI can verify, check it from a
+machine that is not this host and not on your tailnet:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' https://deploy.yourdomain.com/v1/deploy
+```
+
+A TLS error here means CI will fail the same way. `slip doctor` also flags the
+common version of this — a self-signed certificate serving a public hostname —
+but it reads the issuer from Caddy locally, so it cannot tell you whether the
+host is reachable from where CI actually runs. The `curl` above, from off-host,
+is the check that answers that.
 
 ## 6. Set up secrets
 
