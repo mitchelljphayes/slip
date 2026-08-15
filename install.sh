@@ -55,35 +55,85 @@ detect_arch() {
     esac
 }
 
-# checksum_verify: verifies <archive>.sha256 against <archive> using the
-# OS-appropriate tool. `sha256sum -c` is GNU coreutils (Linux); macOS has
-# `shasum -a 256 -c`. Falls back to a warn (no fail) when neither is present.
+# sha256_of: prints the SHA-256 digest of <file> using whichever tool is
+# available. Returns nonzero when neither sha256sum nor shasum is present.
+# Used by checksum_verify so the local archive filename is irrelevant to
+# verification: the published sidecar may name the release asset while the
+# installer stores the archive as `slip.tar.gz` (SLIP-123).
+sha256_of() {
+    # sha256_of <file>
+    local digest
+    if command -v sha256sum >/dev/null 2>&1; then
+        digest="$(sha256sum "$1" | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+        digest="$(shasum -a 256 "$1" | awk '{print $1}')"
+    else
+        return 1
+    fi
+    printf '%s\n' "$digest"
+}
+
+# checksum_verify: verifies <archive>.sha256 against <archive> by extracting
+# the expected digest from the sidecar and comparing it to a digest computed
+# over the local archive. The sidecar's filename field is treated as
+# untrusted and ignored, so the local archive name does not need to match the
+# release asset basename (SLIP-123). Falls back to a warn (no fail) when
+# neither sha256sum nor shasum is present; all other failure modes
+# (unreadable, malformed, mismatched) fail with a prescriptive error before
+# extraction or installation.
 checksum_verify() {
     # checksum_verify <archive> <archive.sha256>
-    local archive shafile
+    local archive shafile expected actual
     archive="$1"
     shafile="$2"
-    case "$OS" in
-        linux)
-            if command -v sha256sum >/dev/null 2>&1; then
-                (cd "$(dirname "$archive")" && sha256sum -c "$(basename "$shafile")") \
-                    || error "checksum verification failed"
-            else
-                warn "sha256sum not found — skipped checksum verification"
-            fi
-            ;;
-        darwin)
-            if command -v shasum >/dev/null 2>&1; then
-                (cd "$(dirname "$archive")" && shasum -a 256 -c "$(basename "$shafile")") \
-                    || error "checksum verification failed"
-            else
-                warn "shasum not found — skipped checksum verification"
-            fi
-            ;;
-        *)
-            warn "checksum verification not supported on $OS — skipped"
+
+    # Tool selection is shared with sha256_of; if no tool is available we
+    # preserve the historical warn-and-skip behavior rather than failing.
+    if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+        warn "neither sha256sum nor shasum found — skipped checksum verification"
+        return 0
+    fi
+
+    # Read only the first whitespace-delimited field of the first sidecar
+    # line. The sidecar is untrusted network input; the filename field is
+    # ignored entirely.
+    if ! expected="$(awk 'NR==1{print $1; exit}' "$shafile" 2>/dev/null)"; then
+        error "checksum verification failed — cannot read sidecar $shafile (re-download the release or verify manually with sha256sum)"
+    fi
+    if [ -z "$expected" ]; then
+        error "checksum verification failed — sidecar $shafile is empty (re-download the release or verify manually with sha256sum)"
+    fi
+
+    # Require exactly 64 hexadecimal characters. Separate the length check
+    # (so a wrong-length digest is rejected before the hex-content case) and
+    # the invalid-hex case (POSIX `case`, no regex).
+    if [ "${#expected}" -ne 64 ]; then
+        error "checksum verification failed — sidecar digest is not 64 hex characters (got ${#expected}); re-download the release or verify manually with sha256sum"
+    fi
+    case "$expected" in
+        *[!0-9a-fA-F]*)
+            error "checksum verification failed — sidecar digest contains non-hex characters; re-download the release or verify manually with sha256sum"
             ;;
     esac
+
+    # Normalize the expected digest to lowercase for a case-insensitive
+    # comparison (sha256sum emits lowercase; shasum may emit uppercase on
+    # some platforms).
+    expected="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
+
+    # Compute the archive digest under its local name.
+    if ! actual="$(sha256_of "$archive")"; then
+        error "checksum verification failed — could not compute digest of $archive"
+    fi
+    # shasum on some platforms prefixes a binary-mode `*` marker; awk already
+    # stripped to the first field, so `actual` is pure hex. Normalize case.
+    actual="$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')"
+
+    if [ "$expected" != "$actual" ]; then
+        error "checksum verification failed — archive digest $actual does not match sidecar $expected; re-download the release or verify manually with sha256sum"
+    fi
+
+    info "Checksum verified."
 }
 
 fetch() {
@@ -96,6 +146,47 @@ fetch() {
         error "neither curl nor wget is installed"
     fi
 }
+
+# ── install_prebuilt: download + verify + extract + install binaries ───────
+# Defined before the test seam so tests can source the installer with
+# SLIP_INSTALLER_MAIN=0 and invoke this function directly.
+install_prebuilt() {
+    # install_prebuilt <version> <target>
+    local p_version p_target p_url p_tmpdir
+    p_version="$1"
+    p_target="$2"
+
+    p_tmpdir="$(mktemp -d)"
+    trap 'rm -rf "$p_tmpdir"' RETURN
+
+    p_url="https://github.com/$REPO/releases/download/$p_version/slip-$p_target.tar.gz"
+    info "Downloading $p_url..."
+    fetch "$p_url" "$p_tmpdir/slip.tar.gz" \
+        || { warn "download failed (version $p_version may not have $p_target binaries)"; return 1; }
+
+    # Verify checksum if available
+    if fetch "$p_url.sha256" "$p_tmpdir/slip.tar.gz.sha256" 2>/dev/null; then
+        info "Verifying checksum..."
+        checksum_verify "$p_tmpdir/slip.tar.gz" "$p_tmpdir/slip.tar.gz.sha256"
+    fi
+
+    # Extract
+    tar -xzf "$p_tmpdir/slip.tar.gz" -C "$p_tmpdir"
+
+    # Install binaries
+    install -Dm755 "$p_tmpdir/slipd" "$PREFIX/bin/slipd"
+    install -Dm755 "$p_tmpdir/slip"   "$PREFIX/bin/slip"
+    info "Binaries installed to $PREFIX/bin/"
+}
+
+# ── Test seam ──────────────────────────────────────────────────────────────
+# When sourced with SLIP_INSTALLER_MAIN=0, return before top-level argument
+# parsing so tests can invoke individual functions (install_prebuilt,
+# checksum_verify, sha256_of) without running the installer or the root/need
+# guards. Normal execution (the default) is unaffected.
+if [ "${SLIP_INSTALLER_MAIN:-1}" = "0" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 # ── Parse args ─────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -160,36 +251,6 @@ need tar
 # Determine target
 TARGET="$(detect_arch)"
 info "Target: $TARGET"
-
-# ── install_prebuilt: download + verify + extract + install binaries ───────
-install_prebuilt() {
-    # install_prebuilt <version> <target>
-    local p_version p_target p_url p_tmpdir
-    p_version="$1"
-    p_target="$2"
-
-    p_tmpdir="$(mktemp -d)"
-    trap 'rm -rf "$p_tmpdir"' RETURN
-
-    p_url="https://github.com/$REPO/releases/download/$p_version/slip-$p_target.tar.gz"
-    info "Downloading $p_url..."
-    fetch "$p_url" "$p_tmpdir/slip.tar.gz" \
-        || { warn "download failed (version $p_version may not have $p_target binaries)"; return 1; }
-
-    # Verify checksum if available
-    if fetch "$p_url.sha256" "$p_tmpdir/slip.tar.gz.sha256" 2>/dev/null; then
-        info "Verifying checksum..."
-        checksum_verify "$p_tmpdir/slip.tar.gz" "$p_tmpdir/slip.tar.gz.sha256"
-    fi
-
-    # Extract
-    tar -xzf "$p_tmpdir/slip.tar.gz" -C "$p_tmpdir"
-
-    # Install binaries
-    install -Dm755 "$p_tmpdir/slipd" "$PREFIX/bin/slipd"
-    install -Dm755 "$p_tmpdir/slip"   "$PREFIX/bin/slip"
-    info "Binaries installed to $PREFIX/bin/"
-}
 
 # ── install_source: build from source via cargo ────────────────────────────
 install_source() {
