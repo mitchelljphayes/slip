@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Preserve externally managed Caddy TLS policies during reconciliation (SLIP-125).** Slip now updates only TLS automation policies it owns, preventing certificate renewal configuration for unrelated routes from being deleted.
+
 ## [0.1.0] - 2026-08-15
 
 First tagged release. Everything below describes changes made during

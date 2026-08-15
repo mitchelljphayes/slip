@@ -47,7 +47,7 @@ pub struct PreviewRequestInfo {
 #[derive(Debug, Deserialize)]
 pub struct DeployRequest {
     pub app: String,
-    /// Image base (e.g., "ghcr.io/org/stat-stream"). Optional — server resolves
+    /// Image base (e.g., "ghcr.io/org/stat-stream"). Optional, server resolves
     /// from app config when omitted.
     #[serde(default)]
     pub image: Option<String>,
@@ -85,7 +85,7 @@ pub struct ErrorResponse {
 /// Query parameters for `GET /v1/apps/{name}/logs`.
 #[derive(Debug, Deserialize)]
 pub struct LogsQueryParams {
-    /// Duration string (e.g. "1h", "5m30s") — only show logs newer than this.
+    /// Duration string (e.g. "1h", "5m30s"), only show logs newer than this.
     #[serde(default)]
     pub since: Option<String>,
     /// Follow log output (stream new lines as they arrive). Default: false.
@@ -364,19 +364,19 @@ pub struct SetSecretsRequest {
     pub secrets: HashMap<String, String>,
 }
 
-/// Response for `PUT /v1/apps/{name}/secrets` — lists keys that were set.
+/// Response for `PUT /v1/apps/{name}/secrets`, lists keys that were set.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SetSecretsResponse {
     pub set: Vec<String>,
 }
 
-/// Response for `GET /v1/apps/{name}/secrets` — key names only, never values.
+/// Response for `GET /v1/apps/{name}/secrets`, key names only, never values.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SecretsListResponse {
     pub secrets: Vec<String>,
 }
 
-/// Response for `DELETE /v1/previews/{app}` — IDs of torn-down previews.
+/// Response for `DELETE /v1/previews/{app}`, IDs of torn-down previews.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TeardownAllResponse {
     pub torn_down: Vec<String>,
@@ -477,9 +477,9 @@ impl IntoResponse for AppError {
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            // 502 Bad Gateway — Caddy/storage failure that prevents completion.
+            // 502 Bad Gateway, Caddy/storage failure that prevents completion.
             AppError::RenewNotProven(msg) => (StatusCode::from_u16(502).unwrap(), msg),
-            // 504 Gateway Timeout — renewal timed out.
+            // 504 Gateway Timeout, renewal timed out.
             AppError::RenewTimeout(msg) => (StatusCode::from_u16(504).unwrap(), msg),
         };
         (status, Json(ErrorResponse { error: message })).into_response()
@@ -541,7 +541,7 @@ impl AppState {
     ///
     /// Persists to SQLite (fire-and-forget via `tokio::spawn`) and updates the
     /// in-memory cache synchronously.  If the SQLite write fails it is logged
-    /// but the deploy continues — deploy history is best-effort persistence.
+    /// but the deploy continues, deploy history is best-effort persistence.
     pub fn record_deploy(&self, ctx: &DeployContext) {
         // Persist to SQLite (fire-and-forget via spawn_blocking).
         let db = self.db.clone();
@@ -670,9 +670,9 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 
 /// Verify authentication for preview endpoints.
 ///
-/// Accepts either:
-/// - `Authorization: Bearer {token}` — validated against the management auth secret
-/// - `X-Slip-Signature` — HMAC-SHA256 validated against the app's secret (or global fallback)
+/// Accepts either token. First, `Authorization: Bearer {token}`, validated
+/// against the management auth secret. Second, `X-Slip-Signature`,
+/// HMAC-SHA256 validated against the app's secret (or global fallback).
 ///
 /// The `hmac_body` parameter is the data to verify the HMAC signature over
 /// (e.g. `format!("{app}:{preview_id}")` for single teardown,
@@ -698,7 +698,7 @@ async fn verify_preview_auth(
     {
         let app_cfg = state.apps.read().await.get(app).cloned().ok_or_else(|| {
             AppError::NotFound(format!(
-                "unknown app: {app} — register it via POST /v1/apps or run `slip apply`"
+                "unknown app: {app}, register it via POST /v1/apps or run `slip apply`"
             ))
         })?;
 
@@ -755,7 +755,7 @@ fn validate_app_name(name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// `POST /v1/apps` — Create a new app.
+/// `POST /v1/apps`, Create a new app.
 async fn handle_create_app(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateAppRequest>,
@@ -822,7 +822,7 @@ async fn handle_create_app(
     Ok((StatusCode::CREATED, Json(app_response)))
 }
 
-/// `GET /v1/apps` — List all apps.
+/// `GET /v1/apps`, List all apps.
 async fn handle_list_apps(
     State(state): State<Arc<AppState>>,
 ) -> Result<(StatusCode, Json<AppListResponse>), AppError> {
@@ -831,7 +831,7 @@ async fn handle_list_apps(
     Ok((StatusCode::OK, Json(AppListResponse { apps: app_list })))
 }
 
-/// `GET /v1/apps/{name}` — Get a specific app.
+/// `GET /v1/apps/{name}`, Get a specific app.
 async fn handle_get_app(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -839,14 +839,14 @@ async fn handle_get_app(
     let apps = state.apps.read().await;
     let app_config = apps.get(&name).ok_or_else(|| {
         AppError::NotFound(format!(
-            "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+            "app '{}' not found, register it via POST /v1/apps or run `slip apply`",
             name
         ))
     })?;
     Ok((StatusCode::OK, Json(AppResponse::from(app_config))))
 }
 
-/// `PATCH /v1/apps/{name}` — Update an app.
+/// `PATCH /v1/apps/{name}`, Update an app.
 async fn handle_update_app(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -859,7 +859,7 @@ async fn handle_update_app(
             .get(&name)
             .ok_or_else(|| {
                 AppError::NotFound(format!(
-                    "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+                    "app '{}' not found, register it via POST /v1/apps or run `slip apply`",
                     name
                 ))
             })?
@@ -936,7 +936,7 @@ async fn handle_update_app(
     Ok((StatusCode::OK, Json(app_response)))
 }
 
-/// `DELETE /v1/apps/{name}` — Delete an app.
+/// `DELETE /v1/apps/{name}`, Delete an app.
 async fn handle_delete_app(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -946,7 +946,7 @@ async fn handle_delete_app(
         let mut apps = state.apps.write().await;
         if apps.remove(&name).is_none() {
             return Err(AppError::NotFound(format!(
-                "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+                "app '{}' not found, register it via POST /v1/apps or run `slip apply`",
                 name
             )));
         }
@@ -1007,7 +1007,7 @@ async fn handle_delete_app(
     Ok((StatusCode::OK, Json(serde_json::json!({"status": "ok"}))))
 }
 
-/// `POST /v1/apps/{name}/rollback` — Roll back to the previous version.
+/// `POST /v1/apps/{name}/rollback`, Roll back to the previous version.
 async fn handle_rollback(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -1016,7 +1016,7 @@ async fn handle_rollback(
     // Look up app config.
     let app_cfg = state.apps.read().await.get(&name).cloned().ok_or_else(|| {
         AppError::NotFound(format!(
-            "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+            "app '{}' not found, register it via POST /v1/apps or run `slip apply`",
             name
         ))
     })?;
@@ -1119,7 +1119,7 @@ async fn handle_rollback(
 
 // ─── Secrets handlers ─────────────────────────────────────────────────────────
 
-/// `GET /v1/apps/{name}/secrets` — List secret key names for an app.
+/// `GET /v1/apps/{name}/secrets`, List secret key names for an app.
 ///
 /// Values are never returned.
 async fn handle_list_secrets(
@@ -1131,7 +1131,7 @@ async fn handle_list_secrets(
         let apps = state.apps.read().await;
         if !apps.contains_key(&name) {
             return Err(AppError::NotFound(format!(
-                "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+                "app '{}' not found, register it via POST /v1/apps or run `slip apply`",
                 name
             )));
         }
@@ -1145,10 +1145,10 @@ async fn handle_list_secrets(
     Ok((StatusCode::OK, Json(SecretsListResponse { secrets: keys })))
 }
 
-/// `PUT /v1/apps/{name}/secrets` — Set (bulk) secrets for an app.
+/// `PUT /v1/apps/{name}/secrets`, Set (bulk) secrets for an app.
 ///
 /// Each key name is validated. Values are stored but never returned in the
-/// response — only the list of keys that were set.
+/// response, only the list of keys that were set.
 async fn handle_set_secrets(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -1159,7 +1159,7 @@ async fn handle_set_secrets(
         let apps = state.apps.read().await;
         if !apps.contains_key(&name) {
             return Err(AppError::NotFound(format!(
-                "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+                "app '{}' not found, register it via POST /v1/apps or run `slip apply`",
                 name
             )));
         }
@@ -1196,7 +1196,7 @@ async fn handle_set_secrets(
     Ok((StatusCode::OK, Json(SetSecretsResponse { set: set_keys })))
 }
 
-/// `DELETE /v1/apps/{name}/secrets/{key}` — Remove a single secret.
+/// `DELETE /v1/apps/{name}/secrets/{key}`, Remove a single secret.
 async fn handle_remove_secret(
     State(state): State<Arc<AppState>>,
     Path((name, key)): Path<(String, String)>,
@@ -1206,7 +1206,7 @@ async fn handle_remove_secret(
         let apps = state.apps.read().await;
         if !apps.contains_key(&name) {
             return Err(AppError::NotFound(format!(
-                "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+                "app '{}' not found, register it via POST /v1/apps or run `slip apply`",
                 name
             )));
         }
@@ -1255,7 +1255,7 @@ pub struct SetDeployKeyResponse {
     pub message: Option<String>,
 }
 
-/// `PUT /v1/apps/{name}/key` — Generate or rotate a per-app deploy key.
+/// `PUT /v1/apps/{name}/key`, Generate or rotate a per-app deploy key.
 ///
 /// The key is stored in the secrets store (not in app TOML) with 0o600 perms.
 /// It is returned **once** in the response body.  The caller is responsible
@@ -1272,7 +1272,7 @@ async fn handle_set_deploy_key(
         let apps = state.apps.read().await;
         if !apps.contains_key(&name) {
             return Err(AppError::NotFound(format!(
-                "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+                "app '{}' not found, register it via POST /v1/apps or run `slip apply`",
                 name
             )));
         }
@@ -1294,15 +1294,15 @@ async fn handle_set_deploy_key(
             (Some(new_key), true, None)
         }
         Some(_) => {
-            // Key exists but rotate not requested — do not reveal the key.
+            // Key exists but rotate not requested, do not reveal the key.
             (
                 None,
                 false,
-                Some("deploy key already exists — pass rotate=true to rotate it".to_string()),
+                Some("deploy key already exists, pass rotate=true to rotate it".to_string()),
             )
         }
         None => {
-            // No existing key — create one.
+            // No existing key, create one.
             let new_key = state
                 .secrets_store
                 .set_deploy_key(&name)
@@ -1333,7 +1333,7 @@ async fn handle_set_deploy_key(
 /// Request body for `PUT /v1/registries/{url}`.
 #[derive(Debug, Deserialize)]
 pub struct SetRegistryCredRequest {
-    /// Username for the registry (optional — anonymous pull if absent).
+    /// Username for the registry (optional, anonymous pull if absent).
     #[serde(default)]
     pub username: Option<String>,
     /// Password/token. Required (use `slip registry login` to set it).
@@ -1350,7 +1350,7 @@ pub struct SetRegistryCredResponse {
     pub username: Option<String>,
 }
 
-/// `PUT /v1/registries/{url}` — store (or rotate) a registry credential.
+/// `PUT /v1/registries/{url}`, store (or rotate) a registry credential.
 ///
 /// The `{url}` path segment is host[:port] (no scheme, no path). The
 /// password is written to the secrets store under the synthetic `__registry`
@@ -1366,7 +1366,7 @@ async fn handle_set_registry_credential(
     // Validate URL via normalize (rejects path components / bad shape).
     let normalized = crate::config::normalize_registry_url(&url).map_err(|e| {
         AppError::BadRequest(format!(
-            "invalid registry url '{url}' — {e}. \
+            "invalid registry url '{url}', {e}. \
              Use host[:port] only (e.g. ghcr.io). See `slip registry login --help`."
         ))
     })?;
@@ -1387,7 +1387,7 @@ async fn handle_set_registry_credential(
     ))
 }
 
-/// `DELETE /v1/registries/{url}` — remove a stored registry credential.
+/// `DELETE /v1/registries/{url}`, remove a stored registry credential.
 ///
 /// 404 if no credential is stored for the (normalized) URL.
 async fn handle_remove_registry_credential(
@@ -1395,7 +1395,7 @@ async fn handle_remove_registry_credential(
     Path(url): Path<String>,
 ) -> Result<StatusCode, AppError> {
     let normalized = crate::config::normalize_registry_url(&url)
-        .map_err(|e| AppError::BadRequest(format!("invalid registry url '{url}' — {e}")))?;
+        .map_err(|e| AppError::BadRequest(format!("invalid registry url '{url}', {e}")))?;
     let removed = state
         .secrets_store
         .remove_registry_credential(&normalized)
@@ -1405,7 +1405,7 @@ async fn handle_remove_registry_credential(
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound(format!(
-            "no credential stored for registry '{normalized}' — \
+            "no credential stored for registry '{normalized}', \
              run `slip registry list` to see stored registries"
         )))
     }
@@ -1427,7 +1427,7 @@ pub struct RegistryListResponse {
     pub credential_source: String,
 }
 
-/// `GET /v1/registries` — list all known registries (TOML-declared + store).
+/// `GET /v1/registries`, list all known registries (TOML-declared + store).
 ///
 /// Merges the two sources. Never includes password/token material.
 async fn handle_list_registries(
@@ -1530,7 +1530,7 @@ async fn handle_deploy(
         .cloned()
         .ok_or_else(|| {
             AppError::NotFound(format!(
-                "unknown app: {} — register it via POST /v1/apps or run `slip apply`",
+                "unknown app: {}, register it via POST /v1/apps or run `slip apply`",
                 request.app
             ))
         })?;
@@ -1549,7 +1549,7 @@ async fn handle_deploy(
         return Err(AppError::Unauthorized("invalid signature".to_string()));
     }
 
-    // 7. Resolve image (optional in request — fall back to app config).
+    // 7. Resolve image (optional in request, fall back to app config).
     let resolved_image = request
         .image
         .clone()
@@ -1709,7 +1709,7 @@ async fn handle_deploy(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        // Lock guard is moved into the task — released when the task ends.
+        // Lock guard is moved into the task, released when the task ends.
         let _guard = guard;
         execute_deploy(state_clone, deploy_ctx).await;
     });
@@ -1894,7 +1894,7 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
 
 /// `GET /v1/apps/{name}/status`
 ///
-/// `GET /v1/apps/{name}/logs` — stream container logs as NDJSON (chunked).
+/// `GET /v1/apps/{name}/logs`, stream container logs as NDJSON (chunked).
 ///
 /// Resolves containers by the `slip.app` label (catches both blue-green
 /// overlap containers), merges their log streams via `futures_util::stream::select`,
@@ -1902,8 +1902,8 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
 /// codes (404/400); mid-stream errors are emitted as NDJSON error lines.
 ///
 /// Query params:
-/// - `since` — duration string like "1h", "5m30s" (converted to Unix timestamp)
-/// - `follow` — stream new lines as they arrive (default false)
+/// - `since`, duration string like "1h", "5m30s" (converted to Unix timestamp)
+/// - `follow`, stream new lines as they arrive (default false)
 async fn handle_app_logs(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -1914,7 +1914,7 @@ async fn handle_app_logs(
         let apps = state.apps.read().await;
         if !apps.contains_key(&name) {
             return AppError::NotFound(format!(
-                "app '{name}' not found — register it via POST /v1/apps or run `slip apply`"
+                "app '{name}' not found, register it via POST /v1/apps or run `slip apply`"
             ))
             .into_response();
         }
@@ -1926,7 +1926,7 @@ async fn handle_app_logs(
             Ok(ts) => Some(ts),
             Err(msg) => {
                 return AppError::BadRequest(format!(
-                    "invalid --since '{s}': {msg} — use formats like 1h, 5m, 30s, 5m30s"
+                    "invalid --since '{s}': {msg}, use formats like 1h, 5m, 30s, 5m30s"
                 ))
                 .into_response();
             }
@@ -1950,7 +1950,7 @@ async fn handle_app_logs(
 
     if containers.is_empty() {
         return AppError::NotFound(format!(
-            "app '{name}' has no running containers — run `slip deploy` to start one"
+            "app '{name}' has no running containers, run `slip deploy` to start one"
         ))
         .into_response();
     }
@@ -2042,7 +2042,7 @@ async fn handle_app_logs(
                     }
                 };
                 if tx.send(Ok(bytes)).await.is_err() {
-                    // Receiver dropped (client disconnected) — stop streaming.
+                    // Receiver dropped (client disconnected), stop streaming.
                     break;
                 }
             }
@@ -2133,7 +2133,7 @@ async fn handle_app_status(
     // Verify app exists and get config.
     let app_cfg = state.apps.read().await.get(&name).cloned().ok_or_else(|| {
         AppError::NotFound(format!(
-            "app '{}' not found — register it via POST /v1/apps or run `slip apply`",
+            "app '{}' not found, register it via POST /v1/apps or run `slip apply`",
             name
         ))
     })?;
@@ -2151,7 +2151,7 @@ async fn handle_app_status(
         None => "not_deployed",
     };
 
-    // ── Container state via label query (2s timeout — a hanging runtime
+    // ── Container state via label query (2s timeout, a hanging runtime
     //    socket must not block the status response) ─────────────────────────
     let container_query_timeout = std::time::Duration::from_secs(2);
     let container_state = if let Some(ref rs) = runtime_state {
@@ -2169,7 +2169,7 @@ async fn handle_app_status(
                 Err(_) => Some("unknown".to_string()),
             }
         } else {
-            // No container_id — query by label for the app.
+            // No container_id, query by label for the app.
             match tokio::time::timeout(
                 container_query_timeout,
                 state.runtime.list_by_label("slip.app", &name),
@@ -2322,7 +2322,7 @@ async fn handle_app_status(
                 Err(_) => Some(true),
             }
         } else {
-            // No last_applied recorded — can't determine drift.
+            // No last_applied recorded, can't determine drift.
             None
         }
     } else {
@@ -2393,7 +2393,7 @@ fn validate_renew_host(host: &str) -> Result<(), AppError> {
             IpAddr::V4(v4) => {
                 if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
                     return Err(AppError::BadRequest(format!(
-                        "host '{host}' is a loopback/link-local/unspecified IP — \
+                        "host '{host}' is a loopback/link-local/unspecified IP, \
                          renew is not permitted against metadata endpoints"
                     )));
                 }
@@ -2401,7 +2401,7 @@ fn validate_renew_host(host: &str) -> Result<(), AppError> {
             IpAddr::V6(v6) => {
                 if v6.is_loopback() || v6.is_unspecified() {
                     return Err(AppError::BadRequest(format!(
-                        "host '{host}' is a loopback/unspecified IPv6 — \
+                        "host '{host}' is a loopback/unspecified IPv6, \
                          renew is not permitted against metadata endpoints"
                     )));
                 }
@@ -2412,34 +2412,31 @@ fn validate_renew_host(host: &str) -> Result<(), AppError> {
     // Hostname: must contain at least one dot (reject bare names).
     if !host.contains('.') {
         return Err(AppError::BadRequest(format!(
-            "host '{host}' is not a valid FQDN — must contain at least one dot"
+            "host '{host}' is not a valid FQDN, must contain at least one dot"
         )));
     }
     // Reject obvious SSRF targets.
     if host == "metadata.google.internal" || host.ends_with(".metadata") {
         return Err(AppError::BadRequest(format!(
-            "host '{host}' looks like a cloud metadata endpoint — refused"
+            "host '{host}' looks like a cloud metadata endpoint, refused"
         )));
     }
     Ok(())
 }
 
-/// `POST /v1/tls/renew` — non-destructive, authenticated TLS certificate
+/// `POST /v1/tls/renew`, non-destructive, authenticated TLS certificate
 /// renewal via `renewal_window_ratio` bump-and-revert.
 ///
 /// For Tailscale-managed hosts, returns a successful no-op (exit 0).
-/// For ACME-issuer hosts:
-/// 1. Acquire per-host lock (concurrent renew → 409 Conflict).
-/// 2. Validate host (SSRF defense).
-/// 3. Probe the before-state cert (TLS handshake with SNI → fingerprint + notAfter).
-/// 4. Bump `renewal_window_ratio` to 1.0 + reload.
-/// 5. Poll the external cert until fingerprint changes and/or notAfter advances.
-/// 6. If `restart_caddy` is set and ratio-bump didn't prove renewal, restart
-///    Caddy (bounded, prescriptive error if systemd unavailable), wait for
-///    admin readiness, then re-poll for cert proof.
-/// 7. Guard/finally: ALWAYS revert the ratio (success, failure, timeout).
-/// 8. `renewed: true` only if cert probe proves renewal.
-/// 9. If restoration fails, the whole operation fails loudly.
+/// For ACME-issuer hosts, the handler acquires a per-host lock (concurrent
+/// renew gets 409 Conflict), validates the host (SSRF defense), probes the
+/// before-state cert, bumps `renewal_window_ratio` to 1.0 and reloads, then
+/// polls the external cert until the fingerprint or notAfter advances. If
+/// `restart_caddy` is set and the ratio-bump did not prove renewal, it
+/// restarts Caddy (bounded, prescriptive error if systemd unavailable),
+/// waits for admin readiness, then re-polls. The guard/finally block
+/// ALWAYS reverts the ratio. `renewed: true` only if the cert probe proves
+/// renewal. If restoration fails, the whole operation fails loudly.
 ///
 /// The renewal body (bump→probe→restore) runs in a detached tokio task so
 /// that HTTP client disconnection does not cancel restoration. The handler
@@ -2456,7 +2453,7 @@ async fn handle_tls_renew(
 
     // Acquire per-host renew lock (concurrent renew → 409).
     // Use try_lock_owned() so the OwnedMutexGuard can be moved into the
-    // detached task — the lock outlives handler cancellation and protects
+    // detached task, the lock outlives handler cancellation and protects
     // the entire renewal cycle, not just the handler's scope.
     let lock = {
         state
@@ -2467,7 +2464,7 @@ async fn handle_tls_renew(
     };
     let guard = lock.try_lock_owned().map_err(|_| {
         AppError::Conflict(format!(
-            "a TLS renewal for '{host}' is already in progress — wait for it to complete"
+            "a TLS renewal for '{host}' is already in progress, wait for it to complete"
         ))
     })?;
 
@@ -2489,7 +2486,7 @@ async fn handle_tls_renew(
                 restored: true,
                 managed_by: Some("tailscale".to_string()),
                 message: Some(format!(
-                    "host {host} uses the Tailscale certificate manager — \
+                    "host {host} uses the Tailscale certificate manager, \
                      renewal is handled automatically by tailscaled; no action needed"
                 )),
                 elapsed_ms: start.elapsed().as_millis() as u64,
@@ -2506,7 +2503,7 @@ async fn handle_tls_renew(
 
     let original_policy = original_policy.ok_or_else(|| {
         AppError::NotFound(format!(
-            "no TLS policy found for {host} — run `slip apply` to register it"
+            "no TLS policy found for {host}, run `slip apply` to register it"
         ))
     })?;
 
@@ -2582,7 +2579,7 @@ async fn handle_tls_renew(
         ))),
         RenewalOutcome::RestorationFailed { detail } => Err(AppError::Internal(
             crate::caddy::redact_external_error(&format!(
-                "TLS renewal for {host}: renewal_window_ratio revert FAILED — \
+                "TLS renewal for {host}: renewal_window_ratio revert FAILED, \
                  Caddy may be left with ratio=1.0 which will hit LE rate limits. \
                  Manual fix: PATCH the policy for {host} to restore \
                  renewal_window_ratio, then reload Caddy. Error: {detail}"
@@ -2605,7 +2602,7 @@ enum RenewalOutcome {
     NotProven { restored: bool },
     /// Renewal timed out.
     Timeout { restored: bool },
-    /// Ratio restoration failed — critical, needs manual intervention.
+    /// Ratio restoration failed, critical, needs manual intervention.
     RestorationFailed { detail: String },
     /// Other error.
     Error { detail: String },
@@ -2684,7 +2681,7 @@ async fn run_renewal_cycle(
     if !renewed && restart_caddy {
         tracing::info!(
             host = host,
-            "ratio-bump did not prove renewal — restarting Caddy"
+            "ratio-bump did not prove renewal, restarting Caddy"
         );
         match restart_caddy_bounded().await {
             Ok(()) => {
@@ -2743,7 +2740,7 @@ async fn run_renewal_cycle(
                         error = %e,
                         "post-restore verification read failed (non-fatal)"
                     );
-                    // Don't fail on read error — the restore itself succeeded.
+                    // Don't fail on read error, the restore itself succeeded.
                 }
             }
         }
@@ -2751,7 +2748,7 @@ async fn run_renewal_cycle(
             return RenewalOutcome::RestorationFailed {
                 detail: format!(
                     "failed to restore renewal_window_ratio for {host} \
-                     (was Some={:?}) — Caddy may be left with ratio=1.0",
+                     (was Some={:?}), Caddy may be left with ratio=1.0",
                     original_ratio
                 ),
             };
@@ -2826,18 +2823,16 @@ async fn restart_caddy_bounded() -> Result<(), String> {
     match result {
         Ok(Ok(Ok(out))) if out.status == 0 => Ok(()),
         Ok(Ok(Ok(out))) => Err(format!(
-            "systemctl restart caddy exited {} — \
+            "systemctl restart caddy exited {}, \
              slip may not own the systemd lifecycle; restart manually: systemctl restart caddy. \
              stderr: {}",
             out.status,
             out.stderr.chars().take(200).collect::<String>()
         )),
-        Ok(Ok(Err(e))) => Err(format!(
-            "cannot run systemctl: {e} — restart Caddy manually"
-        )),
+        Ok(Ok(Err(e))) => Err(format!("cannot run systemctl: {e}, restart Caddy manually")),
         Ok(Err(e)) => Err(format!("task join error: {e}")),
         Err(_) => {
-            Err("systemctl restart caddy timed out (30s) — restart Caddy manually".to_string())
+            Err("systemctl restart caddy timed out (30s), restart Caddy manually".to_string())
         }
     }
 }
@@ -2940,7 +2935,7 @@ async fn handle_preview_teardown(
     // Validate app exists.
     if !state.apps.read().await.contains_key(&app) {
         return Err(AppError::NotFound(format!(
-            "unknown app: {app} — register it via POST /v1/apps or run `slip apply`"
+            "unknown app: {app}, register it via POST /v1/apps or run `slip apply`"
         )));
     }
 
@@ -2973,7 +2968,7 @@ async fn handle_list_previews(
     // Validate app exists.
     if !state.apps.read().await.contains_key(&app) {
         return Err(AppError::NotFound(format!(
-            "unknown app: {app} — register it via POST /v1/apps or run `slip apply`"
+            "unknown app: {app}, register it via POST /v1/apps or run `slip apply`"
         )));
     }
 
@@ -2999,7 +2994,7 @@ async fn handle_preview_status(
     // Validate app exists.
     if !state.apps.read().await.contains_key(&app) {
         return Err(AppError::NotFound(format!(
-            "unknown app: {app} — register it via POST /v1/apps or run `slip apply`"
+            "unknown app: {app}, register it via POST /v1/apps or run `slip apply`"
         )));
     }
 
@@ -3023,7 +3018,7 @@ async fn handle_preview_teardown_all(
     // Validate app exists.
     if !state.apps.read().await.contains_key(&app) {
         return Err(AppError::NotFound(format!(
-            "unknown app: {app} — register it via POST /v1/apps or run `slip apply`"
+            "unknown app: {app}, register it via POST /v1/apps or run `slip apply`"
         )));
     }
 
@@ -3161,7 +3156,7 @@ mod tests {
         let secrets_tmp = tempfile::tempdir().expect("tempdir for secrets");
         let secrets_path = secrets_tmp.path().to_path_buf();
         // Leak the TempDir so it survives for the test duration.
-        // This is acceptable in test code — the OS cleans up /tmp on reboot.
+        // This is acceptable in test code, the OS cleans up /tmp on reboot.
         Box::leak(Box::new(secrets_tmp));
 
         Arc::new(AppState {
@@ -3264,7 +3259,7 @@ mod tests {
 
     #[test]
     fn test_deploy_request_without_image_field_defaults_empty() {
-        // image is optional — defaults to None
+        // image is optional, defaults to None
         let json = r#"{"app":"myapp","tag":"v1.0.0"}"#;
         let req: crate::api::DeployRequest = serde_json::from_str(json).unwrap();
         assert!(
@@ -3365,7 +3360,7 @@ mod tests {
         let app = build_router(state);
 
         let body = deploy_body("nonexistent", APP_IMAGE, "v1.0.0");
-        // We sign with global secret because app doesn't exist (any secret won't matter —
+        // We sign with global secret because app doesn't exist (any secret won't matter .
         // 404 is returned before signature check, but we need valid sig to reach the right
         // error path.  Actually per the flow, lookup happens BEFORE signature check, so
         // we'll get 404 regardless of the signature.)
@@ -3458,7 +3453,7 @@ mod tests {
         let deploy_locks: DashMap<String, Arc<Mutex<()>>> = DashMap::new();
         // Pre-insert a locked mutex so the handler cannot acquire it.
         let locked = Arc::new(Mutex::new(()));
-        // Acquire an owned guard — this keeps the lock held for the lifetime of `_guard`.
+        // Acquire an owned guard, this keeps the lock held for the lifetime of `_guard`.
         let _guard = locked.clone().try_lock_owned().unwrap();
 
         // Insert it so the handler sees the lock as taken.
@@ -3517,7 +3512,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deploy_global_secret_fallback() {
-        // App has no per-app secret — should fall back to global secret.
+        // App has no per-app secret, should fall back to global secret.
         let mut apps = HashMap::new();
         apps.insert(APP_NAME.to_string(), test_app_config(None));
 
@@ -3564,7 +3559,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
-    // ── GET /v1/status — no deploys ───────────────────────────────────────────
+    // ── GET /v1/status, no deploys ───────────────────────────────────────────
 
     #[tokio::test]
     async fn test_status_no_deploys() {
@@ -3596,7 +3591,7 @@ mod tests {
         assert!(testapp["port"].is_null());
     }
 
-    // ── GET /v1/status — app with running status ──────────────────────────────
+    // ── GET /v1/status, app with running status ──────────────────────────────
 
     #[tokio::test]
     async fn test_status_with_running_app() {
@@ -3643,7 +3638,7 @@ mod tests {
         assert_eq!(testapp["port"], 54321);
     }
 
-    // ── GET /v1/status — includes deploy_id/triggered_by from cache ────────────
+    // ── GET /v1/status, includes deploy_id/triggered_by from cache ────────────
 
     #[tokio::test]
     async fn test_status_includes_deploy_metadata() {
@@ -3712,7 +3707,7 @@ mod tests {
         assert_eq!(testapp["triggered_by"], "webhook");
     }
 
-    // ── GET /v1/deploys/:deploy_id — found ────────────────────────────────────
+    // ── GET /v1/deploys/:deploy_id, found ────────────────────────────────────
 
     #[tokio::test]
     async fn test_deploy_status_found() {
@@ -3764,7 +3759,7 @@ mod tests {
         assert!(payload["error"].is_null());
     }
 
-    // ── GET /v1/deploys/:deploy_id — not found ────────────────────────────────
+    // ── GET /v1/deploys/:deploy_id, not found ────────────────────────────────
 
     #[tokio::test]
     async fn test_deploy_status_not_found() {
@@ -3905,7 +3900,7 @@ mod tests {
         assert!(payload.error.contains("invalid characters"));
     }
 
-    // ── GET /v1/previews/:app — empty list ────────────────────────────────────
+    // ── GET /v1/previews/:app, empty list ────────────────────────────────────
 
     #[tokio::test]
     async fn test_list_previews_empty() {
@@ -3928,7 +3923,7 @@ mod tests {
         assert!(payload.is_empty(), "should return empty list");
     }
 
-    // ── GET /v1/previews/:app — with previews ─────────────────────────────────
+    // ── GET /v1/previews/:app, with previews ─────────────────────────────────
 
     #[tokio::test]
     async fn test_list_previews_with_entries() {
@@ -3975,7 +3970,7 @@ mod tests {
                 deploy_id: None,
             },
         );
-        // Different app — should not appear in the list for APP_NAME.
+        // Different app, should not appear in the list for APP_NAME.
         state.preview_states.insert(
             "otherapp:pr-1".to_string(),
             PreviewState {
@@ -4020,7 +4015,7 @@ mod tests {
         assert!(ids.contains(&"pr-2"), "should contain pr-2");
     }
 
-    // ── GET /v1/previews/:app/:preview_id — found ─────────────────────────────
+    // ── GET /v1/previews/:app/:preview_id, found ─────────────────────────────
 
     #[tokio::test]
     async fn test_preview_status_found() {
@@ -4072,7 +4067,7 @@ mod tests {
         assert_eq!(payload["port"], 55999);
     }
 
-    // ── GET /v1/previews/:app/:preview_id — not found ─────────────────────────
+    // ── GET /v1/previews/:app/:preview_id, not found ─────────────────────────
 
     #[tokio::test]
     async fn test_preview_status_not_found() {
@@ -4095,7 +4090,7 @@ mod tests {
         assert!(payload.error.contains("not found"));
     }
 
-    // ── DELETE /v1/previews/:app/:preview_id — missing signature → 401 ────────
+    // ── DELETE /v1/previews/:app/:preview_id, missing signature → 401 ────────
 
     #[tokio::test]
     async fn test_preview_teardown_missing_signature() {
@@ -4112,7 +4107,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
-    // ── DELETE /v1/previews/:app/:preview_id — invalid signature → 401 ────────
+    // ── DELETE /v1/previews/:app/:preview_id, invalid signature → 401 ────────
 
     #[tokio::test]
     async fn test_preview_teardown_invalid_signature() {
@@ -4297,11 +4292,11 @@ mod tests {
         );
     }
 
-    // ── DELETE /v1/previews/:app/:preview_id — valid, no preview → 200 ────────
+    // ── DELETE /v1/previews/:app/:preview_id, valid, no preview → 200 ────────
 
     #[tokio::test]
     async fn test_preview_teardown_valid_nonexistent_returns_ok() {
-        // teardown_preview is idempotent — deleting a non-existent preview → 200.
+        // teardown_preview is idempotent, deleting a non-existent preview → 200.
         let state = create_test_state();
         let app = build_router(state);
 
@@ -4991,7 +4986,7 @@ mod tests {
         let payload: crate::api::SetSecretsResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(payload.set, vec!["API_KEY", "DB_URL"]); // sorted
 
-        // List secrets — should return key names only (use same state)
+        // List secrets, should return key names only (use same state)
         let request = Request::builder()
             .method("GET")
             .uri(format!("/v1/apps/{APP_NAME}/secrets"))
@@ -5296,7 +5291,7 @@ mod tests {
         let state = create_test_state();
         let app = build_router(state);
 
-        // DELETE /v1/previews/{app} with Bearer token — no previews exist.
+        // DELETE /v1/previews/{app} with Bearer token, no previews exist.
         let request = Request::builder()
             .method("DELETE")
             .uri(format!("/v1/previews/{APP_NAME}"))
@@ -5494,7 +5489,7 @@ mod tests {
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        // Second call: same app, no rotate — must NOT return the key.
+        // Second call: same app, no rotate, must NOT return the key.
         let body = serde_json::json!({}).to_string();
         let request = Request::builder()
             .method("PUT")
@@ -5551,7 +5546,7 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let first_key = payload["key"].as_str().unwrap().to_string();
 
-        // Second call: rotate=true — must return a NEW key.
+        // Second call: rotate=true, must return a NEW key.
         let body = serde_json::json!({"rotate": true}).to_string();
         let request = Request::builder()
             .method("PUT")
@@ -5916,7 +5911,7 @@ path = "/tmp/slip-test"
             "secrets should be settable immediately"
         );
 
-        // Step 4: Simulate restart — re-load config from disk
+        // Step 4: Simulate restart, re-load config from disk
         let (_reloaded_cfg, reloaded_apps) =
             crate::config::load_config(&config_dir).expect("should reload config from disk");
 
@@ -6552,7 +6547,7 @@ path = "/tmp/slip-test"
         assert_eq!(payload["status"], "deploying");
         assert_eq!(payload["tag"], "v2.0.0");
         // The deploy metadata shows the stuck phase (non-terminal) with no
-        // finished_at — this is the diagnostic that tells an operator the
+        // finished_at, this is the diagnostic that tells an operator the
         // deploy is in progress and hasn't completed.
         assert_eq!(payload["deploy_id"], "dep_stuck001");
         assert_eq!(payload["last_deploy"]["deploy_id"], "dep_stuck001");
@@ -6629,7 +6624,7 @@ path = "/tmp/slip-test"
     }
 
     /// Sync probe respects `expect_status = "200"` and rejects an initial 307
-    /// (no redirects followed). AC12 — single shared policy.
+    /// (no redirects followed). AC12, single shared policy.
     #[tokio::test]
     async fn status_app_respects_expect_status_200_rejects_307() {
         let state = create_test_state();
@@ -6691,7 +6686,7 @@ path = "/tmp/slip-test"
         assert_eq!(payload["health"]["status"], "unhealthy");
     }
 
-    /// Sync probe default (no `expect_status`) accepts 307 — the default
+    /// Sync probe default (no `expect_status`) accepts 307, the default
     /// `200-399` is applied at probe time. AC12 / AC7.
     #[tokio::test]
     async fn status_app_default_accepts_307() {
@@ -6749,7 +6744,7 @@ path = "/tmp/slip-test"
         let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             payload["health"]["status"], "healthy",
-            "default 200-399 must accept 307 — no redirect chasing"
+            "default 200-399 must accept 307, no redirect chasing"
         );
     }
 
@@ -6963,20 +6958,20 @@ path = "/tmp/slip-test"
     /// `parse_since_duration` parses valid duration strings.
     #[test]
     fn test_parse_since_duration_valid() {
-        // "30s" — 30 seconds ago
+        // "30s", 30 seconds ago
         let now = chrono::Utc::now().timestamp();
         let ts = parse_since_duration("30s").unwrap();
         assert_eq!(ts, now - 30);
 
-        // "5m" — 300 seconds ago
+        // "5m", 300 seconds ago
         let ts = parse_since_duration("5m").unwrap();
         assert_eq!(ts, now - 300);
 
-        // "1h" — 3600 seconds ago
+        // "1h", 3600 seconds ago
         let ts = parse_since_duration("1h").unwrap();
         assert_eq!(ts, now - 3600);
 
-        // "5m30s" — combined
+        // "5m30s", combined
         let ts = parse_since_duration("5m30s").unwrap();
         assert_eq!(ts, now - 330);
     }
@@ -7252,14 +7247,23 @@ path = "/tmp/slip-test"
         use std::sync::Arc;
         use tokio::sync::Mutex;
 
+        // The policies Vec models the `policies` array; `key_exists` models
+        // whether the `policies` key exists in Caddy's config tree. PUT is
+        // create-only (409 if the key exists, regardless of emptiness) .
+        // matching real Caddy semantics, not the old `is_empty()` check.
         let policies = Arc::new(Mutex::new(vec![policy]));
+        let key_exists = Arc::new(Mutex::new(true));
         let p_get = policies.clone();
         let p_patch_idx = policies.clone();
         let p_del_idx = policies.clone();
         let p_del_ratio = policies.clone();
         let p_patch_id = policies.clone();
+        let p_del_id = policies.clone();
 
         let p_post = policies.clone();
+        let p_put = policies.clone();
+        let k_put = key_exists.clone();
+        let p_automation = policies.clone();
         let app = Router::new()
             .route(
                 "/config/apps/tls/automation/policies",
@@ -7276,6 +7280,26 @@ path = "/tmp/slip-test"
                         let mut p = p.lock().await;
                         p.push(body);
                         StatusCode::OK
+                    }
+                })
+                .put(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let p = p_put.clone();
+                    let k = k_put.clone();
+                    async move {
+                        let mut k = k.lock().await;
+                        // Create-only: 409 if the key exists (populated or
+                        // empty), matching real Caddy. The old `is_empty()`
+                        // check returned OK for an existing-but-empty key.
+                        if *k {
+                            StatusCode::CONFLICT
+                        } else {
+                            *k = true;
+                            let mut p = p.lock().await;
+                            if let Some(arr) = body.as_array() {
+                                *p = arr.clone();
+                            }
+                            StatusCode::OK
+                        }
                     }
                 }),
             )
@@ -7364,12 +7388,45 @@ path = "/tmp/slip-test"
                             StatusCode::OK
                         }
                     },
+                )
+                .delete(
+                    move |axum::extract::Path(id): axum::extract::Path<String>| {
+                        let p = p_del_id.clone();
+                        async move {
+                            let mut p = p.lock().await;
+                            let before = p.len();
+                            p.retain(|policy| {
+                                policy
+                                    .get("@id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s != id)
+                                    .unwrap_or(true)
+                            });
+                            if p.len() < before {
+                                StatusCode::OK
+                            } else {
+                                StatusCode::NOT_FOUND
+                            }
+                        }
+                    },
                 ),
             )
             .route(
                 "/config/apps/tls/automation",
-                axum::routing::post(|axum::Json(_body): axum::Json<serde_json::Value>| async {
-                    StatusCode::OK
+                axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let p = p_automation.clone();
+                    async move {
+                        // Faithful replace semantics: the `policies` field in
+                        // the body replaces the entire policies array (the
+                        // v0.1.0 destructive primitive). The renew path no
+                        // longer issues this request, but the mock models
+                        // real Caddy so a regression would be caught.
+                        if let Some(policies) = body.get("policies") {
+                            let mut p = p.lock().await;
+                            *p = policies.as_array().cloned().unwrap_or_default();
+                        }
+                        StatusCode::OK
+                    }
                 }),
             )
             .route(
@@ -7412,7 +7469,7 @@ path = "/tmp/slip-test"
         let state = create_test_state_with_caddy(&caddy_url);
         let app = build_router(state);
 
-        // Send the first renew request — it will enter the detached task
+        // Send the first renew request, it will enter the detached task
         // and hold the lock while polling (probe_cert will fail quickly
         // since there's no TLS server, but the poll loop sleeps 5s).
         let app1 = app.clone();
@@ -7430,7 +7487,7 @@ path = "/tmp/slip-test"
         // Give the first request time to acquire the lock and enter the task.
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-        // Send a second renew — should get 409 because the lock is held.
+        // Send a second renew, should get 409 because the lock is held.
         let request2 = Request::builder()
             .method("POST")
             .uri("/v1/tls/renew")
@@ -7446,7 +7503,7 @@ path = "/tmp/slip-test"
         );
 
         // Clean up the first request (it will eventually time out or error).
-        // We don't need to await it — just let it finish in the background.
+        // We don't need to await it, just let it finish in the background.
         first.abort();
     }
 
