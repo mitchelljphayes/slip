@@ -18,7 +18,7 @@ jobs:
           # A key on the ollama provider reaches ollama.com.
           W4H_AI_PROVIDER: ${{ secrets.OLLAMA_API_KEY && 'ollama' || '' }}
           W4H_AI_KEY: ${{ secrets.OLLAMA_API_KEY }}
-          W4H_AI_MODEL: glm-5.1
+          W4H_AI_MODEL: glm-5.2
         run: |
           body="$RUNNER_TEMP/pr-description.md"
           jq -r '.pull_request.body // empty' "$GITHUB_EVENT_PATH" > "$body"
