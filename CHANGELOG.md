@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-15
+
+First tagged release. Everything below describes changes made during
+pre-release development on `main`, so the "Changed (breaking)" entries are
+relative to earlier unreleased states rather than to a published version —
+a fresh install of 0.1.0 has nothing to migrate.
+
 ### Changed (breaking)
 
 - **`[deploy] tls` now defaults to `acme`, was `internal` (#53).** The deploy
