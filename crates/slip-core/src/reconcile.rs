@@ -614,12 +614,22 @@ mod tests {
             axum::Json(body): axum::Json<serde_json::Value>,
         ) -> StatusCode {
             let mut map = s.lock().await;
-            if let std::collections::hash_map::Entry::Occupied(mut e) = map.entry(id) {
+            if let std::collections::hash_map::Entry::Occupied(mut e) = map.entry(id.clone()) {
                 e.insert(body);
-                StatusCode::OK
-            } else {
-                StatusCode::NOT_FOUND
+                return StatusCode::OK;
             }
+            // Element-scoped PATCH on TLS policies by @id.
+            if let Some(policies) = map.get_mut("__tls_policies__")
+                && let Some(arr) = policies.as_array_mut()
+            {
+                for p in arr.iter_mut() {
+                    if p.get("@id").and_then(|v| v.as_str()) == Some(&id) {
+                        *p = body;
+                        return StatusCode::OK;
+                    }
+                }
+            }
+            StatusCode::NOT_FOUND
         }
 
         async fn mock_delete_route(
@@ -628,10 +638,19 @@ mod tests {
         ) -> StatusCode {
             let mut map = s.lock().await;
             if map.remove(&id).is_some() {
-                StatusCode::OK
-            } else {
-                StatusCode::NOT_FOUND
+                return StatusCode::OK;
             }
+            // Element-scoped DELETE on TLS policies by @id.
+            if let Some(policies) = map.get_mut("__tls_policies__")
+                && let Some(arr) = policies.as_array_mut()
+            {
+                let before = arr.len();
+                arr.retain(|p| p.get("@id").and_then(|v| v.as_str()) != Some(&id));
+                if arr.len() < before {
+                    return StatusCode::OK;
+                }
+            }
+            StatusCode::NOT_FOUND
         }
 
         async fn mock_get_route(
@@ -653,7 +672,8 @@ mod tests {
             if let Some(policies) = map.get("__tls_policies__") {
                 (StatusCode::OK, axum::Json(policies.clone()))
             } else {
-                (StatusCode::OK, axum::Json(serde_json::json!([])))
+                // Real Caddy returns 404 when the `policies` key is absent.
+                (StatusCode::NOT_FOUND, axum::Json(serde_json::json!(null)))
             }
         }
 
@@ -667,6 +687,33 @@ mod tests {
                 .or_insert(serde_json::json!([]));
             if let Some(arr) = policies.as_array_mut() {
                 arr.push(body);
+            }
+            StatusCode::OK
+        }
+
+        /// Create-only PUT on the policies array (409 if exists).
+        async fn mock_put_tls_policies(
+            State(s): State<MockState>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> StatusCode {
+            let mut map = s.lock().await;
+            if map.contains_key("__tls_policies__") {
+                StatusCode::CONFLICT
+            } else {
+                map.insert("__tls_policies__".to_string(), body);
+                StatusCode::OK
+            }
+        }
+
+        /// Faithful `POST /config/apps/tls/automation` — replaces the
+        /// `policies` sub-key (the v0.1.0 destructive primitive).
+        async fn mock_post_tls_automation(
+            State(s): State<MockState>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> StatusCode {
+            let mut map = s.lock().await;
+            if let Some(policies) = body.get("policies") {
+                map.insert("__tls_policies__".to_string(), policies.clone());
             }
             StatusCode::OK
         }
@@ -691,7 +738,13 @@ mod tests {
             )
             .route(
                 "/config/apps/tls/automation/policies",
-                get(mock_get_tls_policies).post(mock_add_tls_policy),
+                get(mock_get_tls_policies)
+                    .post(mock_add_tls_policy)
+                    .put(mock_put_tls_policies),
+            )
+            .route(
+                "/config/apps/tls/automation",
+                post(mock_post_tls_automation),
             )
             .with_state(state.clone());
 
@@ -1101,6 +1154,187 @@ mod tests {
         assert!(
             !f.error.is_empty(),
             "failure error message should be non-empty"
+        );
+    }
+
+    // ── SLIP-125: foreign TLS policy preservation across reconcile cycles ──
+
+    /// A foreign DNS-01 policy no `slip-tls-*` `@id`).
+    fn foreign_dns01_policy() -> serde_json::Value {
+        serde_json::json!({
+            "subjects": ["api.example.com"],
+            "issuers": [{
+                "module": "acme",
+                "ca": "https://acme-v02.api.letsencrypt.org/directory",
+                "challenges": {
+                    "dns": {
+                        "provider": {"name": "cloudflare", "api_token": "{env.CF_TOKEN}"}
+                    }
+                }
+            }]
+        })
+    }
+
+    /// A foreign Tailscale `get_certificate` policy.
+    fn foreign_tailscale_policy() -> serde_json::Value {
+        serde_json::json!({
+            "subjects": ["arrakeen.abyssinian-lime.ts.net"],
+            "get_certificate": [{"via": "tailscale"}]
+        })
+    }
+
+    /// Snapshot the current `__tls_policies__` array from the mock.
+    async fn snapshot_policies(state: &MockState) -> Vec<serde_json::Value> {
+        state
+            .lock()
+            .await
+            .get("__tls_policies__")
+            .and_then(|p| p.as_array())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn reconcile_preserves_foreign_tls_policies_across_two_cycles() {
+        // Pre-seed Caddy with foreign DNS-01 + Tailscale policies, then run
+        // two reconcile ticks. The foreign policies must survive both
+        // cycles byte-for-byte; Slip's own policies must converge and stay
+        // stable (no duplicates).
+        let (port, state) = start_mock_caddy().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let caddy = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        caddy.bootstrap().await.unwrap();
+
+        // Seed foreign policies.
+        let foreign_dns01 = foreign_dns01_policy();
+        let foreign_ts = foreign_tailscale_policy();
+        state.lock().await.insert(
+            "__tls_policies__".to_string(),
+            serde_json::json!([foreign_dns01.clone(), foreign_ts.clone()]),
+        );
+
+        // Build a context with a deploy config (Internal TLS) so reconcile
+        // re-applies the deploy policy each tick.
+        let ctx = ReconcileContext {
+            caddy: caddy.clone(),
+            app_states: HashMap::new(),
+            apps: HashMap::new(),
+            preview: None,
+            caddy_tls: None,
+            deploy: Some(ServerDeployConfig {
+                domain: Some("deploy.example.com".to_string()),
+                tls: TlsStrategy::Internal,
+                ..Default::default()
+            }),
+            listen_addr: "127.0.0.1:7890".to_string(),
+            acme_email: None,
+            acme_ca: None,
+        };
+        let backoff = default_backoff();
+
+        // ── Cycle 1 ──
+        reconcile_tick(&ctx, &backoff).await;
+        let after_1 = snapshot_policies(&state).await;
+        assert_eq!(after_1.len(), 3, "2 foreign + 1 slip after cycle 1");
+        // Foreign policies unchanged in order.
+        assert_eq!(&after_1[0], &foreign_dns01, "DNS-01 survives cycle 1");
+        assert_eq!(&after_1[1], &foreign_ts, "Tailscale survives cycle 1");
+        assert_eq!(
+            after_1[2]["@id"].as_str(),
+            Some("slip-tls-deploy.example.com"),
+            "Slip policy converged in cycle 1"
+        );
+
+        // ── Cycle 2 ──
+        reconcile_tick(&ctx, &backoff).await;
+        let after_2 = snapshot_policies(&state).await;
+        assert_eq!(
+            after_2.len(),
+            3,
+            "no new duplicates after cycle 2 — Slip policies converge idempotently"
+        );
+        assert_eq!(&after_2[0], &foreign_dns01, "DNS-01 survives cycle 2");
+        assert_eq!(&after_2[1], &foreign_ts, "Tailscale survives cycle 2");
+        assert_eq!(
+            after_2[2]["@id"].as_str(),
+            Some("slip-tls-deploy.example.com"),
+            "Slip policy stable across cycle 2"
+        );
+        assert_eq!(
+            after_2[2]["issuers"][0]["module"].as_str(),
+            Some("internal"),
+            "Slip policy body stable across cycle 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_preserves_deploy_tailscale_policy_across_cycles() {
+        // `[deploy] tls = "tailscale"`: the deploy-ingress Tailscale policy
+        // is Slip-owned (`slip-tls-<ts-host>`). It must remain present and
+        // stable across reconcile cycles — another app's reconciliation
+        // cannot remove it. A foreign policy for a different subject must
+        // also survive.
+        let (port, state) = start_mock_caddy().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let caddy = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        caddy.bootstrap().await.unwrap();
+
+        // Seed a foreign DNS-01 policy (different subject).
+        let foreign_dns01 = foreign_dns01_policy();
+        state.lock().await.insert(
+            "__tls_policies__".to_string(),
+            serde_json::json!([foreign_dns01.clone()]),
+        );
+
+        let deploy_host = "arrakeen.abyssinian-lime.ts.net";
+        let ctx = ReconcileContext {
+            caddy: caddy.clone(),
+            app_states: HashMap::new(),
+            apps: HashMap::new(),
+            preview: None,
+            caddy_tls: None,
+            deploy: Some(ServerDeployConfig {
+                domain: Some(deploy_host.to_string()),
+                tls: TlsStrategy::Tailscale,
+                ..Default::default()
+            }),
+            listen_addr: "127.0.0.1:7890".to_string(),
+            acme_email: None,
+            acme_ca: None,
+        };
+        let backoff = default_backoff();
+
+        // ── Cycle 1 ──
+        reconcile_tick(&ctx, &backoff).await;
+        let after_1 = snapshot_policies(&state).await;
+        assert_eq!(after_1.len(), 2, "foreign + tailscale deploy");
+        assert_eq!(&after_1[0], &foreign_dns01, "foreign DNS-01 preserved");
+        assert_eq!(
+            after_1[1]["@id"].as_str(),
+            Some("slip-tls-arrakeen.abyssinian-lime.ts.net"),
+            "Tailscale deploy policy carries stable @id"
+        );
+        assert_eq!(
+            after_1[1]["get_certificate"][0]["via"].as_str(),
+            Some("tailscale"),
+            "Tailscale get_certificate remains present"
+        );
+
+        // ── Cycle 2 ──
+        reconcile_tick(&ctx, &backoff).await;
+        let after_2 = snapshot_policies(&state).await;
+        assert_eq!(after_2.len(), 2, "no duplicates after cycle 2");
+        assert_eq!(&after_2[0], &foreign_dns01, "foreign still preserved");
+        assert_eq!(
+            after_2[1]["get_certificate"][0]["via"].as_str(),
+            Some("tailscale"),
+            "Tailscale get_certificate still present after cycle 2"
+        );
+        assert!(
+            after_2[1].get("issuers").is_none(),
+            "Tailscale policy still has no issuers after cycle 2"
         );
     }
 }

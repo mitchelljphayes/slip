@@ -7252,14 +7252,23 @@ path = "/tmp/slip-test"
         use std::sync::Arc;
         use tokio::sync::Mutex;
 
+        // The policies Vec models the `policies` array; `key_exists` models
+        // whether the `policies` key exists in Caddy's config tree. PUT is
+        // create-only (409 if the key exists, regardless of emptiness) —
+        // matching real Caddy semantics, not the old `is_empty()` check.
         let policies = Arc::new(Mutex::new(vec![policy]));
+        let key_exists = Arc::new(Mutex::new(true));
         let p_get = policies.clone();
         let p_patch_idx = policies.clone();
         let p_del_idx = policies.clone();
         let p_del_ratio = policies.clone();
         let p_patch_id = policies.clone();
+        let p_del_id = policies.clone();
 
         let p_post = policies.clone();
+        let p_put = policies.clone();
+        let k_put = key_exists.clone();
+        let p_automation = policies.clone();
         let app = Router::new()
             .route(
                 "/config/apps/tls/automation/policies",
@@ -7276,6 +7285,26 @@ path = "/tmp/slip-test"
                         let mut p = p.lock().await;
                         p.push(body);
                         StatusCode::OK
+                    }
+                })
+                .put(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let p = p_put.clone();
+                    let k = k_put.clone();
+                    async move {
+                        let mut k = k.lock().await;
+                        // Create-only: 409 if the key exists (populated or
+                        // empty), matching real Caddy. The old `is_empty()`
+                        // check returned OK for an existing-but-empty key.
+                        if *k {
+                            StatusCode::CONFLICT
+                        } else {
+                            *k = true;
+                            let mut p = p.lock().await;
+                            if let Some(arr) = body.as_array() {
+                                *p = arr.clone();
+                            }
+                            StatusCode::OK
+                        }
                     }
                 }),
             )
@@ -7364,12 +7393,45 @@ path = "/tmp/slip-test"
                             StatusCode::OK
                         }
                     },
+                )
+                .delete(
+                    move |axum::extract::Path(id): axum::extract::Path<String>| {
+                        let p = p_del_id.clone();
+                        async move {
+                            let mut p = p.lock().await;
+                            let before = p.len();
+                            p.retain(|policy| {
+                                policy
+                                    .get("@id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s != id)
+                                    .unwrap_or(true)
+                            });
+                            if p.len() < before {
+                                StatusCode::OK
+                            } else {
+                                StatusCode::NOT_FOUND
+                            }
+                        }
+                    },
                 ),
             )
             .route(
                 "/config/apps/tls/automation",
-                axum::routing::post(|axum::Json(_body): axum::Json<serde_json::Value>| async {
-                    StatusCode::OK
+                axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let p = p_automation.clone();
+                    async move {
+                        // Faithful replace semantics: the `policies` field in
+                        // the body replaces the entire policies array (the
+                        // v0.1.0 destructive primitive). The renew path no
+                        // longer issues this request, but the mock models
+                        // real Caddy so a regression would be caught.
+                        if let Some(policies) = body.get("policies") {
+                            let mut p = p.lock().await;
+                            *p = policies.as_array().cloned().unwrap_or_default();
+                        }
+                        StatusCode::OK
+                    }
                 }),
             )
             .route(

@@ -98,6 +98,17 @@ pub enum CaddyError {
     Unreachable { url: String, source: reqwest::Error },
     #[error("caddy TLS configuration failed: {0}")]
     TlsConfigFailed(String),
+    /// An unowned (non-`slip-tls-*`) Caddy TLS automation policy already
+    /// covers the subject Slip wants to manage. Slip refuses to adopt or
+    /// shadow it; the operator must reconcile the conflict explicitly.
+    #[error(
+        "TLS policy conflict on subject '{subject}': an unowned Caddy TLS automation \
+         policy already covers it (expected Slip-owned @id '{policy_id}'). \
+         Slip will not adopt or duplicate it. Either remove the foreign policy \
+         from Caddy (DELETE /config/apps/tls/automation/policies/<N>) or tag it \
+         with the expected @id so Slip can manage it."
+    )]
+    TlsPolicyConflict { subject: String, policy_id: String },
     /// Another Caddy server (from a Caddyfile) already claims the listener
     /// that slip's `slip` server needs. This is a fatal configuration error.
     #[error(
