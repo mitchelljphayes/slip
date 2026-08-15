@@ -1,0 +1,19 @@
+name: Comments
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  words-for-humans:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v10.0.0
+      - run: |
+          uvx words-for-humans==0.2.0 \
+            --diff "origin/${{ github.base_ref }}...HEAD" \
+            --format github
