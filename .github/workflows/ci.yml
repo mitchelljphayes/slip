@@ -68,7 +68,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: install.sh syntax check
-        run: sh -n install.sh
+        run: bash -n install.sh
       - name: Installer regression tests
         run: bash scripts/install-test.sh
 

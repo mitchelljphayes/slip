@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # slip installer regression test (SLIP-123)
 #
-# Verifies that install_prebuilt() verifies a downloaded Linux archive against
-# its published .sha256 sidecar even when the sidecar names the release asset
-# and the installer stores the archive as `slip.tar.gz`. Covers the success,
-# mismatch, and malformed-digest cases. Uses no live network and no root
-# installation: `fetch` is stubbed to copy local fixtures, and `install` targets
-# a temporary prefix.
+# Verifies that install_prebuilt() checks a downloaded Linux archive
+# against its published .sha256 sidecar. The sidecar names the release
+# asset, but the installer stores the archive as `slip.tar.gz`. Covers
+# the success, mismatch, and malformed-digest cases. Uses no live
+# network and no root: `fetch` is stubbed to copy local fixtures, and
+# `install` targets a temporary prefix.
 #
 # Usage:
 #   bash scripts/install-test.sh
@@ -40,7 +40,7 @@ fail() {
 }
 
 # Source the installer with the test seam so only the function definitions are
-# loaded — argument parsing, need_root, and dispatch do not run.
+# loaded: argument parsing, need_root, and dispatch do not run.
 # shellcheck source=/dev/null
 SLIP_INSTALLER_MAIN=0 . "$INSTALLER"
 
@@ -76,7 +76,7 @@ SIDECAR_MALFORMED="$FIXTURE_DIR/malformed.sha256"
 
 write_sidecar "$SIDECAR_OK" "$REAL_DIGEST"
 write_sidecar "$SIDECAR_MISMATCH" "1111111111111111111111111111111111111111111111111111111111111111"
-# Wrong-length + non-hex: a single `z` — fails the length check first.
+# Wrong-length + non-hex: a single `z`; fails the length check first.
 write_sidecar "$SIDECAR_MALFORMED" "z"
 
 # ── Stub fetch ───────────────────────────────────────────────────────────────
@@ -140,7 +140,7 @@ run_case() {
 
 # ── Cases ────────────────────────────────────────────────────────────────────
 # 1. Matching digest, sidecar names the published asset, archive stored as
-#    `slip.tar.gz` — the original SLIP-123 regression. Must succeed and install
+#    `slip.tar.gz`: the original SLIP-123 regression. Must succeed and install
 #    both binaries.
 run_case "matching" 0 "$SIDECAR_OK"
 

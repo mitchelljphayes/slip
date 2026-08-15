@@ -58,7 +58,7 @@ detect_arch() {
 # sha256_of: prints the SHA-256 digest of <file> using whichever tool is
 # available. Returns nonzero when neither sha256sum nor shasum is present.
 # Used by checksum_verify so the local archive filename is irrelevant to
-# verification — the published sidecar may name the release asset while the
+# verification: the published sidecar may name the release asset while the
 # installer stores the archive as `slip.tar.gz` (SLIP-123).
 sha256_of() {
     # sha256_of <file>
@@ -179,6 +179,79 @@ install_prebuilt() {
     info "Binaries installed to $PREFIX/bin/"
 }
 
+# ── Test seam ──────────────────────────────────────────────────────────────
+# When sourced with SLIP_INSTALLER_MAIN=0, return before top-level argument
+# parsing so tests can invoke individual functions (install_prebuilt,
+# checksum_verify, sha256_of) without running the installer or the root/need
+# guards. Normal execution (the default) is unaffected.
+if [ "${SLIP_INSTALLER_MAIN:-1}" = "0" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+# ── Parse args ─────────────────────────────────────────────────────────────
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --version)  VERSION="$2";  shift 2 ;;
+        --prefix)   PREFIX="$2";    shift 2 ;;
+        --uninstall) UNINSTALL=1;   shift   ;;
+        --help|-h)
+            cat <<EOF
+slip installer
+
+Usage:
+  install.sh [options]
+
+Options:
+  --version <tag>   Install a specific version (e.g. v0.1.0). Default: latest release.
+  --prefix <path>    Install prefix (default: /usr/local).
+  --uninstall        Remove slipd, slip, user, and directories.
+  --help             Show this help.
+
+On Linux x86_64/aarch64 this downloads the prebuilt static binary. On all
+other hosts (macOS today) — or when a prebuilt binary is not available — it
+builds from source via cargo (requires the Rust toolchain + git).
+EOF
+            exit 0
+            ;;
+        *) error "unknown option: $1" ;;
+    esac
+done
+
+# ── Uninstall ──────────────────────────────────────────────────────────────
+if [ "${UNINSTALL:-0}" = "1" ]; then
+    need_root
+    info "Uninstalling slip..."
+
+    systemctl stop slipd.service 2>/dev/null || true
+    systemctl disable slipd.service 2>/dev/null || true
+    rm -f /etc/systemd/system/slipd.service
+    systemctl daemon-reload 2>/dev/null || true
+
+    rm -f "$PREFIX/bin/slipd" "$PREFIX/bin/slip"
+
+    if id "$SERVICE_USER" &>/dev/null; then
+        userdel "$SERVICE_USER" 2>/dev/null || true
+    fi
+
+    read -rp "Remove config and data directories ($CONFIG_DIR, $DATA_DIR)? [y/N] " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        rm -rf "$CONFIG_DIR" "$DATA_DIR"
+        info "Removed $CONFIG_DIR and $DATA_DIR"
+    fi
+
+    info "slip uninstalled."
+    exit 0
+fi
+
+# ── Install ────────────────────────────────────────────────────────────────
+need_root
+need uname
+need tar
+
+# Determine target
+TARGET="$(detect_arch)"
+info "Target: $TARGET"
+
 # ── install_source: build from source via cargo ────────────────────────────
 install_source() {
     # install_source [version]
@@ -262,79 +335,6 @@ install_source() {
 
     info "Binaries installed to $PREFIX/bin/"
 }
-
-# ── Test seam ──────────────────────────────────────────────────────────────
-# When sourced with SLIP_INSTALLER_MAIN=0, return before top-level argument
-# parsing so tests can invoke individual functions (install_prebuilt,
-# checksum_verify, sha256_of) without running the installer or the root/need
-# guards. Normal execution (the default) is unaffected.
-if [ "${SLIP_INSTALLER_MAIN:-1}" = "0" ]; then
-    return 0 2>/dev/null || exit 0
-fi
-
-# ── Parse args ─────────────────────────────────────────────────────────────
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --version)  VERSION="$2";  shift 2 ;;
-        --prefix)   PREFIX="$2";    shift 2 ;;
-        --uninstall) UNINSTALL=1;   shift   ;;
-        --help|-h)
-            cat <<EOF
-slip installer
-
-Usage:
-  install.sh [options]
-
-Options:
-  --version <tag>   Install a specific version (e.g. v0.1.0). Default: latest release.
-  --prefix <path>    Install prefix (default: /usr/local).
-  --uninstall        Remove slipd, slip, user, and directories.
-  --help             Show this help.
-
-On Linux x86_64/aarch64 this downloads the prebuilt static binary. On all
-other hosts (macOS today) — or when a prebuilt binary is not available — it
-builds from source via cargo (requires the Rust toolchain + git).
-EOF
-            exit 0
-            ;;
-        *) error "unknown option: $1" ;;
-    esac
-done
-
-# ── Uninstall ──────────────────────────────────────────────────────────────
-if [ "${UNINSTALL:-0}" = "1" ]; then
-    need_root
-    info "Uninstalling slip..."
-
-    systemctl stop slipd.service 2>/dev/null || true
-    systemctl disable slipd.service 2>/dev/null || true
-    rm -f /etc/systemd/system/slipd.service
-    systemctl daemon-reload 2>/dev/null || true
-
-    rm -f "$PREFIX/bin/slipd" "$PREFIX/bin/slip"
-
-    if id "$SERVICE_USER" &>/dev/null; then
-        userdel "$SERVICE_USER" 2>/dev/null || true
-    fi
-
-    read -rp "Remove config and data directories ($CONFIG_DIR, $DATA_DIR)? [y/N] " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        rm -rf "$CONFIG_DIR" "$DATA_DIR"
-        info "Removed $CONFIG_DIR and $DATA_DIR"
-    fi
-
-    info "slip uninstalled."
-    exit 0
-fi
-
-# ── Install ────────────────────────────────────────────────────────────────
-need_root
-need uname
-need tar
-
-# Determine target
-TARGET="$(detect_arch)"
-info "Target: $TARGET"
 
 # ── Dispatch ───────────────────────────────────────────────────────────────
 if [ "$TARGET" = "source" ]; then
