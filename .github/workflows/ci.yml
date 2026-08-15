@@ -11,13 +11,24 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+# The Rust version is set in rust-toolchain.toml, not here. The runners ship
+# rustup, and the first cargo call installs the pinned toolchain along with the
+# components that file declares (rustfmt, clippy). Each job invokes
+# `cargo --version` up front so the resolved version is visible in the log
+# rather than buried in the first real step.
+#
+# To change the Rust version, edit rust-toolchain.toml. Editing this file will
+# not do it: rustup applies the toolchain file as an override, so anything
+# installed here is ignored.
+
 jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the pinned toolchain
+        run: cargo --version && rustc --version
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
 
@@ -26,9 +37,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Install the pinned toolchain
+        run: cargo --version && rustc --version
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -37,7 +47,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the pinned toolchain
+        run: cargo --version && rustc --version
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
@@ -46,9 +57,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: Install the pinned toolchain
+        run: cargo --version && rustc --version
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
 
@@ -57,7 +67,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the pinned toolchain
+        run: cargo --version && rustc --version
       - uses: Swatinem/rust-cache@v2
       - name: Install Caddy
         run: |
@@ -81,7 +92,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the pinned toolchain
+        run: cargo --version && rustc --version
       - uses: Swatinem/rust-cache@v2
       - name: Install Caddy
         run: |

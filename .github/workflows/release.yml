@@ -22,16 +22,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No `toolchain:` input — rust-toolchain.toml pins the version, and
-      # naming it here too would let the two drift apart. `targets:` is
-      # deliberately omitted for the same reason: it would install the target
-      # for the toolchain this action selects, while cargo resolves to the
-      # pinned one. cross installs the target inside its container.
-      - uses: dtolnay/rust-toolchain@stable
-
+      # No toolchain-install step: cross builds inside a container that
+      # provisions the toolchain from rust-toolchain.toml, along with the
+      # target. Installing one on the host would be ignored — rustup applies
+      # the toolchain file as an override, which is exactly how the original
+      # workflow broke (it installed the musl targets for `stable` while
+      # cargo resolved to the pinned version).
+      #
+      # To change the Rust version, edit rust-toolchain.toml.
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix: ${{ matrix.target }}
+          # `prefix` is not a valid input and was silently ignored, so both
+          # matrix jobs shared one cache key and evicted each other.
+          prefix-key: ${{ matrix.target }}
 
       # cross builds in a per-target container that carries the musl C
       # toolchain. That is required, not a convenience: libsqlite3-sys
