@@ -1,0 +1,4 @@
+profile = "code"
+
+[paths]
+"docs/**" = "prose-technical"
