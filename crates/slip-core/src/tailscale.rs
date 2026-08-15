@@ -113,13 +113,40 @@ pub async fn preflight_tailscale(
         });
     }
 
-    // 5. Caddy manager module present
-    let manager_module = caddy.has_cert_manager("tailscale").await.unwrap_or(false);
+    // 5. Caddy manager module present.
+    // API-first with binary fallback via the injected runner (SLIP-124). The
+    // admin API `/modules/` endpoint is undocumented and always 404 on standard
+    // Caddy, so the binary `caddy list-modules` is the source of truth.
+    // - Ok(true)  → module confirmed present → proceed.
+    // - Ok(false) → confirmed absent (authoritative listing without the ID) →
+    //   fail-closed with an upgrade/rebuild remedy.
+    // - Err       → unknown (API unreachable AND binary missing/nonzero) →
+    //   fail-closed with a prescriptive verify remedy. We do NOT silently claim
+    //   absence (which would block Tailscale TLS policy for the wrong reason).
+    let manager_module = match caddy
+        .has_cert_manager_with_runner("tailscale", runner)
+        .await
+    {
+        Ok(present) => present,
+        Err(e) => {
+            return Err(TailscalePreflightError {
+                check: "tailscale.manager_module",
+                remedy: format!(
+                    "could not verify Tailscale certificate manager — {e}. \
+                     Ensure `caddy` is on $PATH or the admin API is reachable, \
+                     then run `caddy list-modules` to confirm \
+                     tls.get_certificate.tailscale is compiled in"
+                ),
+            });
+        }
+    };
     if !manager_module {
         return Err(TailscalePreflightError {
             check: "tailscale.manager_module",
             remedy: "Tailscale certificate manager not found in Caddy — \
-                     Caddy v2.5+ required; upgrade Caddy"
+                     `caddy list-modules` confirms tls.get_certificate.tailscale \
+                     is absent; Caddy v2.5+ required (built-in since 2.5), \
+                     rebuild with `xcaddy build` if using a custom build"
                 .to_string(),
         });
     }

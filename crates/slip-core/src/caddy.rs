@@ -1159,6 +1159,14 @@ impl CaddyClient {
     /// Queries `GET /modules/` and checks the `tls.get_certificate` array for
     /// `name`. Used for the Tailscale manager (core in Caddy v2.5+, but
     /// verified for old-Caddy detection).
+    ///
+    /// This overload has no binary fallback (it cannot run `caddy list-modules`
+    /// without a `CommandRunner`). On admin-API failure it returns `Err`
+    /// (Unknown). Callers that can supply a runner should prefer
+    /// [`has_cert_manager_with_runner`], which falls back to the binary and
+    /// distinguishes confirmed-absence (`Ok(false)`) from unknown (`Err`).
+    ///
+    /// [`has_cert_manager_with_runner`]: CaddyClient::has_cert_manager_with_runner
     pub async fn has_cert_manager(&self, name: &str) -> Result<bool, CaddyError> {
         let modules = self.list_modules().await?;
         if let Some(managers) = modules
@@ -1170,6 +1178,97 @@ impl CaddyClient {
                 .any(|m| m.as_str().map(|s| s == name).unwrap_or(false)))
         } else {
             Ok(false)
+        }
+    }
+
+    /// Check if a certificate manager module is compiled into Caddy, with a
+    /// binary fallback via the injected `CommandRunner` (SLIP-124).
+    ///
+    /// API-first for compatibility: queries `GET /modules/` and checks the
+    /// `tls.get_certificate` array for `name`. A successful, parseable API
+    /// response is authoritative — including `Ok(false)` when the module is
+    /// confirmed absent (per AC #2: a definitive API listing without the module
+    /// ID is a fail-able absence).
+    ///
+    /// On API failure (404 on the undocumented `/modules/` endpoint, transport
+    /// error, parse error), falls back to `caddy list-modules` via `runner` —
+    /// the documented enumeration mechanism for compiled modules. The binary
+    /// is authoritative on exit 0: [`module_present_exact`] decides
+    /// `Ok(true)`/`Ok(false)`. A nonzero exit or a missing binary yields
+    /// `Err` (Unknown) — the caller (reconcile preflight) fail-closes on
+    /// `Err` rather than silently treating the module as absent.
+    ///
+    /// Return semantics (tri-state via `Result<bool>`):
+    /// - `Ok(true)` — module confirmed present (API or binary).
+    /// - `Ok(false)` — module confirmed absent (authoritative API listing or
+    ///   binary `list-modules` exit 0 without the ID).
+    /// - `Err` — unknown (API unreachable AND binary missing/nonzero). The
+    ///   caller must not treat this as absence.
+    pub async fn has_cert_manager_with_runner(
+        &self,
+        name: &str,
+        runner: &dyn crate::doctor::CommandRunner,
+    ) -> Result<bool, CaddyError> {
+        // Try GET /modules/ first (authoritative when it returns a parseable
+        // module list — standard Caddy never does for /modules/, but a
+        // hypothetical admin extension might).
+        match self.list_modules().await {
+            Ok(modules) => {
+                if let Some(managers) = modules
+                    .get("tls.get_certificate")
+                    .and_then(|m| m.as_array())
+                {
+                    return Ok(managers
+                        .iter()
+                        .any(|m| m.as_str().map(|s| s == name).unwrap_or(false)));
+                }
+                // API succeeded but the namespace was absent/empty — a
+                // definitive listing without the module → confirmed absent.
+                Ok(false)
+            }
+            Err(api_err) => {
+                // API failed (404/transport/parse). Fall back to the binary via
+                // the injected runner — the documented source of truth for
+                // compiled modules.
+                let module_id = format!("tls.get_certificate.{name}");
+                match runner.run("caddy", &["list-modules"]) {
+                    Ok(o) if o.status == 0 => {
+                        let status = crate::doctor::module_present_exact(&o.stdout, &module_id);
+                        Ok(status == crate::doctor::CheckStatus::Pass)
+                    }
+                    Ok(o) => {
+                        tracing::warn!(
+                            name = name,
+                            status = o.status,
+                            stderr = %o.stderr,
+                            "caddy list-modules failed; cannot verify cert manager presence"
+                        );
+                        Err(CaddyError::TlsConfigFailed(format!(
+                            "could not verify certificate manager '{name}': \
+                             admin API /modules/ failed ({api_err}) and \
+                             `caddy list-modules` exited {} — ensure `caddy` is \
+                             on $PATH or the admin API is reachable; \
+                             run `caddy list-modules` to confirm",
+                            o.status
+                        )))
+                    }
+                    Err(io_err) => {
+                        tracing::warn!(
+                            name = name,
+                            error = %io_err,
+                            "cannot verify cert manager: GET /modules/ failed and \
+                             `caddy` binary not runnable"
+                        );
+                        Err(CaddyError::TlsConfigFailed(format!(
+                            "could not verify certificate manager '{name}': \
+                             admin API /modules/ failed ({api_err}) and \
+                             `caddy` binary not runnable ({io_err}) — ensure \
+                             `caddy` is on $PATH or the admin API is reachable; \
+                             run `caddy list-modules` to confirm"
+                        )))
+                    }
+                }
+            }
         }
     }
 
@@ -1535,6 +1634,25 @@ mod tests {
         }
     }
 
+    /// Mock `GET /modules/`. Standard Caddy has NO `/modules/` admin endpoint
+    /// (it is undocumented and always 404), so by default this returns 404.
+    /// Tests that want to exercise the API path set the `__modules__` key in
+    /// `MockState` to a JSON object (e.g.
+    /// `{"tls.get_certificate": ["tailscale"]}`) and get a 200. This is the
+    /// seam for `has_cert_manager`/`has_dns_provider`/`list_modules` coverage
+    /// (SLIP-124).
+    async fn mock_get_modules(
+        State(state): State<MockState>,
+    ) -> (StatusCode, axum::Json<serde_json::Value>) {
+        let map = state.lock().await;
+        if let Some(modules) = map.get("__modules__") {
+            (StatusCode::OK, axum::Json(modules.clone()))
+        } else {
+            // Standard Caddy: no /modules/ route → 404.
+            (StatusCode::NOT_FOUND, axum::Json(json!(null)))
+        }
+    }
+
     /// Mock `POST /load`, stores the slip server block from the loaded config.
     async fn mock_load_config(
         State(state): State<MockState>,
@@ -1751,6 +1869,7 @@ mod tests {
         let state: MockState = Arc::new(Mutex::new(HashMap::new()));
         let app = Router::new()
             .route("/config/", get(mock_get_config))
+            .route("/modules/", get(mock_get_modules))
             .route("/load", post(mock_load_config))
             .route(
                 "/config/apps/http/servers/slip",
@@ -2398,6 +2517,199 @@ mod tests {
         assert!(
             matches!(err, CaddyError::TlsConfigFailed(_)),
             "error should be TlsConfigFailed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SLIP-124: /modules/ + has_cert_manager / has_cert_manager_with_runner
+    // -----------------------------------------------------------------------
+
+    /// A fake `CommandRunner` for the binary-fallback path. Returns canned
+    /// `CommandOutput` for the `caddy` command; any other command errs.
+    struct FakeCaddyRunner {
+        caddy_out: Option<crate::doctor::CommandOutput>,
+        caddy_err: Option<std::io::Error>,
+    }
+
+    impl crate::doctor::CommandRunner for FakeCaddyRunner {
+        fn run(&self, cmd: &str, _args: &[&str]) -> std::io::Result<crate::doctor::CommandOutput> {
+            if cmd == "caddy" {
+                if let Some(err) = &self.caddy_err {
+                    return Err(clone_io_error(err));
+                }
+                if let Some(out) = &self.caddy_out {
+                    return Ok(out.clone());
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no canned caddy output",
+                ))
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("unexpected command {cmd}"),
+                ))
+            }
+        }
+    }
+
+    /// Clone an `io::Error` by re-creating it from its kind + display string
+    /// (io::Error is not Clone).
+    fn clone_io_error(e: &std::io::Error) -> std::io::Error {
+        std::io::Error::new(e.kind(), e.to_string())
+    }
+
+    fn caddy_modules_ok(stdout: &str) -> crate::doctor::CommandOutput {
+        crate::doctor::CommandOutput {
+            stdout: stdout.into(),
+            stderr: String::new(),
+            status: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_modules_returns_json_when_route_configured() {
+        // When __modules__ is set, GET /modules/ returns 200 + the JSON body.
+        let (port, state) = start_mock_caddy().await;
+        state.lock().await.insert(
+            "__modules__".to_string(),
+            json!({"dns.providers": ["cloudflare"], "tls.get_certificate": ["tailscale"]}),
+        );
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        let modules = client.list_modules().await.expect("list_modules ok");
+        assert_eq!(
+            modules
+                .get("tls.get_certificate")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str()),
+            Some("tailscale")
+        );
+    }
+
+    #[tokio::test]
+    async fn has_cert_manager_api_present() {
+        let (port, state) = start_mock_caddy().await;
+        state.lock().await.insert(
+            "__modules__".to_string(),
+            json!({"tls.get_certificate": ["tailscale", "acme"]}),
+        );
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        assert!(
+            client.has_cert_manager("tailscale").await.unwrap(),
+            "API lists tailscale → present"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_cert_manager_api_absent() {
+        // Definitive API listing without the module ID → Ok(false) (AC #2).
+        let (port, state) = start_mock_caddy().await;
+        state.lock().await.insert(
+            "__modules__".to_string(),
+            json!({"tls.get_certificate": ["acme"]}),
+        );
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        assert!(
+            !client.has_cert_manager("tailscale").await.unwrap(),
+            "API lists no tailscale → absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_cert_manager_api_404_falls_back_to_binary_present() {
+        // No __modules__ key → 404 (standard Caddy). Binary lists the module
+        // via the runner → Ok(true). Regression for SLIP-124: a 404 must not
+        // flip the result to absent.
+        let (port, _state) = start_mock_caddy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        let runner = FakeCaddyRunner {
+            caddy_out: Some(caddy_modules_ok(
+                "http.handlers.reverse_proxy\ntls.get_certificate.tailscale\n",
+            )),
+            caddy_err: None,
+        };
+        assert!(
+            client
+                .has_cert_manager_with_runner("tailscale", &runner)
+                .await
+                .unwrap(),
+            "API 404 + binary present → present"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_cert_manager_api_404_falls_back_to_binary_absent() {
+        // API 404 + binary succeeds without the module → Ok(false) (confirmed
+        // absent, fail-able). The 404 is ignored; binary is source of truth.
+        let (port, _state) = start_mock_caddy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        let runner = FakeCaddyRunner {
+            caddy_out: Some(caddy_modules_ok("http.handlers.reverse_proxy\n")),
+            caddy_err: None,
+        };
+        assert!(
+            !client
+                .has_cert_manager_with_runner("tailscale", &runner)
+                .await
+                .unwrap(),
+            "API 404 + binary absent → absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_cert_manager_api_404_binary_missing_is_unknown_err() {
+        // API 404 + no caddy binary → Err (Unknown), NOT Ok(false). The
+        // caller must not treat this as confirmed absence (AC #3/#5).
+        let (port, _state) = start_mock_caddy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        let runner = FakeCaddyRunner {
+            caddy_out: None,
+            caddy_err: None,
+        };
+        let res = client
+            .has_cert_manager_with_runner("tailscale", &runner)
+            .await;
+        assert!(res.is_err(), "API 404 + binary missing → Err (unknown)");
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("could not verify"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn has_cert_manager_api_404_binary_nonzero_is_unknown_err() {
+        // API 404 + binary nonzero exit → Err (Unknown), never Ok(false).
+        let (port, _state) = start_mock_caddy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        let runner = FakeCaddyRunner {
+            caddy_out: Some(crate::doctor::CommandOutput {
+                stdout: String::new(),
+                stderr: String::from("caddy: fatal error"),
+                status: 1,
+            }),
+            caddy_err: None,
+        };
+        let res = client
+            .has_cert_manager_with_runner("tailscale", &runner)
+            .await;
+        assert!(res.is_err(), "API 404 + binary nonzero → Err (unknown)");
+    }
+
+    #[tokio::test]
+    async fn has_cert_manager_with_runner_rejects_substring() {
+        // The binary fallback uses exact matching: a module whose ID contains
+        // the target as a substring must not pass.
+        let (port, _state) = start_mock_caddy().await;
+        let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
+        let runner = FakeCaddyRunner {
+            caddy_out: Some(caddy_modules_ok("tls.get_certificate.tailscale_extras\n")),
+            caddy_err: None,
+        };
+        assert!(
+            !client
+                .has_cert_manager_with_runner("tailscale", &runner)
+                .await
+                .unwrap(),
+            "substring must not match → absent"
         );
     }
 
