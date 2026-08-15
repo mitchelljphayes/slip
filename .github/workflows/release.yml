@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - "v*"
+  # Build-only dry run. Publishing is gated on a tag ref below, so a manual
+  # dispatch verifies the cross builds without creating a release.
+  workflow_dispatch:
 
 jobs:
   build:
@@ -19,16 +22,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # No `toolchain:` input — rust-toolchain.toml pins the version, and
+      # naming it here too would let the two drift apart. `targets:` is
+      # deliberately omitted for the same reason: it would install the target
+      # for the toolchain this action selects, while cargo resolves to the
+      # pinned one. cross installs the target inside its container.
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
           prefix: ${{ matrix.target }}
 
+      # cross builds in a per-target container that carries the musl C
+      # toolchain. That is required, not a convenience: libsqlite3-sys
+      # (rusqlite `bundled`) compiles SQLite from C, and ring compiles C and
+      # assembly, so a plain `cargo build --target *-musl` on ubuntu-latest
+      # fails at link time even with the target installed.
+      - uses: taiki-e/install-action@cross
+
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cross build --release --locked --target ${{ matrix.target }}
 
       - name: Package
         run: |
@@ -39,6 +52,19 @@ jobs:
           cd dist
           sha256sum slip-${{ matrix.target }}.tar.gz > slip-${{ matrix.target }}.tar.gz.sha256
 
+      - name: Verify the binaries are static and the right architecture
+        run: |
+          cd target/${{ matrix.target }}/release
+          file slipd slip
+          # A dynamically linked binary would defeat the point of the musl
+          # build and fail on hosts without a matching libc.
+          for bin in slipd slip; do
+            if file "$bin" | grep -q "dynamically linked"; then
+              echo "::error::$bin is dynamically linked, expected static"
+              exit 1
+            fi
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: slip-${{ matrix.arch }}
@@ -47,6 +73,9 @@ jobs:
   release:
     name: Publish release
     needs: build
+    # Only publish for an actual tag. A workflow_dispatch run stops after the
+    # build job, so the release path can be exercised without publishing.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
