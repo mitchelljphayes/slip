@@ -26,6 +26,6 @@ jobs:
           if [ -s "$body" ]; then
               description=(--pr-description-file "$body")
           fi
-          uvx words-for-humans==0.2.2 \
+          uvx words-for-humans==0.2.3 \
             --diff "origin/${{ github.base_ref }}...HEAD" \
             --format github ${description+"${description[@]}"}
