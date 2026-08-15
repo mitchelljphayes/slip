@@ -13,7 +13,19 @@ jobs:
         with:
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v10.0.0
-      - run: |
-          uvx words-for-humans==0.2.0 \
+      - env:
+          # Judgment turns on by itself once the repository has the secret.
+          # A key on the ollama provider reaches ollama.com.
+          W4H_AI_PROVIDER: ${{ secrets.OLLAMA_API_KEY && 'ollama' || '' }}
+          W4H_AI_KEY: ${{ secrets.OLLAMA_API_KEY }}
+          W4H_AI_MODEL: glm-5.1
+        run: |
+          body="$RUNNER_TEMP/pr-description.md"
+          jq -r '.pull_request.body // empty' "$GITHUB_EVENT_PATH" > "$body"
+          description=()
+          if [ -s "$body" ]; then
+              description=(--pr-description-file "$body")
+          fi
+          uvx words-for-humans==0.2.2 \
             --diff "origin/${{ github.base_ref }}...HEAD" \
-            --format github
+            --format github ${description+"${description[@]}"}
