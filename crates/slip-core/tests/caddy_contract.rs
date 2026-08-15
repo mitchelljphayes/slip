@@ -373,6 +373,10 @@ async fn ensure_policies_array_exists(base_url: &str) {
 /// via the admin API (POST appends one element). Ensures the parent
 /// `policies` array exists first via a create-only PUT, because Caddy's
 /// admin API does not auto-create intermediate map keys for POST.
+///
+/// On failure, captures the response body so the Caddy provisioning error
+/// (e.g. an unknown module name) is visible in the test output instead of
+/// an opaque status code.
 async fn inject_foreign_policy(base_url: &str, policy: &serde_json::Value) {
     ensure_policies_array_exists(base_url).await;
     let http = reqwest::Client::new();
@@ -382,24 +386,33 @@ async fn inject_foreign_policy(base_url: &str, policy: &serde_json::Value) {
         .send()
         .await
         .expect("POST foreign policy");
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
     assert!(
-        resp.status().is_success(),
-        "foreign policy injection failed: {}",
-        resp.status()
+        status.is_success(),
+        "foreign policy injection failed: {status}\n\
+         policy: {policy}\n\
+         caddy response body: {body}"
     );
 }
 
-/// A foreign DNS-01 policy (Cloudflare, no `@id`).
-fn foreign_dns01_policy() -> serde_json::Value {
+/// A foreign ACME HTTP-01 policy (no `@id`). Uses only stock Caddy modules
+/// (`tls.issuance.acme` with the default HTTP-01 challenge) so it provisions
+/// on the stock apt Caddy used by CI. The Cloudflare DNS-01 shape used in
+/// the unit/mock tests (`caddy.rs`/`reconcile.rs` `foreign_dns01_policy`)
+/// requires the `caddy-dns/cloudflare` community module compiled via
+/// `xcaddy`, which stock Caddy does not ship. The contract suite cannot
+/// provision that shape, so this stock-provisionable ACME policy stands in
+/// to prove byte-for-byte preservation and ordering of a distinct
+/// subject-scoped issuer-based foreign policy.
+fn foreign_acme_http01_policy() -> serde_json::Value {
     serde_json::json!({
         "subjects": ["api.example.com"],
         "issuers": [{
             "module": "acme",
             "ca": "https://acme-v02.api.letsencrypt.org/directory",
             "challenges": {
-                "dns": {
-                    "provider": {"name": "cloudflare", "api_token": "{env.CF_TOKEN}"}
-                }
+                "http": {}
             }
         }]
     })
@@ -423,7 +436,7 @@ fn foreign_internal_policy() -> serde_json::Value {
     })
 }
 
-/// Real-Caddy contract: foreign DNS-01 + Tailscale + internal policies
+/// Real-Caddy contract: foreign ACME HTTP-01 + Tailscale + internal policies
 /// survive startup (`bootstrap` + `bootstrap_deploy` + `configure_tls`)
 /// AND at least two periodic reconciliation cycles. Slip's own policies
 /// converge once and stay stable (no duplicates). Foreign ordering and
@@ -435,13 +448,13 @@ async fn tls_policies_foreign_survive_reconcile_cycles_on_real_caddy() {
     let client = CaddyClient::new(guard.base_url.clone());
 
     // ── 1. Seed real Caddy with three foreign policies (manual / external). ──
-    inject_foreign_policy(&guard.base_url, &foreign_dns01_policy()).await;
+    inject_foreign_policy(&guard.base_url, &foreign_acme_http01_policy()).await;
     inject_foreign_policy(&guard.base_url, &foreign_tailscale_policy()).await;
     inject_foreign_policy(&guard.base_url, &foreign_internal_policy()).await;
 
     let foreign_before = fetch_tls_policies(&guard.base_url).await;
     assert_eq!(foreign_before.len(), 3, "3 foreign policies seeded");
-    let foreign_dns01_before = foreign_before[0].clone();
+    let foreign_acme_before = foreign_before[0].clone();
     let foreign_ts_before = foreign_before[1].clone();
     let foreign_internal_before = foreign_before[2].clone();
 
@@ -468,8 +481,8 @@ async fn tls_policies_foreign_survive_reconcile_cycles_on_real_caddy() {
     );
     // Foreign policies unchanged in order.
     assert_eq!(
-        after_startup[0], foreign_dns01_before,
-        "DNS-01 policy byte-identical after startup"
+        after_startup[0], foreign_acme_before,
+        "ACME HTTP-01 policy byte-identical after startup"
     );
     assert_eq!(
         after_startup[1], foreign_ts_before,
@@ -512,7 +525,10 @@ async fn tls_policies_foreign_survive_reconcile_cycles_on_real_caddy() {
         4,
         "no new duplicates after cycle 1, Slip converged idempotently"
     );
-    assert_eq!(after_c1[0], foreign_dns01_before, "DNS-01 survives cycle 1");
+    assert_eq!(
+        after_c1[0], foreign_acme_before,
+        "ACME HTTP-01 survives cycle 1"
+    );
     assert_eq!(after_c1[1], foreign_ts_before, "Tailscale survives cycle 1");
     assert_eq!(
         after_c1[2], foreign_internal_before,
@@ -532,7 +548,10 @@ async fn tls_policies_foreign_survive_reconcile_cycles_on_real_caddy() {
         4,
         "no new duplicates after cycle 2, Slip stable"
     );
-    assert_eq!(after_c2[0], foreign_dns01_before, "DNS-01 survives cycle 2");
+    assert_eq!(
+        after_c2[0], foreign_acme_before,
+        "ACME HTTP-01 survives cycle 2"
+    );
     assert_eq!(after_c2[1], foreign_ts_before, "Tailscale survives cycle 2");
     assert_eq!(
         after_c2[2], foreign_internal_before,
@@ -559,10 +578,10 @@ async fn tls_deploy_tailscale_policy_remains_present_on_real_caddy() {
     let guard = start_caddy();
     let client = CaddyClient::new(guard.base_url.clone());
 
-    // Seed a foreign DNS-01 policy for a different subject.
-    inject_foreign_policy(&guard.base_url, &foreign_dns01_policy()).await;
+    // Seed a foreign ACME HTTP-01 policy for a different subject.
+    inject_foreign_policy(&guard.base_url, &foreign_acme_http01_policy()).await;
     let foreign_before = fetch_tls_policies(&guard.base_url).await;
-    let foreign_dns01_before = foreign_before[0].clone();
+    let foreign_acme_before = foreign_before[0].clone();
 
     // Startup with deploy = Tailscale.
     client.bootstrap().await.expect("bootstrap should succeed");
@@ -582,8 +601,8 @@ async fn tls_deploy_tailscale_policy_remains_present_on_real_caddy() {
     let after_startup = fetch_tls_policies(&guard.base_url).await;
     assert_eq!(after_startup.len(), 2, "foreign + tailscale deploy");
     assert_eq!(
-        after_startup[0], foreign_dns01_before,
-        "foreign DNS-01 preserved"
+        after_startup[0], foreign_acme_before,
+        "foreign ACME HTTP-01 preserved"
     );
     assert_eq!(
         after_startup[1]["@id"].as_str(),
@@ -622,8 +641,8 @@ async fn tls_deploy_tailscale_policy_remains_present_on_real_caddy() {
         let after = fetch_tls_policies(&guard.base_url).await;
         assert_eq!(after.len(), 2, "no duplicates after cycle {cycle}");
         assert_eq!(
-            after[0], foreign_dns01_before,
-            "foreign DNS-01 preserved after cycle {cycle}"
+            after[0], foreign_acme_before,
+            "foreign ACME HTTP-01 preserved after cycle {cycle}"
         );
         assert_eq!(
             after[1]["get_certificate"][0]["via"].as_str(),
@@ -741,10 +760,10 @@ async fn tls_upsert_patch_in_place_preserves_ordering_on_real_caddy() {
     let guard = start_caddy();
     let client = CaddyClient::new(guard.base_url.clone());
 
-    // Seed: foreign DNS-01, then Slip-owned internal, then foreign Tailscale.
+    // Seed: foreign ACME HTTP-01, then Slip-owned internal, then foreign Tailscale.
     // The owned policy is in the MIDDLE so we can detect both forward and
     // backward position shifts.
-    inject_foreign_policy(&guard.base_url, &foreign_dns01_policy()).await;
+    inject_foreign_policy(&guard.base_url, &foreign_acme_http01_policy()).await;
     let slip_subjects = vec!["deploy.example.com".to_string()];
     let slip_internal = build_tls_policy(&slip_subjects, TlsStrategy::Internal, None, None, None);
     inject_foreign_policy(&guard.base_url, &slip_internal).await;
@@ -752,7 +771,7 @@ async fn tls_upsert_patch_in_place_preserves_ordering_on_real_caddy() {
 
     let before = fetch_tls_policies(&guard.base_url).await;
     assert_eq!(before.len(), 3, "3 policies seeded");
-    let foreign_dns01_before = before[0].clone();
+    let foreign_acme_before = before[0].clone();
     let foreign_ts_before = before[2].clone();
 
     // Tag the owned policy with its @id so the upsert recognizes it. On a
@@ -816,8 +835,8 @@ async fn tls_upsert_patch_in_place_preserves_ordering_on_real_caddy() {
 
     // Foreign policies unchanged and in their original positions.
     assert_eq!(
-        after[0], foreign_dns01_before,
-        "foreign DNS-01 at index 0 unchanged"
+        after[0], foreign_acme_before,
+        "foreign ACME HTTP-01 at index 0 unchanged"
     );
     assert_eq!(
         after[2], foreign_ts_before,
