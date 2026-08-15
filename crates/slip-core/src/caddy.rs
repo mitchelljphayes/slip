@@ -22,21 +22,21 @@ const DEFAULT_ACME_CA: &str = "https://acme-v02.api.letsencrypt.org/directory";
 /// Build a Caddy TLS automation policy as a pure `serde_json::Value`.
 ///
 /// This is the single, generalized policy builder for all four strategies.
-/// It does NOT talk to Caddy — it's pure and unit-testable in isolation.
+/// It does NOT talk to Caddy, it's pure and unit-testable in isolation.
 ///
 /// # Arguments
-/// * `subjects` — the host(s) this policy applies to (e.g. `["deploy.example.com"]`,
+/// * `subjects`, the host(s) this policy applies to (e.g. `["deploy.example.com"]`,
 ///   `["*.preview.example.com"]`).
-/// * `strategy` — the TLS strategy.
-/// * `dns_config` — DNS-01 provider config (required for `CloudflareDns01`).
-/// * `acme_email` — ACME contact email (required for `Acme`/`CloudflareDns01`).
-/// * `ca_url` — ACME CA URL override (None = production LE directory).
+/// * `strategy`, the TLS strategy.
+/// * `dns_config`, DNS-01 provider config (required for `CloudflareDns01`).
+/// * `acme_email`, ACME contact email (required for `Acme`/`CloudflareDns01`).
+/// * `ca_url`, ACME CA URL override (None = production LE directory).
 ///
 /// # Output shapes
 /// - `Internal` → `{"subjects":[...], "issuers":[{"module":"internal"}]}`
 /// - `Acme` → `{"subjects":[...], "issuers":[{"module":"acme","ca":...,"email":...}]}`
 /// - `CloudflareDns01` → the existing `configure_tls` shape, parameterized by `subjects`.
-/// - `Tailscale` → `{"subjects":[...], "get_certificate":[{"via":"tailscale"}]}` — NO `issuers`.
+/// - `Tailscale` → `{"subjects":[...], "get_certificate":[{"via":"tailscale"}]}`, NO `issuers`.
 pub fn build_tls_policy(
     subjects: &[String],
     strategy: TlsStrategy,
@@ -104,7 +104,7 @@ pub fn build_tls_policy(
             // Tailscale is a certificate MANAGER, not an issuer.
             // Caddy's implicitTailscaleManagersOnly() skips ACME provisioning
             // for all-.ts.net subjects with a Tailscale manager.
-            // NO issuers[] key — adding one would cause public-CA log spam.
+            // NO issuers[] key, adding one would cause public-CA log spam.
             json!({
                 "subjects": subjects_json,
                 "get_certificate": [{"via": "tailscale"}]
@@ -119,7 +119,7 @@ pub fn build_tls_policy(
 ///
 /// Used by `slip tls renew` to prove a certificate actually changed (fingerprint
 /// and/or `notAfter` advanced) rather than relying on config/reload alone.
-/// This is **observation only** — the TLS connection accepts any server
+/// This is **observation only**, the TLS connection accepts any server
 /// certificate (including self-signed/internal) without verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertProbe {
@@ -136,7 +136,7 @@ pub struct CertProbe {
 /// Connects to `host:443`, does a TLS handshake with SNI=`host`, reads the
 /// leaf certificate, and returns its SHA-256 fingerprint + notAfter.
 ///
-/// This is **observation only** — no certificate verification is performed.
+/// This is **observation only**, no certificate verification is performed.
 /// The purpose is to read public metadata (fingerprint, notAfter) to prove
 /// that a renewal actually occurred, not to validate trust.
 ///
@@ -148,7 +148,7 @@ pub async fn probe_cert(host: &str) -> Result<Option<CertProbe>, String> {
     use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
     use tokio_rustls::TlsConnector;
 
-    // A verifier that accepts any certificate — observation only.
+    // A verifier that accepts any certificate, observation only.
     #[derive(Debug)]
     struct NoVerify;
 
@@ -299,7 +299,7 @@ pub enum TlsClassification {
 /// - IP literal → private/CGNAT check via `is_private_or_cgnat`.
 /// - `.ts.net` → always `Public` (handled by Tailscale manager, never internal).
 pub fn classify_host_tls(host: &str) -> TlsClassification {
-    // .ts.net is never auto-internal — handled by Tailscale manager.
+    // .ts.net is never auto-internal, handled by Tailscale manager.
     if is_ts_net_host(host) {
         return TlsClassification::Public;
     }
@@ -481,15 +481,15 @@ impl CaddyClient {
     /// `admin` endpoint (no `apps` tree). Rather than POSTing into a path that
     /// may not exist yet (`config/apps/http/servers`), this reads the full
     /// config, merges the slip server block in, and atomically reloads it via
-    /// `POST /load` — preserving any existing config (e.g. `admin`).
+    /// `POST /load`, preserving any existing config (e.g. `admin`).
     ///
     /// ## Conflict detection (SLIP-88)
     ///
     /// Before merging, this method scans the existing config for any HTTP server
     /// (other than `slip`) that already claims `:443` (or whatever the `slip`
     /// server listens on). If found, it returns
-    /// [`CaddyError::ListenerConflict`] — a prescriptive error that names the
-    /// conflicting server and the remedy — instead of crash-looping on a
+    /// [`CaddyError::ListenerConflict`], a prescriptive error that names the
+    /// conflicting server and the remedy, instead of crash-looping on a
     /// rejected `POST /load`.
     pub async fn bootstrap(&self) -> Result<(), CaddyError> {
         // Fetch the current full config.
@@ -590,7 +590,7 @@ impl CaddyClient {
     ///
     /// The route is slip-owned: it uses the `slip-*` @id prefix and is
     /// re-applied on every reconcile pass. It is NOT deleted by `remove_routes`
-    /// (which targets `slip-{app_name}-{index}` — the deploy-webhook id is
+    /// (which targets `slip-{app_name}-{index}`, the deploy-webhook id is
     /// `slip-deploy-webhook`, no numeric suffix).
     ///
     /// When `domain` is `None`, this is a no-op (backwards compatible).
@@ -644,7 +644,7 @@ impl CaddyClient {
             .send()
             .await?;
         if !patch_resp.status().is_success() {
-            // Route didn't exist — append it.
+            // Route didn't exist, append it.
             let post_url = format!("{}/config/apps/http/servers/slip/routes", self.base_url);
             let post_resp = self.client.post(&post_url).json(&route_body).send().await?;
             if !post_resp.status().is_success() {
@@ -667,38 +667,36 @@ impl CaddyClient {
     /// Idempotent, ownership-safe upsert of a TLS automation policy.
     ///
     /// Slip owns *only* policies whose stable `@id` is `slip-tls-<subject>`.
-    /// Subject equality alone is **not** proof of ownership — an unrelated
+    /// Subject equality alone is **not** proof of ownership, an unrelated
     /// policy covering the same subject is preserved and surfaced as a
     /// [`CaddyError::TlsPolicyConflict`] rather than being adopted or
     /// shadowed by an order-dependent duplicate.
     ///
-    /// # Algorithm
-    /// 1. `GET /config/apps/tls/automation/policies` (read the current
-    ///    collection before deciding what to change).
-    /// 2. Partition the array into a *matched own* policy (`@id` ==
-    ///    `slip-tls-<subject>`), an *unowned same-subject* policy, or nothing.
-    ///    The pre-`@id` subject fallback is kept *only* to locate a policy
-    ///    Slip already owns but whose `@id` was stripped — and even then it
-    ///    is treated as a conflict, not silently adopted, because current
-    ///    state cannot prove who created an untagged policy.
-    /// 3. If the matched own policy already equals the desired policy →
-    ///    no-op (idempotent convergence).
-    /// 4. If the matched own policy differs → replace *that element in place*
-    ///    via `PATCH /id/<id>` carrying the full desired policy (with `@id`
-    ///    re-stamped). This preserves array ordering and avoids the
-    ///    lost-policy window of DELETE-then-append (a failed PATCH leaves
-    ///    the existing element untouched). If the PATCH returns 404 (the
-    ///    owned entry disappeared concurrently), fall back to append.
-    ///    Any other PATCH failure is a prescriptive error — the existing
-    ///    policy is left in place.
-    /// 5. If no owned policy exists and no unowned policy conflicts on the
-    ///    same subject → ensure the parent `policies` array exists
-    ///    (create-only `PUT` when absent) and `POST`-append one policy.
-    /// 6. If an unowned or untagged policy already covers the same subject →
-    ///    preserve it and return [`CaddyError::TlsPolicyConflict`].
+    /// The algorithm reads the current `policies` array via GET, then
+    /// partitions it. A *matched own* policy is one whose `@id` equals
+    /// `slip-tls-<subject>`. The pre-`@id` subject fallback is kept *only*
+    /// to locate a policy Slip already owns but whose `@id` was stripped.
+    /// Even then it is treated as a conflict, not silently adopted, because
+    /// current state cannot prove who created an untagged policy.
+    ///
+    /// If the matched own policy equals the desired policy, the upsert is a
+    /// no-op (idempotent convergence). If it differs, the upsert replaces
+    /// that element in place via `PATCH /id/<id>` with the full desired
+    /// policy (`@id` re-stamped). This preserves array ordering and avoids
+    /// the lost-policy window of DELETE-then-append (a failed PATCH leaves
+    /// the existing element untouched). If the PATCH returns 404 (the owned
+    /// entry disappeared concurrently), the upsert falls back to append.
+    /// Any other PATCH failure is a prescriptive error, the existing policy
+    /// is left in place.
+    ///
+    /// If no owned policy exists and no unowned policy conflicts on the
+    /// same subject, the upsert ensures the parent `policies` array exists
+    /// (create-only `PUT` when absent) and `POST`-appends one policy. If an
+    /// unowned or untagged policy already covers the same subject, the
+    /// upsert preserves it and returns [`CaddyError::TlsPolicyConflict`].
     ///
     /// The parent `tls/automation` object is **never** written as an
-    /// initialization fallback — that was the v0.1.0 destructive operation
+    /// initialization fallback, that was the v0.1.0 destructive operation
     /// (`POST /config/apps/tls/automation {"policies":[]}` replaced the
     /// whole array, wiping every pre-existing policy).
     ///
@@ -716,7 +714,7 @@ impl CaddyClient {
         let resp = self.client.get(&policies_url).send().await?;
 
         // Read the current policy collection before deciding what to change.
-        // A 404 here means the `policies` key is absent — treat as empty.
+        // A 404 here means the `policies` key is absent, treat as empty.
         let policies: Vec<Value> = if resp.status().is_success() {
             resp.json().await.unwrap_or_default()
         } else {
@@ -735,7 +733,7 @@ impl CaddyClient {
                 .unwrap_or(false);
             if id_match {
                 owned = Some((i, existing.clone()));
-                // An exact @id match is authoritative — stop scanning.
+                // An exact @id match is authoritative, stop scanning.
                 break;
             }
             // Subject overlap check (used only for conflict detection, never
@@ -765,10 +763,10 @@ impl CaddyClient {
                 e_obj.remove("@id");
             }
             if existing_cmp == *policy {
-                // Bodies match (ignoring @id) — idempotent no-op.
+                // Bodies match (ignoring @id), idempotent no-op.
                 return Ok(());
             }
-            // Bodies differ — replace *this element in place* via PATCH /id/<id>.
+            // Bodies differ, replace *this element in place* via PATCH /id/<id>.
             // PATCH is atomic per-request: a failure leaves the existing element
             // untouched (no lost-policy window, unlike DELETE-then-append).
             // It also preserves the element's array position.
@@ -797,14 +795,14 @@ impl CaddyClient {
         // ── Branch 3: no owned policy, no conflict → append ──
         // Ensure the parent `policies` array exists using a create-only PUT.
         // `PUT /config/apps/tls/automation/policies` with body `[]` creates
-        // the key if absent and returns 409 Conflict if it already exists —
+        // the key if absent and returns 409 Conflict if it already exists.
         // a safe "create-if-absent" that never clobbers existing elements.
         // We only do this when the earlier GET did not return a successful
         // array (i.e. the key was absent).
         if policies.is_empty() {
             let put_url = format!("{}/config/apps/tls/automation/policies", self.base_url);
             let put_resp = self.client.put(&put_url).json(&json!([])).send().await?;
-            // 409 Conflict = already exists (concurrent create) — tolerate it.
+            // 409 Conflict = already exists (concurrent create), tolerate it.
             // 2xx = created. Anything else is a hard failure.
             let status = put_resp.status();
             if !status.is_success() && status != reqwest::StatusCode::CONFLICT {
@@ -825,10 +823,10 @@ impl CaddyClient {
     /// existing element untouched).
     ///
     /// If the PATCH returns 404 (the owned entry disappeared between the
-    /// GET and the PATCH — a concurrent external edit), fall back to the
+    /// GET and the PATCH, a concurrent external edit), fall back to the
     /// append path so convergence is preserved.
     ///
-    /// Any other PATCH failure is a prescriptive error — the existing
+    /// Any other PATCH failure is a prescriptive error, the existing
     /// policy is left in place and the caller is told the remedy.
     async fn patch_tls_policy_in_place(
         &self,
@@ -856,7 +854,7 @@ impl CaddyClient {
         if status == reqwest::StatusCode::NOT_FOUND {
             tracing::info!(
                 policy_id = %policy_id,
-                "owned TLS policy vanished mid-flight (PATCH 404) — falling back to append"
+                "owned TLS policy vanished mid-flight (PATCH 404), falling back to append"
             );
             return self.append_tls_policy(policy_id, policy).await;
         }
@@ -865,7 +863,7 @@ impl CaddyClient {
         // error so the caller knows the remedy (retry next tick).
         let text = patch_resp.text().await.unwrap_or_default();
         Err(CaddyError::TlsConfigFailed(format!(
-            "PATCH {patch_url} returned {status}: {text} — existing policy left in place; \
+            "PATCH {patch_url} returned {status}: {text}, existing policy left in place; \
              reconcile will retry next tick"
         )))
     }
@@ -941,7 +939,7 @@ impl CaddyClient {
                 continue;
             }
 
-            // Route didn't exist — append it.
+            // Route didn't exist, append it.
             let post_url = format!("{}/config/apps/http/servers/slip/routes", self.base_url);
             let post_resp = self.client.post(&post_url).json(&route_body).send().await?;
             if post_resp.status().is_success() {
@@ -1136,15 +1134,15 @@ impl CaddyClient {
                         Ok(status == crate::doctor::CheckStatus::Pass)
                     }
                     Ok(_) => {
-                        // Binary exists but failed — treat as "not found".
+                        // Binary exists but failed, treat as "not found".
                         tracing::warn!(
-                            "caddy list-modules binary check failed — \
+                            "caddy list-modules binary check failed, \
                              cannot verify DNS plugin presence"
                         );
                         Ok(false)
                     }
                     Err(_) => {
-                        // No caddy binary and no admin API — cannot verify.
+                        // No caddy binary and no admin API, cannot verify.
                         tracing::warn!(
                             "cannot verify DNS plugin: GET /modules/ failed and \
                              `caddy` binary not found on $PATH"
@@ -1240,7 +1238,7 @@ impl CaddyClient {
         tracing::warn!(
             host = host,
             status = %resp.status(),
-            "PATCH by @id failed — falling back to positional index"
+            "PATCH by @id failed, falling back to positional index"
         );
 
         let policies_url = format!("{}/config/apps/tls/automation/policies", self.base_url);
@@ -1266,7 +1264,7 @@ impl CaddyClient {
 
         let Some(idx) = index else {
             return Err(CaddyError::TlsConfigFailed(format!(
-                "no TLS policy found for {host} — run `slip apply` to register it"
+                "no TLS policy found for {host}, run `slip apply` to register it"
             )));
         };
 
@@ -1289,7 +1287,7 @@ impl CaddyClient {
 
     /// Delete the `renewal_window_ratio` field from a host's TLS policy.
     ///
-    /// Used when the original ratio was absent (None) — the temporary bump
+    /// Used when the original ratio was absent (None), the temporary bump
     /// must be removed, not merely set to a different value. Uses the stable
     /// `@id` for the deletion.
     pub async fn delete_tls_policy_ratio(&self, host: &str) -> Result<(), CaddyError> {
@@ -1303,7 +1301,7 @@ impl CaddyClient {
         tracing::warn!(
             host = host,
             status = %resp.status(),
-            "DELETE by @id failed — falling back to positional index"
+            "DELETE by @id failed, falling back to positional index"
         );
         let policies_url = format!("{}/config/apps/tls/automation/policies", self.base_url);
         let resp = self.client.get(&policies_url).send().await?;
@@ -1327,7 +1325,7 @@ impl CaddyClient {
         });
         let Some(idx) = index else {
             return Err(CaddyError::TlsConfigFailed(format!(
-                "no TLS policy found for {host} — run `slip apply` to register it"
+                "no TLS policy found for {host}, run `slip apply` to register it"
             )));
         };
         let delete_url = format!(
@@ -1357,7 +1355,7 @@ impl CaddyClient {
     ) -> Result<bool, CaddyError> {
         let policy = self.get_tls_policy(host).await?;
         match (policy, expected) {
-            (None, _) => Ok(false), // policy gone — not restored
+            (None, _) => Ok(false), // policy gone, not restored
             (Some(p), None) => {
                 // Field should be absent.
                 Ok(p.get("renewal_window_ratio").is_none())
@@ -1371,10 +1369,10 @@ impl CaddyClient {
     /// Reload Caddy config (POST /load with current config).
     ///
     /// Triggers a config reload which causes Caddy to re-scan renewal windows.
-    /// Requires a successful 2xx JSON-object GET before POST — never POSTs
+    /// Requires a successful 2xx JSON-object GET before POST, never POSTs
     /// null/stale content.
     pub async fn reload(&self) -> Result<(), CaddyError> {
-        // GET the current config — must be a successful JSON object.
+        // GET the current config, must be a successful JSON object.
         let cfg_url = format!("{}/config/", self.base_url);
         let resp = self.client.get(&cfg_url).send().await?;
         if !resp.status().is_success() {
@@ -1390,7 +1388,7 @@ impl CaddyClient {
         // Verify the config is a JSON object (not null/array).
         if !config.is_object() {
             return Err(CaddyError::TlsConfigFailed(
-                "Caddy config GET returned non-object JSON — refusing to POST null/stale content"
+                "Caddy config GET returned non-object JSON, refusing to POST null/stale content"
                     .to_string(),
             ));
         }
@@ -1443,7 +1441,7 @@ pub fn redact_external_error(input: &str) -> String {
 /// `*.example.com` matches `foo.example.com` but NOT `example.com` itself.
 fn is_wildcard_match(wildcard: &str, domain: &str) -> bool {
     if let Some(suffix) = wildcard.strip_prefix("*.") {
-        // suffix is "example.com" — domain must have at least one label
+        // suffix is "example.com", domain must have at least one label
         // before it, i.e. "foo.example.com", not "example.com" itself.
         domain.ends_with(suffix) && domain.len() > suffix.len() && {
             // The char before the suffix match must be a dot.
@@ -1515,7 +1513,7 @@ mod tests {
         }
     }
 
-    /// Mock `GET /config/` — returns the full config, reflecting whether the
+    /// Mock `GET /config/`, returns the full config, reflecting whether the
     /// slip server block has been created.
     async fn mock_get_config(
         State(state): State<MockState>,
@@ -1537,7 +1535,7 @@ mod tests {
         }
     }
 
-    /// Mock `POST /load` — stores the slip server block from the loaded config.
+    /// Mock `POST /load`, stores the slip server block from the loaded config.
     async fn mock_load_config(
         State(state): State<MockState>,
         axum::Json(body): axum::Json<serde_json::Value>,
@@ -1637,8 +1635,10 @@ mod tests {
         if let Some(policies) = map.get("__tls_policies__") {
             (StatusCode::OK, axum::Json(policies.clone()))
         } else {
-            // Real Caddy returns 404 when the `policies` key is absent.
-            (StatusCode::NOT_FOUND, axum::Json(json!(null)))
+            // Real Caddy wraps the missing-intermediate traversal error as
+            // HTTP 400 (not 404). The production code treats any non-success
+            // GET as "absent → empty" (caddy.rs upsert_tls_policy).
+            (StatusCode::BAD_REQUEST, axum::Json(json!(null)))
         }
     }
 
@@ -1647,7 +1647,14 @@ mod tests {
         axum::Json(body): axum::Json<serde_json::Value>,
     ) -> StatusCode {
         let mut map = state.lock().await;
-        // Get existing policies or create empty array
+        // Real Caddy does NOT auto-create intermediate map keys for POST.
+        // If the `policies` key is absent (no PUT created it first), POST
+        // into the missing intermediate returns 500. The production code
+        // always calls the create-only PUT before appending, so this only
+        // fires on a test harness that forgets the PUT.
+        if !map.contains_key("__tls_policies__") {
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
         let policies = map
             .entry("__tls_policies__".to_string())
             .or_insert(json!([]));
@@ -1657,7 +1664,7 @@ mod tests {
         StatusCode::OK
     }
 
-    /// Create-only `PUT /config/apps/tls/automation/policies` — models real
+    /// Create-only `PUT /config/apps/tls/automation/policies`, models real
     /// Caddy: 409 Conflict if the key already exists, otherwise create.
     async fn mock_put_tls_policies(
         State(state): State<MockState>,
@@ -1672,7 +1679,7 @@ mod tests {
         }
     }
 
-    /// Destructive `POST /config/apps/tls/automation` — models real Caddy's
+    /// Destructive `POST /config/apps/tls/automation`, models real Caddy's
     /// upsert semantics: the `policies` field in the body **replaces** the
     /// entire policies array. This is the v0.1.0 bug primitive; the mock
     /// faithfully reproduces it so the old code path would fail preservation
@@ -1927,7 +1934,7 @@ mod tests {
         let (port, _state) = start_mock_caddy().await;
         let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
 
-        // Route never existed — should be OK.
+        // Route never existed, should be OK.
         client
             .remove_route("nonexistent")
             .await
@@ -2112,7 +2119,7 @@ mod tests {
         let (port, _state) = start_mock_caddy().await;
         let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
 
-        // No routes exist — should be OK.
+        // No routes exist, should be OK.
         client
             .remove_routes("nonexistent", 3)
             .await
@@ -2228,7 +2235,7 @@ mod tests {
             .await
             .insert("__tls_policies__".to_string(), json!([existing_policy]));
 
-        // Should succeed without adding a new policy (idempotent — bodies match).
+        // Should succeed without adding a new policy (idempotent, bodies match).
         client
             .configure_tls("preview.example.com", &tls_config)
             .await
@@ -2575,14 +2582,14 @@ mod tests {
             Some("deploy.example.com"),
             "subject should be the deploy domain"
         );
-        // CRITICAL: issuers is PLURAL and an ARRAY — the singular form silently fails.
+        // CRITICAL: issuers is PLURAL and an ARRAY, the singular form silently fails.
         assert!(
             policy.get("issuers").is_some(),
             "policy should have 'issuers' (plural, array)"
         );
         assert!(
             policy.get("issuer").is_none(),
-            "policy should NOT have 'issuer' (singular) — that silently fails"
+            "policy should NOT have 'issuer' (singular), that silently fails"
         );
         assert_eq!(
             policy["issuers"][0]["module"].as_str(),
@@ -2714,7 +2721,7 @@ mod tests {
     //
     // The v0.1.0 bug: `upsert_tls_policy` unconditionally POSTed
     // `{"policies":[]}` to `/config/apps/tls/automation`, which Caddy
-    // treats as "replace the entire policies array" — wiping every
+    // treats as "replace the entire policies array", wiping every
     // pre-existing subject-scoped TLS automation policy (Cloudflare DNS-01,
     // internal-CA, Tailscale `get_certificate`, anything Slip doesn't
     // recognize as its own). These tests pin the ownership-safe fix:
@@ -2782,7 +2789,7 @@ mod tests {
         assert_eq!(policies.len(), 2, "foreign + slip policy");
 
         // The foreign policy must be byte-for-byte unchanged and remain first
-        // (foreign ordering preserved — Slip appended, did not reorder).
+        // (foreign ordering preserved, Slip appended, did not reorder).
         assert_eq!(
             &policies[0], &foreign,
             "foreign DNS-01 policy must be byte-for-byte unchanged"
@@ -2918,7 +2925,7 @@ mod tests {
         // Foreign policy unchanged (still first).
         assert_eq!(&policies[0], &foreign, "foreign policy untouched");
 
-        // Slip policy replaced in place (ACME, not internal) — PATCH-by-ID
+        // Slip policy replaced in place (ACME, not internal), PATCH-by-ID
         // preserves the element's array position, unlike DELETE-then-append
         // which would move it to the end.
         assert_eq!(
@@ -2933,12 +2940,12 @@ mod tests {
         );
         // Explicit ordering assertion: the Slip policy is still at index 1
         // (it was seeded at index 1). DELETE-then-append would have moved
-        // it to the end — here index 1 is still the last element, so the
+        // it to the end, here index 1 is still the last element, so the
         // position is preserved.
         assert_eq!(
             policies.len(),
             2,
-            "no append happened — PATCH replaced in place at the same index"
+            "no append happened, PATCH replaced in place at the same index"
         );
     }
 
@@ -3014,7 +3021,7 @@ mod tests {
             matches!(err, CaddyError::TlsPolicyConflict { .. }),
             "expected TlsPolicyConflict, got: {err}"
         );
-        // Error is prescriptive — names the remedy.
+        // Error is prescriptive, names the remedy.
         let msg = err.to_string();
         assert!(msg.contains("deploy.example.com"), "names the subject");
         assert!(
@@ -3034,7 +3041,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_patch_in_place_preserves_ordering_with_foreign_policies() {
-        // PATCH-by-ID replaces the owned element in place — it does NOT
+        // PATCH-by-ID replaces the owned element in place, it does NOT
         // move it to the end of the array (which DELETE-then-append would).
         // This test places the owned policy BEFORE foreign policies and
         // asserts it stays at the same index after a replace.
@@ -3081,13 +3088,13 @@ mod tests {
             .get("__tls_policies__")
             .and_then(|p| p.as_array())
             .expect("policies should exist");
-        assert_eq!(policies.len(), 3, "no append, no wipe — replaced in place");
+        assert_eq!(policies.len(), 3, "no append, no wipe, replaced in place");
 
         // The owned policy is still at index 0 (PATCH preserved position).
         assert_eq!(
             policies[0]["@id"].as_str(),
             Some("slip-tls-deploy.example.com"),
-            "owned policy still at index 0 — PATCH preserved position"
+            "owned policy still at index 0, PATCH preserved position"
         );
         assert_eq!(
             policies[0]["issuers"][0]["module"].as_str(),
@@ -3109,8 +3116,8 @@ mod tests {
     async fn upsert_patch_404_falls_back_to_append_without_touching_foreign() {
         // If the owned policy vanishes between the GET and the PATCH
         // (concurrent external edit), Caddy returns 404 on the PATCH.
-        // The upsert must fall back to append — converging the desired
-        // state — without touching any foreign policies.
+        // The upsert must fall back to append, converging the desired
+        // state, without touching any foreign policies.
         //
         // We simulate this by having the mock's PATCH handler return 404
         // for the owned @id (as if the entry was deleted mid-flight), then
@@ -3118,30 +3125,10 @@ mod tests {
         let (port, state) = start_mock_caddy().await;
         let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
 
-        // Seed: one foreign policy + the owned policy. The mock's
-        // /id/{id} PATCH will find the @id and return OK normally. To
-        // simulate the concurrent-delete, we delete the owned policy from
-        // the mock state AFTER the GET but BEFORE the PATCH — we do this
-        // by racing: spawn a task that deletes the @id after a short delay.
-        // However, the simpler and deterministic approach is to use a
-        // mock that returns 404 for PATCH on a specific @id.
-        //
-        // Instead of a custom mock, we can deterministically trigger the
-        // 404 path: seed the foreign policy but NOT the owned policy, yet
-        // make the GET return the owned policy. That's not possible with
-        // the shared mock. Instead, we use a dedicated approach: delete
-        // the owned policy between the GET and PATCH by intercepting.
-        //
-        // The cleanest deterministic simulation: seed only a foreign
-        // policy (no owned policy with our @id), so the GET returns just
-        // the foreign one. The upsert sees no owned policy → goes to the
-        // append branch (Branch 3), which is the SAME fallback the
-        // PATCH-404 path uses. This tests the append fallback directly.
-        //
-        // For the actual PATCH-404 path, we need the owned policy to
-        // exist at GET time but vanish by PATCH time. We achieve this by
-        // spawning a task that deletes it from the mock state after the
-        // client's GET has completed.
+        // Seed: one foreign policy + the owned policy. A racing task
+        // deletes the owned policy from the mock state after the client's
+        // GET has completed but before the PATCH fires. The PATCH then
+        // returns 404, and the upsert falls back to append.
         let foreign = foreign_dns01_policy();
         let mut slip_policy = build_tls_policy(
             &["deploy.example.com".to_string()],
@@ -3177,7 +3164,7 @@ mod tests {
             }
         });
 
-        // Upsert a different body (ACME) — the GET sees the owned policy,
+        // Upsert a different body (ACME), the GET sees the owned policy,
         // but by the time PATCH fires, it's gone (404) → append fallback.
         let subjects = vec!["deploy.example.com".to_string()];
         let new_policy = build_tls_policy(
@@ -3220,7 +3207,7 @@ mod tests {
                 p.get("@id").and_then(|v| v.as_str()) == Some("slip-tls-deploy.example.com")
             })
             .count();
-        assert_eq!(slip_count, 1, "exactly one Slip policy — no duplicate");
+        assert_eq!(slip_count, 1, "exactly one Slip policy, no duplicate");
     }
 
     #[tokio::test]
@@ -3285,7 +3272,7 @@ mod tests {
         assert_eq!(
             policies[0]["issuers"][0]["module"].as_str(),
             Some("internal"),
-            "existing internal policy left in place — not replaced"
+            "existing internal policy left in place, not replaced"
         );
     }
 
@@ -3293,10 +3280,10 @@ mod tests {
     async fn upsert_never_writes_parent_automation_object() {
         // The destructive v0.1.0 path POSTed `{"policies":[]}` to
         // `/config/apps/tls/automation`, which replaced the entire array.
-        // The faithful mock models that semantics AND records the call in a
-        // request log, so this test asserts BOTH that the foreign policy
-        // survives AND that the forbidden `POST .../automation` is never
-        // issued — a direct regression guard, not just an indirect one.
+        // The faithful mock models that semantics and records the call in a
+        // request log. This test asserts both that the foreign policy
+        // survives and that the forbidden `POST .../automation` is never
+        // issued, a direct regression guard.
         let (port, state) = start_mock_caddy().await;
         let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
 
@@ -3330,7 +3317,7 @@ mod tests {
             .expect("policies should exist");
         assert!(
             policies.iter().any(|p| p == &foreign),
-            "foreign policy must survive — parent automation object was NOT written"
+            "foreign policy must survive, parent automation object was NOT written"
         );
     }
 
@@ -3342,7 +3329,7 @@ mod tests {
         let (port, state) = start_mock_caddy().await;
         let client = CaddyClient::new(format!("http://127.0.0.1:{port}"));
 
-        // No __tls_policies__ seeded — GET will 404.
+        // No __tls_policies__ seeded, GET will return non-success (400).
         let subjects = vec!["deploy.example.com".to_string()];
         let policy = build_tls_policy(&subjects, TlsStrategy::Internal, None, None, None);
         client
@@ -3452,7 +3439,7 @@ mod tests {
         assert!(issuer.is_none());
     }
 
-    // ── build_tls_policy (Phase 2 — pure policy builder) ──────────────────
+    // ── build_tls_policy (Phase 2, pure policy builder) ──────────────────
 
     fn dns_config_fixture(staging: bool) -> CaddyTlsConfig {
         let mut table = toml::value::Table::new();
@@ -3583,7 +3570,7 @@ mod tests {
         // CRITICAL: Tailscale is a MANAGER, not an issuer.
         assert!(
             policy.get("issuers").is_none(),
-            "Tailscale policy must NOT have issuers[] — it's a get_certificate manager"
+            "Tailscale policy must NOT have issuers[], it's a get_certificate manager"
         );
         assert_eq!(
             policy["get_certificate"][0]["via"], "tailscale",
@@ -3654,7 +3641,7 @@ mod tests {
 
     #[test]
     fn classify_host_ts_net_is_public() {
-        // .ts.net is never auto-internal — handled by Tailscale manager.
+        // .ts.net is never auto-internal, handled by Tailscale manager.
         assert_eq!(
             classify_host_tls("host.tailnet.ts.net"),
             TlsClassification::Public
@@ -3703,7 +3690,7 @@ mod tests {
         );
     }
 
-    // ── cert_renewed / CertProbe comparison (Phase 4 — cert proof) ────────
+    // ── cert_renewed / CertProbe comparison (Phase 4, cert proof) ────────
 
     #[test]
     fn cert_renewed_fingerprint_change() {

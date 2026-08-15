@@ -114,7 +114,7 @@ pub enum CaddyError {
     #[error(
         "Caddy server '{server}' (from your Caddyfile) already claims {listener}. \
          slip owns {listener} via its 'slip' server. \
-         Remove site blocks from the Caddyfile — use [deploy] for the webhook \
+         Remove site blocks from the Caddyfile, use [deploy] for the webhook \
          and 'slip services expose' / static routes for other hosts."
     )]
     ListenerConflict { server: String, listener: String },

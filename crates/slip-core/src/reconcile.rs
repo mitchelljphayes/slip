@@ -1,4 +1,4 @@
-//! Periodic Caddy reconcile loop — self-heals routes, deploy-webhook, and TLS
+//! Periodic Caddy reconcile loop, self-heals routes, deploy-webhook, and TLS
 //! after a Caddy restart, reload, or missed webhook.
 //!
 //! This is a **safety net**, not the primary update path. Deploys still push
@@ -218,7 +218,7 @@ pub async fn reconcile_app_routes(
     app_configs: &HashMap<String, AppConfig>,
     backoff: &ExponentialBuilder,
 ) -> ReconcileSummary {
-    // Build the flat route list — same logic as state::reconcile_routes.
+    // Build the flat route list, same logic as state::reconcile_routes.
     let routes: Vec<RouteInfo> = states
         .iter()
         .filter_map(|(app_name, state)| {
@@ -358,7 +358,7 @@ async fn reconcile_app_tls(
 
             match decision {
                 crate::caddy::RouteTlsDecision::LeaveDefault => {
-                    // Public host, no explicit TLS — leave Caddy's default.
+                    // Public host, no explicit TLS, leave Caddy's default.
                 }
                 crate::caddy::RouteTlsDecision::Apply(strategy) => {
                     let subjects = vec![host.clone()];
@@ -379,7 +379,7 @@ async fn reconcile_app_tls(
                                 tracing::warn!(
                                     app = %app_name,
                                     host = %host,
-                                    "cloudflare DNS plugin not found in running Caddy — \
+                                    "cloudflare DNS plugin not found in running Caddy, \
                                      DNS-01 policy NOT applied; \
                                      remedy: build a Caddy binary with the DNS plugin: \
                                      `xcaddy build --with github.com/caddy-dns/cloudflare` \
@@ -393,7 +393,7 @@ async fn reconcile_app_tls(
                                     host = %host,
                                     error = %e,
                                     "failed to verify cloudflare DNS plugin presence \
-                                     (both GET /modules/ and caddy list-modules failed) — \
+                                     (both GET /modules/ and caddy list-modules failed), \
                                      DNS-01 policy NOT applied; \
                                      remedy: ensure caddy is installed and reachable, \
                                      then rebuild with: \
@@ -434,7 +434,7 @@ async fn reconcile_app_tls(
                                     host = %host,
                                     check = e.check,
                                     remedy = %e.remedy,
-                                    "Tailscale preflight failed — policy not applied"
+                                    "Tailscale preflight failed, policy not applied"
                                 );
                                 continue;
                             }
@@ -443,7 +443,7 @@ async fn reconcile_app_tls(
                                     app = %app_name,
                                     host = %host,
                                     error = %e,
-                                    "Tailscale preflight task panicked — policy not applied"
+                                    "Tailscale preflight task panicked, policy not applied"
                                 );
                                 continue;
                             }
@@ -451,7 +451,7 @@ async fn reconcile_app_tls(
                                 tracing::warn!(
                                     app = %app_name,
                                     host = %host,
-                                    "Tailscale preflight timed out (15s) — policy not applied"
+                                    "Tailscale preflight timed out (15s), policy not applied"
                                 );
                                 continue;
                             }
@@ -672,8 +672,10 @@ mod tests {
             if let Some(policies) = map.get("__tls_policies__") {
                 (StatusCode::OK, axum::Json(policies.clone()))
             } else {
-                // Real Caddy returns 404 when the `policies` key is absent.
-                (StatusCode::NOT_FOUND, axum::Json(serde_json::json!(null)))
+                // Real Caddy wraps the missing-intermediate traversal error
+                // as HTTP 400 (not 404). The production code treats any
+                // non-success GET as "absent → empty".
+                (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!(null)))
             }
         }
 
@@ -682,6 +684,12 @@ mod tests {
             axum::Json(body): axum::Json<serde_json::Value>,
         ) -> StatusCode {
             let mut map = s.lock().await;
+            // Real Caddy does NOT auto-create intermediate map keys for
+            // POST. If the `policies` key is absent (no PUT created it
+            // first), POST into the missing intermediate returns 500.
+            if !map.contains_key("__tls_policies__") {
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
             let policies = map
                 .entry("__tls_policies__".to_string())
                 .or_insert(serde_json::json!([]));
@@ -705,7 +713,7 @@ mod tests {
             }
         }
 
-        /// Faithful `POST /config/apps/tls/automation` — replaces the
+        /// Faithful `POST /config/apps/tls/automation`, replaces the
         /// `policies` sub-key (the v0.1.0 destructive primitive).
         async fn mock_post_tls_automation(
             State(s): State<MockState>,
@@ -919,7 +927,7 @@ mod tests {
             assert!(!map.contains_key("slip-test-app-0"));
         }
 
-        // Reconcile again — route should be restored.
+        // Reconcile again, route should be restored.
         let summary2 = reconcile_app_routes(&caddy, &states, &apps, &backoff).await;
         assert_eq!(summary2.routes_failed, 0);
         let map = state.lock().await;
@@ -1072,7 +1080,7 @@ mod tests {
             "deploy-webhook route gone after delete"
         );
 
-        // Run a reconcile tick — it should re-apply the deploy-webhook route.
+        // Run a reconcile tick, it should re-apply the deploy-webhook route.
         let backoff = default_backoff();
         reconcile_tick(&ctx, &backoff).await;
 
@@ -1144,7 +1152,7 @@ mod tests {
 
         let backoff = ExponentialBuilder::default()
             .with_min_delay(Duration::from_millis(1))
-            .with_max_times(0); // no retries — fail immediately
+            .with_max_times(0); // no retries, fail immediately
 
         let summary = reconcile_app_routes(&caddy, &states, &apps, &backoff).await;
         assert_eq!(summary.failures.len(), 1);
@@ -1252,7 +1260,7 @@ mod tests {
         assert_eq!(
             after_2.len(),
             3,
-            "no new duplicates after cycle 2 — Slip policies converge idempotently"
+            "no new duplicates after cycle 2, Slip policies converge idempotently"
         );
         assert_eq!(&after_2[0], &foreign_dns01, "DNS-01 survives cycle 2");
         assert_eq!(&after_2[1], &foreign_ts, "Tailscale survives cycle 2");
@@ -1272,7 +1280,7 @@ mod tests {
     async fn reconcile_preserves_deploy_tailscale_policy_across_cycles() {
         // `[deploy] tls = "tailscale"`: the deploy-ingress Tailscale policy
         // is Slip-owned (`slip-tls-<ts-host>`). It must remain present and
-        // stable across reconcile cycles — another app's reconciliation
+        // stable across reconcile cycles, another app's reconciliation
         // cannot remove it. A foreign policy for a different subject must
         // also survive.
         let (port, state) = start_mock_caddy().await;

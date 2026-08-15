@@ -280,7 +280,7 @@ async fn assert_route_exists(base_url: &str, route_id: &str, timeout: Duration) 
 ///
 /// This is the SLIP-99 acceptance test: kill Caddy, start a fresh instance
 /// (new port, empty config), run a reconcile tick, and confirm the route
-/// reappears — proving the loop converges without manual intervention.
+/// reappears, proving the loop converges without manual intervention.
 #[tokio::test]
 #[ignore]
 async fn reconcile_loop_converges_after_caddy_restart() {
@@ -313,7 +313,7 @@ async fn reconcile_loop_converges_after_caddy_restart() {
         "route should be gone on fresh Caddy (simulating restart)"
     );
 
-    // ── 3. Run a reconcile tick against the new Caddy — self-heal ───────────
+    // ── 3. Run a reconcile tick against the new Caddy, self-heal ───────────
     let ctx2 = test_context(client2, "test-app", "test.local", 8080);
     let summary2 = reconcile_tick(&ctx2, &backoff).await;
     assert_eq!(
@@ -328,7 +328,8 @@ async fn reconcile_loop_converges_after_caddy_restart() {
 // ── SLIP-125: TLS policy preservation contract tests ────────────────────────
 
 /// Fetch the current TLS automation policies array from a real Caddy.
-/// Returns an empty vec if the `policies` key is absent (404).
+/// Returns an empty vec if the `policies` key is absent (non-success GET,
+/// which real Caddy surfaces as 400 for a missing intermediate path).
 async fn fetch_tls_policies(base_url: &str) -> Vec<serde_json::Value> {
     let http = reqwest::Client::new();
     let resp = http
@@ -345,9 +346,35 @@ async fn fetch_tls_policies(base_url: &str) -> Vec<serde_json::Value> {
     }
 }
 
+/// Ensure the `/config/apps/tls/automation/policies` array exists on a real
+/// Caddy using a create-only `PUT []`, tolerating 409 Conflict (key already
+/// exists). This mirrors what the production `upsert_tls_policy` does on the
+/// empty-policies path. Caddy's admin API auto-creates intermediate map keys
+/// for PUT but NOT for POST, so POST into a missing tree would 500. Calling
+/// this before the first `inject_foreign_policy` POST is what makes the test
+/// harness match real-Caddy semantics.
+async fn ensure_policies_array_exists(base_url: &str) {
+    let http = reqwest::Client::new();
+    let resp = http
+        .put(format!("{base_url}/config/apps/tls/automation/policies"))
+        .json(&serde_json::json!([]))
+        .send()
+        .await
+        .expect("PUT policies array");
+    // 2xx = created, 409 = already exists. Anything else is a hard failure.
+    assert!(
+        resp.status().is_success() || resp.status() == reqwest::StatusCode::CONFLICT,
+        "ensure_policies_array_exists failed: {}",
+        resp.status()
+    );
+}
+
 /// Inject a foreign (non-`slip-tls-*`) policy directly into a real Caddy
-/// via the admin API (POST appends one element).
+/// via the admin API (POST appends one element). Ensures the parent
+/// `policies` array exists first via a create-only PUT, because Caddy's
+/// admin API does not auto-create intermediate map keys for POST.
 async fn inject_foreign_policy(base_url: &str, policy: &serde_json::Value) {
+    ensure_policies_array_exists(base_url).await;
     let http = reqwest::Client::new();
     let resp = http
         .post(format!("{base_url}/config/apps/tls/automation/policies"))
@@ -386,7 +413,9 @@ fn foreign_tailscale_policy() -> serde_json::Value {
     })
 }
 
-/// A foreign internal-CA policy (no `@id`).
+/// Exercises the `issuers`-based internal-CA shape (distinct from the
+/// `get_certificate`-based Tailscale shape) to confirm ownership checks are
+/// shape-agnostic.
 fn foreign_internal_policy() -> serde_json::Value {
     serde_json::json!({
         "subjects": ["internal.lab.local"],
@@ -435,7 +464,7 @@ async fn tls_policies_foreign_survive_reconcile_cycles_on_real_caddy() {
     assert_eq!(
         after_startup.len(),
         4,
-        "foreign policies must survive startup — no wholesale wipe"
+        "foreign policies must survive startup, no wholesale wipe"
     );
     // Foreign policies unchanged in order.
     assert_eq!(
@@ -481,7 +510,7 @@ async fn tls_policies_foreign_survive_reconcile_cycles_on_real_caddy() {
     assert_eq!(
         after_c1.len(),
         4,
-        "no new duplicates after cycle 1 — Slip converged idempotently"
+        "no new duplicates after cycle 1, Slip converged idempotently"
     );
     assert_eq!(after_c1[0], foreign_dns01_before, "DNS-01 survives cycle 1");
     assert_eq!(after_c1[1], foreign_ts_before, "Tailscale survives cycle 1");
@@ -501,7 +530,7 @@ async fn tls_policies_foreign_survive_reconcile_cycles_on_real_caddy() {
     assert_eq!(
         after_c2.len(),
         4,
-        "no new duplicates after cycle 2 — Slip stable"
+        "no new duplicates after cycle 2, Slip stable"
     );
     assert_eq!(after_c2[0], foreign_dns01_before, "DNS-01 survives cycle 2");
     assert_eq!(after_c2[1], foreign_ts_before, "Tailscale survives cycle 2");
@@ -610,7 +639,7 @@ async fn tls_deploy_tailscale_policy_remains_present_on_real_caddy() {
 
 /// Real-Caddy contract: the missing-policy-path create-only initialization
 /// works. On a fresh Caddy (no `policies` key), `upsert_tls_policy` creates
-/// the array via `PUT .../policies []` (create-only) and appends — without
+/// the array via `PUT .../policies []` (create-only) and appends, without
 /// ever writing the parent `automation` object.
 #[tokio::test]
 #[ignore]
@@ -618,7 +647,10 @@ async fn tls_upsert_initializes_absent_policies_on_real_caddy() {
     let guard = start_caddy();
     let client = CaddyClient::new(guard.base_url.clone());
 
-    // Fresh Caddy: no policies key. GET should 404.
+    // Fresh Caddy: no `apps/tls/automation/policies` key. Real Caddy wraps
+    // the missing-intermediate traversal error as HTTP 400 (not 404), so we
+    // assert non-success rather than hard-coding 404. The production code
+    // treats any non-success GET as "absent → empty" (caddy.rs:720-724).
     let http = reqwest::Client::new();
     let resp = http
         .get(format!(
@@ -628,13 +660,13 @@ async fn tls_upsert_initializes_absent_policies_on_real_caddy() {
         .send()
         .await
         .expect("GET policies on fresh caddy");
-    assert_eq!(
-        resp.status(),
-        404,
-        "fresh Caddy should have no policies key (404)"
+    assert!(
+        !resp.status().is_success(),
+        "fresh Caddy should have no policies key (non-success GET, real Caddy returns 400): got {}",
+        resp.status()
     );
 
-    // Upsert a Slip-owned policy — should initialize the array.
+    // Upsert a Slip-owned policy, should initialize the array.
     let subjects = vec!["deploy.example.com".to_string()];
     let policy = build_tls_policy(&subjects, TlsStrategy::Internal, None, None, None);
     client
@@ -651,7 +683,7 @@ async fn tls_upsert_initializes_absent_policies_on_real_caddy() {
     );
 
     // The parent `automation` object should NOT have been replaced with a
-    // `{"policies":[]}` body — verify the policies key exists and has our
+    // `{"policies":[]}` body, verify the policies key exists and has our
     // one element (already asserted above), and that a second upsert is
     // idempotent (no duplicate, no wipe).
     client
@@ -700,7 +732,7 @@ async fn tls_upsert_conflicts_on_unowned_same_subject_on_real_caddy() {
 }
 
 /// Real-Caddy contract: replacing an owned policy via PATCH-by-ID updates
-/// it in place — preserving array ordering — rather than DELETE-then-append
+/// it in place, preserving array ordering, rather than DELETE-then-append
 /// which would move it to the end. Foreign policies before and after the
 /// owned entry stay in their original positions.
 #[tokio::test]
@@ -753,7 +785,7 @@ async fn tls_upsert_patch_in_place_preserves_ordering_on_real_caddy() {
         patch_resp.status()
     );
 
-    // Now upsert an ACME policy for the same subject — the owned policy
+    // Now upsert an ACME policy for the same subject, the owned policy
     // (at index 1) is found by @id, bodies differ → PATCH /id/<id> in place.
     let new_policy = build_tls_policy(
         &slip_subjects,
@@ -768,13 +800,13 @@ async fn tls_upsert_patch_in_place_preserves_ordering_on_real_caddy() {
         .expect("PATCH-in-place replace should succeed");
 
     let after = fetch_tls_policies(&guard.base_url).await;
-    assert_eq!(after.len(), 3, "no append, no wipe — replaced in place");
+    assert_eq!(after.len(), 3, "no append, no wipe, replaced in place");
 
     // Owned policy still at index 1 (PATCH preserved position).
     assert_eq!(
         after[1]["@id"].as_str(),
         Some("slip-tls-deploy.example.com"),
-        "owned policy still at index 1 — PATCH preserved position"
+        "owned policy still at index 1, PATCH preserved position"
     );
     assert_eq!(
         after[1]["issuers"][0]["module"].as_str(),
