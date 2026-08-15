@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Fix false `tailscale.manager_module` fail in `slip doctor` (SLIP-124).** `slip doctor` now checks the Tailscale Caddy certificate manager via `caddy list-modules` instead of the undocumented admin API `/modules/` endpoint (always 404 on standard Caddy). A present module passes, a confirmed absence fails, and an unavailable inspection warns rather than fails.
+
 - **Preserve externally managed Caddy TLS policies during reconciliation (SLIP-125).** Slip now updates only TLS automation policies it owns, preventing certificate renewal configuration for unrelated routes from being deleted.
 - **Verify prebuilt archive checksums independent of local filename (SLIP-123).** `install.sh` downloaded the release archive as `slip.tar.gz` while the published `.sha256` sidecar named the release asset (`slip-<target>.tar.gz`), so `sha256sum -c` looked for a file that did not exist and verification always failed. The installer now extracts the expected digest from the sidecar, computes the archive digest under its local name, and compares them directly: the sidecar filename field is treated as untrusted and ignored. Malformed or mismatched digests fail with a prescriptive error before extraction or installation.
 

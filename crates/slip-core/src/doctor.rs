@@ -338,6 +338,37 @@ pub fn parse_caddy_modules(modules_output: &str, required_provider: Option<&str>
     }
 }
 
+/// Classify `caddy list-modules` output for a required module ID using exact
+/// matching.
+///
+/// Unlike `parse_caddy_modules` (which is hardcoded to `dns.providers.*` and
+/// uses substring matching for the DNS-plugin contract), this helper takes an
+/// arbitrary full module ID (e.g. `tls.get_certificate.tailscale`) and matches
+/// it with **exact equality** against the first tab-separated field of each
+/// line. This avoids false positives from substring/prefix matches (e.g. a
+/// hypothetical `tls.get_certificate.tailscale_extras` must not match).
+///
+/// `caddy list-modules` prints one module ID per line (no flags). With
+/// `--packages`/`--versions`, each line is `<id>\t<package>\t<version>`; we
+/// split on `\t` and compare only the first field.
+///
+/// An empty `module_id` yields `Skipped` (parity with `parse_caddy_modules`).
+pub fn module_present_exact(modules_output: &str, module_id: &str) -> CheckStatus {
+    if module_id.is_empty() {
+        return CheckStatus::Skipped;
+    }
+    if modules_output.lines().any(|line| {
+        // Trim trailing \r (Windows/CRLF) and compare the first tab-separated
+        // field with exact equality.
+        let field = line.trim_end_matches('\r').split('\t').next().unwrap_or("");
+        field == module_id
+    }) {
+        CheckStatus::Pass
+    } else {
+        CheckStatus::Fail
+    }
+}
+
 /// Build the remedy string for a missing DNS plugin.
 pub fn dns_plugin_remedy(provider: &str) -> String {
     format!(
@@ -877,6 +908,68 @@ mod tests {
         let r = dns_plugin_remedy("cloudflare");
         assert!(r.contains("xcaddy build"));
         assert!(r.contains("caddy-dns/cloudflare"));
+    }
+
+    // ── module_present_exact ─────────────────────────────────────────────────
+
+    #[test]
+    fn module_present_exact_present_is_pass() {
+        let out = "http.handlers.reverse_proxy\ntls.get_certificate.tailscale\n";
+        assert_eq!(
+            module_present_exact(out, "tls.get_certificate.tailscale"),
+            CheckStatus::Pass
+        );
+    }
+
+    #[test]
+    fn module_present_exact_absent_is_fail() {
+        let out = "http.handlers.reverse_proxy\n";
+        assert_eq!(
+            module_present_exact(out, "tls.get_certificate.tailscale"),
+            CheckStatus::Fail
+        );
+    }
+
+    #[test]
+    fn module_present_exact_rejects_substring() {
+        // A module whose ID merely contains the target as a substring must NOT
+        // match; exact line/field equality is required.
+        let out = "tls.get_certificate.tailscale_extras\n";
+        assert_eq!(
+            module_present_exact(out, "tls.get_certificate.tailscale"),
+            CheckStatus::Fail
+        );
+        // Prefix-only also rejected.
+        let out2 = "tls.get_certificate.tailscale.v2\n";
+        assert_eq!(
+            module_present_exact(out2, "tls.get_certificate.tailscale"),
+            CheckStatus::Fail
+        );
+    }
+
+    #[test]
+    fn module_present_exact_tab_packages_first_field() {
+        // `caddy list-modules --packages` emits `<id>\t<package>`. The first
+        // tab-separated field is the module ID; only it must match exactly.
+        let out = "http.handlers.reverse_proxy\tgithub.com/caddyserver/caddy/v2\n\
+                   tls.get_certificate.tailscale\tgithub.com/caddyserver/caddy/v2\tv2.11.0\n";
+        assert_eq!(
+            module_present_exact(out, "tls.get_certificate.tailscale"),
+            CheckStatus::Pass
+        );
+        // A package path that happens to contain the needle must not match.
+        let out2 = "http.handlers.reverse_proxy\tgithub.com/x/tls.get_certificate.tailscale\n";
+        assert_eq!(
+            module_present_exact(out2, "tls.get_certificate.tailscale"),
+            CheckStatus::Fail
+        );
+    }
+
+    #[test]
+    fn module_present_exact_empty_module_id_is_skipped() {
+        assert_eq!(module_present_exact("anything", ""), CheckStatus::Skipped);
+        // Empty output + empty id still skipped (id check first).
+        assert_eq!(module_present_exact("", ""), CheckStatus::Skipped);
     }
 
     // ── CidrSet / is_cloudflare_ip ──────────────────────────────────────────

@@ -49,7 +49,7 @@ pub use docker::{DockerClient, parse_cpu_limit, parse_memory_limit};
 pub use doctor::{
     CheckStatus, CidrSet, DoctorAction, DoctorReport, Summary, VerificationCheck, aggregate_exit,
     classify_dns_expectation, classify_ip, classify_ufw, fetch_cloudflare_ranges,
-    is_private_or_cgnat, parse_caddy_modules, render_human,
+    is_private_or_cgnat, module_present_exact, parse_caddy_modules, render_human,
 };
 pub use error::{CaddyError, ConfigError, HealthError, RuntimeError};
 pub use health::{HealthCheck, HealthChecker};

@@ -20,7 +20,7 @@ use std::process::Command;
 use slip_core::doctor::{
     self, CheckStatus, CommandOutput, CommandRunner, DoctorAction, DoctorReport, VerificationCheck,
     aggregate_exit, classify_dns_expectation, classify_ufw, dns_plugin_remedy,
-    fetch_cloudflare_ranges, parse_caddy_modules, render_human,
+    fetch_cloudflare_ranges, module_present_exact, parse_caddy_modules, render_human,
 };
 
 use crate::output;
@@ -1186,6 +1186,103 @@ fn collect_registry_hosts(
     out
 }
 
+/// The canonical Caddy module ID for the built-in Tailscale certificate
+/// manager (standard since Caddy v2.5). Used by `classify_manager_module`
+/// and the reconcile preflight.
+const TAILSCALE_CERT_MANAGER_ID: &str = "tls.get_certificate.tailscale";
+
+/// Classify the `tailscale.manager_module` doctor check using the injected
+/// `CommandRunner` to run `caddy list-modules` directly (mirroring
+/// `check_caddy_dns_plugin`). This decouples the check from the admin API
+/// entirely: the admin API reflects runtime config, not the compiled module
+/// set, and its `/modules/` endpoint is undocumented and always 404 on
+/// standard Caddy (the root cause of SLIP-124).
+///
+/// Classification (per the SLIP-124 decision table):
+/// - exit 0 + stdout contains exact `tls.get_certificate.tailscale` → `Pass`
+/// - exit 0 + stdout lacks the exact ID → `Fail` (confirmed absent).
+///   Remedy: upgrade Caddy to v2.5+ or rebuild with xcaddy.
+/// - exit nonzero → `Warn` (cannot verify; don't claim absence).
+/// - binary not found / io error → `Warn` (cannot verify).
+///
+/// Extracted from `check_tls` so it is unit-testable via `FakeRunner` without
+/// constructing a `CaddyClient` or running the async TLS checks.
+fn classify_manager_module(runner: &dyn CommandRunner) -> VerificationCheck {
+    const NAME: &str = "tailscale.manager_module";
+    const LABEL: &str = "Tailscale Caddy certificate manager";
+    match runner.run("caddy", &["list-modules"]) {
+        Ok(o) if o.status == 0 => {
+            match module_present_exact(&o.stdout, TAILSCALE_CERT_MANAGER_ID) {
+                CheckStatus::Pass => VerificationCheck::new(
+                    NAME,
+                    LABEL,
+                    CheckStatus::Pass,
+                    format!(
+                        "{} found via `caddy list-modules`",
+                        TAILSCALE_CERT_MANAGER_ID
+                    ),
+                    None,
+                ),
+                CheckStatus::Fail => VerificationCheck::new(
+                    NAME,
+                    LABEL,
+                    CheckStatus::Fail,
+                    format!(
+                        "Caddy build lacks {}; `caddy list-modules` did not list it \
+                         (built-in since Caddy v2.5)",
+                        TAILSCALE_CERT_MANAGER_ID
+                    ),
+                    Some(String::from(
+                        "upgrade Caddy to v2.5 or later, or rebuild with \
+                         `xcaddy build` if using a custom build; then restart caddy",
+                    )),
+                ),
+                // Skipped only when module_id is empty (never, it's a const);
+                // treat defensively as a fail-closed Warn so we never silently
+                // claim presence.
+                CheckStatus::Skipped | CheckStatus::Warn => VerificationCheck::new(
+                    NAME,
+                    LABEL,
+                    CheckStatus::Warn,
+                    format!(
+                        "could not classify {} in `caddy list-modules` output",
+                        TAILSCALE_CERT_MANAGER_ID
+                    ),
+                    Some(String::from("run `caddy list-modules` manually to verify")),
+                ),
+            }
+        }
+        Ok(o) => VerificationCheck::new(
+            NAME,
+            LABEL,
+            CheckStatus::Warn,
+            format!(
+                "`caddy list-modules` exited {}; cannot verify Tailscale manager module{}",
+                o.status,
+                if o.stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", o.stderr.trim())
+                }
+            ),
+            Some(String::from(
+                "ensure `caddy` is installed and on $PATH, then run \
+                 `caddy list-modules` manually to confirm \
+                 tls.get_certificate.tailscale is compiled in",
+            )),
+        ),
+        Err(_) => VerificationCheck::new(
+            NAME,
+            LABEL,
+            CheckStatus::Warn,
+            "no `caddy` binary found on $PATH; cannot verify Tailscale manager module".to_string(),
+            Some(String::from(
+                "install Caddy (v2.5+) or expose the admin API, then re-run `slip doctor`",
+            )),
+        ),
+    }
+}
+
 /// Check 6: TLS issuer + cert expiry + stuck ACME (documented unsupported).
 async fn check_tls(
     cfg: &DoctorConfig,
@@ -1450,28 +1547,11 @@ async fn check_tls(
             ));
         }
 
-        // tailscale.manager_module — Caddy has the Tailscale manager
-        let has_manager = caddy.has_cert_manager("tailscale").await.unwrap_or(false);
-        if has_manager {
-            out.push(VerificationCheck::new(
-                "tailscale.manager_module",
-                "Tailscale Caddy certificate manager",
-                CheckStatus::Pass,
-                String::from("tls.get_certificate.tailscale found in Caddy module inventory"),
-                None,
-            ));
-        } else {
-            out.push(VerificationCheck::new(
-                "tailscale.manager_module",
-                "Tailscale Caddy certificate manager",
-                CheckStatus::Fail,
-                String::from(
-                    "Tailscale certificate manager not found in Caddy — \
-                     Caddy v2.5+ required for built-in Tailscale manager",
-                ),
-                Some(String::from("upgrade Caddy to v2.5 or later")),
-            ));
-        }
+        // tailscale.manager_module: Caddy has the Tailscale manager.
+        // Use the injected `runner` + `caddy list-modules` directly (SLIP-124).
+        // The admin API `/modules/` endpoint is undocumented and always 404 on
+        // standard Caddy, so it cannot authoritatively report compiled modules.
+        out.push(classify_manager_module(runner));
 
         // tailscale.hostname_match — per .ts.net host
         for ts_host in &ts_net_hosts {
@@ -2416,6 +2496,95 @@ mod tests {
             ..Default::default()
         };
         let check = check_caddy_dns_plugin(&runner, &cfg);
+        assert_eq!(check.status, CheckStatus::Pass);
+    }
+
+    // ── classify_manager_module (SLIP-124) ───────────────────────────────────
+    // The tailscale.manager_module check now uses `caddy list-modules` via the
+    // injected runner (like check_caddy_dns_plugin) instead of the admin API,
+    // which returns 404 on the undocumented `/modules/` endpoint.
+
+    #[test]
+    fn manager_module_pass_when_exact_module_present() {
+        // API 404 + binary present with exact module ID → Pass (regression for
+        // the original SLIP-124 bug: a 404 must not flip the result to Fail).
+        let runner = FakeRunner::new().with(
+            "caddy",
+            ok_out(
+                "http.handlers.reverse_proxy\ntls.get_certificate.tailscale\ndns.providers.cloudflare\n",
+            ),
+        );
+        let check = classify_manager_module(&runner);
+        assert_eq!(check.name, "tailscale.manager_module");
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(check.detail.contains("tls.get_certificate.tailscale"));
+        assert!(check.remedy.is_none());
+    }
+
+    #[test]
+    fn manager_module_fail_when_absent_after_successful_enumeration() {
+        // Binary succeeds but omits the module → confirmed absent → Fail with
+        // a prescriptive upgrade/rebuild remedy.
+        let runner = FakeRunner::new().with(
+            "caddy",
+            ok_out("http.handlers.reverse_proxy\ndns.providers.cloudflare\n"),
+        );
+        let check = classify_manager_module(&runner);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.remedy.as_deref().unwrap().contains("v2.5"));
+    }
+
+    #[test]
+    fn manager_module_warn_when_binary_nonzero_exit() {
+        // Nonzero exit means the command failed, not that the module is absent.
+        // Must Warn (unknown), never Fail.
+        let runner = FakeRunner::new().with(
+            "caddy",
+            CommandOutput {
+                stdout: String::new(),
+                stderr: String::from("caddy: panic: something broke"),
+                status: 1,
+            },
+        );
+        let check = classify_manager_module(&runner);
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("exited 1"));
+        assert!(check.detail.contains("something broke"));
+    }
+
+    #[test]
+    fn manager_module_warn_when_no_caddy_binary() {
+        // No caddy on $PATH → cannot verify → Warn, not Fail.
+        let runner = FakeRunner::new();
+        let check = classify_manager_module(&runner);
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("no `caddy` binary"));
+    }
+
+    #[test]
+    fn manager_module_rejects_substring_match() {
+        // A module whose ID merely contains the target as a substring must not
+        // pass; exact line/field equality is required (best-practices Q2).
+        let runner = FakeRunner::new().with(
+            "caddy",
+            ok_out("http.handlers.reverse_proxy\ntls.get_certificate.tailscale_extras\n"),
+        );
+        let check = classify_manager_module(&runner);
+        assert_eq!(check.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn manager_module_accepts_tab_separated_packages_output() {
+        // `caddy list-modules --packages` emits `<id>\t<package>`; the first
+        // tab-field is the module ID and must match exactly.
+        let runner = FakeRunner::new().with(
+            "caddy",
+            ok_out(
+                "http.handlers.reverse_proxy\tgithub.com/caddyserver/caddy/v2\n\
+                 tls.get_certificate.tailscale\tgithub.com/caddyserver/caddy/v2\tv2.11.0\n",
+            ),
+        );
+        let check = classify_manager_module(&runner);
         assert_eq!(check.status, CheckStatus::Pass);
     }
 
