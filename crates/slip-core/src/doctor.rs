@@ -933,7 +933,7 @@ mod tests {
     #[test]
     fn module_present_exact_rejects_substring() {
         // A module whose ID merely contains the target as a substring must NOT
-        // match — exact line/field equality is required.
+        // match; exact line/field equality is required.
         let out = "tls.get_certificate.tailscale_extras\n";
         assert_eq!(
             module_present_exact(out, "tls.get_certificate.tailscale"),

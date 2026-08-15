@@ -1186,23 +1186,23 @@ impl CaddyClient {
     ///
     /// API-first for compatibility: queries `GET /modules/` and checks the
     /// `tls.get_certificate` array for `name`. A successful, parseable API
-    /// response is authoritative — including `Ok(false)` when the module is
-    /// confirmed absent (per AC #2: a definitive API listing without the module
-    /// ID is a fail-able absence).
+    /// response is authoritative, including `Ok(false)` when the module is
+    /// confirmed absent (per AC #2: a definitive API listing without the
+    /// module ID is a fail-able absence).
     ///
-    /// On API failure (404 on the undocumented `/modules/` endpoint, transport
-    /// error, parse error), falls back to `caddy list-modules` via `runner` —
-    /// the documented enumeration mechanism for compiled modules. The binary
-    /// is authoritative on exit 0: [`module_present_exact`] decides
-    /// `Ok(true)`/`Ok(false)`. A nonzero exit or a missing binary yields
-    /// `Err` (Unknown) — the caller (reconcile preflight) fail-closes on
-    /// `Err` rather than silently treating the module as absent.
+    /// On API failure (404 on the undocumented `/modules/` endpoint,
+    /// transport error, parse error), falls back to `caddy list-modules` via
+    /// `runner`, the documented enumeration mechanism for compiled modules.
+    /// The binary is authoritative on exit 0: [`module_present_exact`]
+    /// decides `Ok(true)`/`Ok(false)`. A nonzero exit or a missing binary
+    /// yields `Err` (Unknown). The caller (reconcile preflight) fail-closes
+    /// on `Err` rather than silently treating the module as absent.
     ///
     /// Return semantics (tri-state via `Result<bool>`):
-    /// - `Ok(true)` — module confirmed present (API or binary).
-    /// - `Ok(false)` — module confirmed absent (authoritative API listing or
+    /// - `Ok(true)`: module confirmed present (API or binary).
+    /// - `Ok(false)`: module confirmed absent (authoritative API listing or
     ///   binary `list-modules` exit 0 without the ID).
-    /// - `Err` — unknown (API unreachable AND binary missing/nonzero). The
+    /// - `Err`: unknown (API unreachable AND binary missing/nonzero). The
     ///   caller must not treat this as absence.
     pub async fn has_cert_manager_with_runner(
         &self,
@@ -1210,7 +1210,7 @@ impl CaddyClient {
         runner: &dyn crate::doctor::CommandRunner,
     ) -> Result<bool, CaddyError> {
         // Try GET /modules/ first (authoritative when it returns a parseable
-        // module list — standard Caddy never does for /modules/, but a
+        // module list; standard Caddy never does for /modules/, but a
         // hypothetical admin extension might).
         match self.list_modules().await {
             Ok(modules) => {
@@ -1222,14 +1222,14 @@ impl CaddyClient {
                         .iter()
                         .any(|m| m.as_str().map(|s| s == name).unwrap_or(false)));
                 }
-                // API succeeded but the namespace was absent/empty — a
+                // API succeeded but the namespace was absent/empty: a
                 // definitive listing without the module → confirmed absent.
                 Ok(false)
             }
             Err(api_err) => {
-                // API failed (404/transport/parse). Fall back to the binary via
-                // the injected runner — the documented source of truth for
-                // compiled modules.
+                // API failed (404/transport/parse). Fall back to the binary
+                // via the injected runner, the documented source of truth
+                // for compiled modules.
                 let module_id = format!("tls.get_certificate.{name}");
                 match runner.run("caddy", &["list-modules"]) {
                     Ok(o) if o.status == 0 => {
@@ -1246,7 +1246,7 @@ impl CaddyClient {
                         Err(CaddyError::TlsConfigFailed(format!(
                             "could not verify certificate manager '{name}': \
                              admin API /modules/ failed ({api_err}) and \
-                             `caddy list-modules` exited {} — ensure `caddy` is \
+                             `caddy list-modules` exited {}; ensure `caddy` is \
                              on $PATH or the admin API is reachable; \
                              run `caddy list-modules` to confirm",
                             o.status
@@ -1262,7 +1262,7 @@ impl CaddyClient {
                         Err(CaddyError::TlsConfigFailed(format!(
                             "could not verify certificate manager '{name}': \
                              admin API /modules/ failed ({api_err}) and \
-                             `caddy` binary not runnable ({io_err}) — ensure \
+                             `caddy` binary not runnable ({io_err}); ensure \
                              `caddy` is on $PATH or the admin API is reachable; \
                              run `caddy list-modules` to confirm"
                         )))

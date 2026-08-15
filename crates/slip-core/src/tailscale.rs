@@ -132,7 +132,7 @@ pub async fn preflight_tailscale(
             return Err(TailscalePreflightError {
                 check: "tailscale.manager_module",
                 remedy: format!(
-                    "could not verify Tailscale certificate manager — {e}. \
+                    "could not verify Tailscale certificate manager: {e}. \
                      Ensure `caddy` is on $PATH or the admin API is reachable, \
                      then run `caddy list-modules` to confirm \
                      tls.get_certificate.tailscale is compiled in"
@@ -143,7 +143,7 @@ pub async fn preflight_tailscale(
     if !manager_module {
         return Err(TailscalePreflightError {
             check: "tailscale.manager_module",
-            remedy: "Tailscale certificate manager not found in Caddy — \
+            remedy: "Tailscale certificate manager not found in Caddy; \
                      `caddy list-modules` confirms tls.get_certificate.tailscale \
                      is absent; Caddy v2.5+ required (built-in since 2.5), \
                      rebuild with `xcaddy build` if using a custom build"
