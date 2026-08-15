@@ -922,7 +922,7 @@ fn resolve_domain(opts: &ServerInitOpts, manifest: Option<&ManifestValues>) -> O
 
 /// Resolve the effective TLS strategy: CLI flag > manifest value > default.
 fn resolve_tls(opts: &ServerInitOpts, manifest: Option<&ManifestValues>) -> String {
-    if opts.tls != "internal" {
+    if opts.tls != "acme" {
         return opts.tls.clone();
     }
     if let Some(m) = manifest
@@ -930,7 +930,7 @@ fn resolve_tls(opts: &ServerInitOpts, manifest: Option<&ManifestValues>) -> Stri
     {
         return tls.clone();
     }
-    "internal".to_string()
+    "acme".to_string()
 }
 
 /// Resolve the effective runtime backend: CLI flag > manifest value > default.

@@ -1241,7 +1241,7 @@ async fn check_tls(
         .deploy
         .as_ref()
         .map(|d| d.tls.as_str())
-        .unwrap_or("internal");
+        .unwrap_or_else(|| slip_core::ServerDeployConfig::default().tls.as_str());
 
     // Single loop: query each host once and reuse the result.
     let mut issuer_any_mismatch = false;
@@ -1634,7 +1634,7 @@ async fn check_dns(
         .as_ref()
         .and_then(|s| s.deploy.as_ref())
         .map(|d| d.tls.as_str())
-        .unwrap_or("internal");
+        .unwrap_or_else(|| slip_core::ServerDeployConfig::default().tls.as_str());
 
     let mut any_fail = false;
     let mut any_warn = false;

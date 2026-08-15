@@ -25,9 +25,11 @@ GitHub Actions → signed webhook → slipd → pull → health check → swap r
 - **Secrets management** — per-app secret store with restrictive file permissions
 - **Per-container health** — mixed HTTP + worker containers in a single pod
 - **Structured logging** — JSON logs via `tracing`
-- **`slip init`** — 🚧 WIP (currently a stub; see [v1.0 roadmap](https://linear.app/mitchelljphayes/project/slip-v1-0-roadmap-3b6e6e0b0b0b))
+- **`slip init`** — scaffolds a repo's `slip.toml`, CI workflow, and agent contract
 - **`slip status`** — daemon overview (uptime, Caddy/runtime health, app table) and per-app detail (tag, container state, health probe, last deploy, routes, cert issuer, secret keys, config drift)
-- **`slip logs`** — 🚧 WIP (currently a stub; see [v1.0 roadmap](https://linear.app/mitchelljphayes/project/slip-v1-0-roadmap-3b6e6e0b0b0b))
+- **`slip logs`** — remote container log tail/follow via the management API
+- **`slip doctor`** — host diagnostics (DNS, UFW, runtime, registry, Caddy, TLS) with prescriptive remedies
+- **`slip apply`** — the repo's `slip.toml` becomes the source of truth (validate → diff → push)
 
 ## Install
 
@@ -79,9 +81,15 @@ url = "ghcr.io"
 
 [caddy]
 admin_api = "http://localhost:2019"
+acme_email = "you@example.com"   # required for the acme / cloudflare-dns01 TLS strategies
 
 [storage]
 path = "/var/lib/slip"
+
+[deploy]
+domain = "deploy.example.com"    # slipd registers the webhook route + TLS policy itself
+# tls = "acme"                   # default: publicly trusted, so CI can verify it.
+                                 # Alternatives: cloudflare-dns01, tailscale, internal
 EOF
 ```
 
