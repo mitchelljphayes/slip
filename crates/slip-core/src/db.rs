@@ -17,9 +17,10 @@ use crate::deploy::{DeployContext, DeployStatus, TriggerSource};
 
 /// Schema migrations, versioned by `rusqlite_migration`.
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(include_str!(
-        "../migrations/001_create_deploys.sql"
-    ))])
+    Migrations::new(vec![
+        M::up(include_str!("../migrations/001_create_deploys.sql")),
+        M::up(include_str!("../migrations/002_create_services.sql")),
+    ])
 }
 
 // ─── Db wrapper ────────────────────────────────────────────────────────────────

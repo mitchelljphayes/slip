@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Internal service model and persistence foundation (SLIP-106 Part 1/3).** Adds the domain contracts and SQLite persistence for managed services without any user-facing service commands. `ServiceName` strict lowercase DNS-label validation, `ProviderKind` closed enum (Postgres only), export-ready `ServiceSpec` with canonical JSON hashing, and internal `ServiceState` with CSPRNG instance IDs, generation compare-and-swap, and retained runtime state. Object-safe `ServiceProvider` trait with instance-scoped secret capability. Additive migration 002 (`slip_metadata`, `services`, `service_state`) with CHECK constraints mirroring Rust validators. Typed `ServiceRepository` with transactional desired and state inserts, generation-safe delete and retain, and atomic retained reattach. No CLI, API, runtime backend, or provider implementation changes.
+
 ## [0.1.1] - 2026-08-16
 
 Patch release of three backward-compatible fixes to `0.1.0`. **Upgrade every
