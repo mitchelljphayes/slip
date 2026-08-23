@@ -139,3 +139,99 @@ jobs:
         run: SLIP_BIN=./target/release/slipd ./scripts/smoke-test.sh
         env:
           SLIP_SECRET: test-secret
+
+  service-security:
+    name: Service Security Tests (Linux root)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: cargo --version && rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Build slip-core lib test binary (as non-root runner)
+        run: |
+          # Compile the test binary as the non-root runner (uid 1000).
+          # cargo is never run as root. Capture the exact binary path
+          # from Cargo's JSON output for deterministic discovery.
+          cargo test -p slip-core --lib --no-run --message-format json \
+            > /tmp/cargo-test-json.txt 2>&1 || {
+              cat /tmp/cargo-test-json.txt
+              exit 1
+            }
+          # Extract the test binary path from the JSON output. The
+          # "test-binary" artifact has the executable path.
+          TEST_BIN=$(grep -o '"executable":"[^"]*"' /tmp/cargo-test-json.txt \
+            | head -1 | sed 's/"executable":"//;s/"//')
+          if [ -z "$TEST_BIN" ]; then
+            echo "ERROR: could not extract test binary from cargo JSON"
+            cat /tmp/cargo-test-json.txt | head -20
+            exit 1
+          fi
+          echo "Test binary: $TEST_BIN"
+          echo "TEST_BIN=$TEST_BIN" >> "$GITHUB_ENV"
+      - name: Run Linux storage and secret security tests as root
+        run: |
+          # The GitHub Actions runner is non-root (uid 1000) on
+          # ubuntu-latest. We execute the test binary via sudo so the
+          # root-gated tests (openat2, UID 0 checks) can run.
+          # The root assertion is inside each test (skip_if_nonroot).
+          #
+          # We run two separate filter groups:
+          # 1. Linux-specific storage+secret tests (require root + openat2).
+          # 2. Portable tests (image_ref, secret portable).
+          #
+          # The Linux-specific group must have a non-zero passed count
+          # to prevent a false green from portables alone.
+
+          # Group 1: Linux-specific tests (nested in _linux module).
+          sudo env -i \
+            PATH="$PATH" \
+            HOME="$HOME" \
+            RUST_BACKTRACE=1 \
+            "$TEST_BIN" --test-threads=1 \
+            'services::storage::_linux::tests::' \
+            'services::secret::_linux::tests::' \
+            > /tmp/linux-tests.txt 2>&1
+          LINUX_EXIT=$?
+          cat /tmp/linux-tests.txt
+          LINUX_PASSED=$(grep -oP 'test result: ok\. \K\d+' /tmp/linux-tests.txt | tail -1)
+          if [ -z "$LINUX_PASSED" ] || [ "$LINUX_PASSED" -eq 0 ]; then
+            echo "ERROR: 0 Linux-specific tests passed."
+            echo "The _linux::tests:: filters may not match any tests."
+            echo "This means the security-critical tests did not run."
+            exit 1
+          fi
+          echo "Linux-specific tests passed: $LINUX_PASSED"
+          # Assert a minimum expected count. The exact count may grow
+          # but must be at least 20 (storage 20 + secret 30+).
+          if [ "$LINUX_PASSED" -lt 20 ]; then
+            echo "ERROR: only $LINUX_PASSED Linux tests passed (expected >= 20)."
+            exit 1
+          fi
+
+          # Group 2: Portable tests (image_ref + secret portable).
+          sudo env -i \
+            PATH="$PATH" \
+            HOME="$HOME" \
+            RUST_BACKTRACE=1 \
+            "$TEST_BIN" --test-threads=1 \
+            'services::image_ref::tests::' \
+            'services::secret::portable_tests::' \
+            > /tmp/portable-tests.txt 2>&1
+          PORTABLE_EXIT=$?
+          cat /tmp/portable-tests.txt
+          PORTABLE_PASSED=$(grep -oP 'test result: ok\. \K\d+' /tmp/portable-tests.txt | tail -1)
+          if [ -z "$PORTABLE_PASSED" ] || [ "$PORTABLE_PASSED" -eq 0 ]; then
+            echo "ERROR: 0 portable tests passed."
+            exit 1
+          fi
+          echo "Portable tests passed: $PORTABLE_PASSED"
+
+          # Exit non-zero if either group failed.
+          if [ $LINUX_EXIT -ne 0 ] || [ $PORTABLE_EXIT -ne 0 ]; then
+            exit 1
+          fi
+      - name: Cleanup
+        if: always()
+        run: rm -rf /tmp/slip-test /tmp/slip-service-test /tmp/cargo-test-json.txt /tmp/test-output.txt /tmp/linux-tests.txt /tmp/portable-tests.txt
