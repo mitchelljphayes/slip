@@ -235,3 +235,47 @@ jobs:
       - name: Cleanup
         if: always()
         run: rm -rf /tmp/slip-test /tmp/slip-service-test /tmp/cargo-test-json.txt /tmp/test-output.txt /tmp/linux-tests.txt /tmp/portable-tests.txt
+
+  services-contract:
+    name: Services Contract Tests (rootful Podman)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: cargo --version && rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Podman (if not present)
+        run: |
+          which podman && podman --version && exit 0
+          sudo apt-get update && sudo apt-get install -y podman
+      - name: Start rootful Podman socket
+        run: |
+          sudo systemctl enable --now podman.socket
+          sudo podman info --format '{{.Host.Security.Rootless}}' || true
+          # Verify the rootful socket is accessible.
+          sudo curl -s --unix-socket /run/podman/podman.sock http://localhost/v5.0.0/libpod/info >/dev/null && echo "rootful Podman socket OK"
+      - name: Run services contract tests
+        run: |
+          # Run the ignored contract tests. Fail if any test fails or if
+          # zero tests run (guards against cfg/ignore mistakes).
+          OUTPUT=$(sudo -E env -i \
+            PATH="$PATH" \
+            HOME="$HOME" \
+            RUST_BACKTRACE=1 \
+            cargo test -p slip-core --test services_contract -- --ignored --test-threads=1 2>&1)
+          EXIT_CODE=$?
+          echo "$OUTPUT"
+          # Assert non-zero test count to prevent false-green from no tests.
+          PASSED=$(echo "$OUTPUT" | grep -oP 'test result: ok\. \K\d+' | tail -1)
+          if [ -z "$PASSED" ] || [ "$PASSED" -eq 0 ]; then
+            echo "ERROR: 0 contract tests passed — the test filter or cfg may be broken"
+            exit 1
+          fi
+          echo "Contract tests passed: $PASSED"
+          exit $EXIT_CODE
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo podman rm -f $(sudo podman ps -a --filter "label=slip.managed=true" -q) 2>/dev/null || true
+          sudo rm -rf /tmp/slip-services-test-*

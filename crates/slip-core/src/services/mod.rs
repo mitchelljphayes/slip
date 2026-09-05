@@ -23,24 +23,33 @@
 //! Part 3 will add the PostgreSQL 18 provider, controller, API, CLI, and
 //! reconciliation.
 
+pub mod controller;
 pub mod image_ref;
 pub mod name;
+pub mod postgres;
 pub mod repository;
 pub mod secret;
 pub mod spec;
 pub mod storage;
 
+pub use controller::{
+    AppConfigUsageReader, FakeUsageReader, ServiceController, ServiceRemovalResult, ServiceStatus,
+    ServiceSummary, ServiceUsageReader,
+};
 pub use image_ref::{ImageDigest, PinnedImageRef};
 pub use name::{ServiceName, ServiceNameError, validate_service_name};
+pub use postgres::{
+    PG18_4_DIGEST, PG18_4_REF, PostgresProvider, resolve_catalog, resolve_image_for_version,
+};
 pub use repository::{ServiceRepository, ServiceRepositoryError, ServiceRow, ServiceStateRow};
 #[cfg(target_os = "linux")]
 pub use secret::InstanceSecretBundle;
 pub use secret::{GenerationName, SecretBundleError, SecretBytes};
 pub use spec::{
-    ContainerId, EnsureAction, EnsureOutcome, FailureCode, FakeInstanceSecrets, HealthKind,
-    InstanceId, InstanceSecretCapability, LifecyclePhase, PostgresConfig, ProviderContext,
-    ProviderKind, ProviderVersion, ProvisionOutcome, ResolvedImage, SecretPurpose, SecretRef,
-    ServiceError, ServiceHealth, ServiceProvider, ServiceSpec, ServiceState, SpecHash,
+    ActiveSecretMounts, ContainerId, EnsureAction, EnsureOutcome, FailureCode, FakeInstanceSecrets,
+    HealthKind, InstanceId, InstanceSecretCapability, LifecyclePhase, PostgresConfig,
+    ProviderContext, ProviderKind, ProviderVersion, ProvisionOutcome, ResolvedImage, SecretPurpose,
+    SecretRef, ServiceError, ServiceHealth, ServiceProvider, ServiceSpec, ServiceState, SpecHash,
 };
 #[cfg(target_os = "linux")]
 pub use storage::ServiceStorage;

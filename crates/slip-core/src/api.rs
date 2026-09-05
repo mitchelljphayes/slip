@@ -453,6 +453,242 @@ pub struct AppListResponse {
     pub apps: Vec<AppResponse>,
 }
 
+// ─── Service API types (SLIP-106 Part 3) ──────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceCreateRequest {
+    pub name: String,
+    pub provider: String,
+    pub version: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ServiceResponse {
+    pub schema: &'static str,
+    pub name: String,
+    pub provider: String,
+    pub version: String,
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<String>,
+    /// Current persisted generation (non-secret operational integer).
+    /// Present on single-GET responses; used by CLI `rm` for CAS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ServiceListResponse {
+    pub schema: &'static str,
+    pub services: Vec<ServiceSummaryResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ServiceSummaryResponse {
+    pub name: String,
+    pub provider: String,
+    pub version: String,
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ServiceDeleteResponse {
+    pub schema: &'static str,
+    pub removed: bool,
+    pub retained: ServiceRetainedInfo,
+    pub affected_apps: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ServiceRetainedInfo {
+    pub data: bool,
+    pub secrets: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ServiceDeleteQuery {
+    pub generation: i64,
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ServiceErrorResponse {
+    pub error: ServiceErrorBody,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ServiceErrorBody {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remedy: Option<String>,
+}
+
+fn service_error_to_response(
+    e: &crate::services::ServiceError,
+) -> (StatusCode, ServiceErrorResponse) {
+    // Sanitize at the API boundary: never pass raw runtime/DB text to clients.
+    // Use closed messages and per-cause remedies. Internal detail stays in logs.
+    let (status, code, message, remedy) = match e {
+        crate::services::ServiceError::UnknownProvider(p) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("unknown provider '{p}'"),
+            Some("supported providers: postgres".to_string()),
+        ),
+        crate::services::ServiceError::InvalidVersion(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "invalid version".to_string(),
+            Some("use a supported major version (e.g. 18)".to_string()),
+        ),
+        crate::services::ServiceError::InvalidName(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "invalid service name".to_string(),
+            Some("use a lowercase DNS label (1-63 chars, no __ or --)".to_string()),
+        ),
+        // Conflict: sanitize — the internal message may contain repo error text.
+        // Classify by checking for known conflict patterns to give the right remedy.
+        crate::services::ServiceError::Conflict(msg) => {
+            if msg.contains("generation") {
+                (
+                    StatusCode::CONFLICT,
+                    "conflict",
+                    "generation mismatch — the service was modified concurrently".to_string(),
+                    Some(
+                        "re-read the service status and retry with the current generation"
+                            .to_string(),
+                    ),
+                )
+            } else if msg.contains("already exists") {
+                (
+                    StatusCode::CONFLICT,
+                    "conflict",
+                    "a service with this name already exists with a different spec".to_string(),
+                    Some(
+                        "remove the existing service first: `slip services rm <name>`".to_string(),
+                    ),
+                )
+            } else if msg.contains("active bindings") {
+                (
+                    StatusCode::CONFLICT,
+                    "conflict",
+                    "service has active bindings from applications".to_string(),
+                    Some("use --force to override (data and secrets will be retained)".to_string()),
+                )
+            } else {
+                (
+                    StatusCode::CONFLICT,
+                    "conflict",
+                    "service state conflict".to_string(),
+                    Some("re-read the service status and retry".to_string()),
+                )
+            }
+        }
+        crate::services::ServiceError::ConcurrentModification => (
+            StatusCode::CONFLICT,
+            "conflict",
+            "concurrent modification detected".to_string(),
+            Some("retry the operation".to_string()),
+        ),
+        crate::services::ServiceError::ContainerNotFound => (
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "service not found".to_string(),
+            Some("the service may have been removed; run `slip services list`".to_string()),
+        ),
+        // Blocked: sanitize — the reason may contain runtime error text.
+        crate::services::ServiceError::Blocked(_, reason) => {
+            // Classify the blocked reason for a useful remedy.
+            if reason.contains("rootful") {
+                (
+                    StatusCode::CONFLICT,
+                    "conflict",
+                    "service operation blocked: runtime is not rootful".to_string(),
+                    Some(
+                        "ensure slipd is running with a rootful Podman/Docker runtime".to_string(),
+                    ),
+                )
+            } else if reason.contains("ownership") || reason.contains("mismatch") {
+                (
+                    StatusCode::CONFLICT,
+                    "conflict",
+                    "service operation blocked: ownership verification failed".to_string(),
+                    Some("the container may have been tampered with; check slipd logs".to_string()),
+                )
+            } else if reason.contains("storage") || reason.contains("linux") {
+                (
+                    StatusCode::CONFLICT,
+                    "conflict",
+                    "service operation blocked: storage not available".to_string(),
+                    Some("ensure the service storage path exists and is accessible".to_string()),
+                )
+            } else {
+                (
+                    StatusCode::CONFLICT,
+                    "conflict",
+                    "service operation blocked".to_string(),
+                    Some("check slipd logs for details".to_string()),
+                )
+            }
+        }
+        crate::services::ServiceError::ReadinessFailed(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "readiness_timeout",
+            "service readiness check failed".to_string(),
+            Some("check container logs and health".to_string()),
+        ),
+        crate::services::ServiceError::ProvisionFailed(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "provision_failed",
+            "service provisioning failed".to_string(),
+            Some("check slipd logs for details".to_string()),
+        ),
+        crate::services::ServiceError::ForeignContainer => (
+            StatusCode::CONFLICT,
+            "conflict",
+            "foreign container exists with the same name".to_string(),
+            Some("remove the foreign container manually".to_string()),
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "internal error".to_string(),
+            None,
+        ),
+    };
+    (
+        status,
+        ServiceErrorResponse {
+            error: ServiceErrorBody {
+                code: code.to_string(),
+                message,
+                remedy,
+            },
+        },
+    )
+}
+
+fn service_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [("cache-control", "no-store")],
+        axum::Json(ServiceErrorResponse {
+            error: ServiceErrorBody {
+                code: "internal".to_string(),
+                message: "service framework is not configured on this server".to_string(),
+                remedy: Some("ensure slipd is running with a rootful runtime".to_string()),
+            },
+        }),
+    )
+        .into_response()
+}
+
 // ─── App error ────────────────────────────────────────────────────────────────
 
 /// Typed errors returned from handlers; each variant maps to an HTTP status.
@@ -534,6 +770,9 @@ pub struct AppState {
     pub renew_locks: DashMap<String, Arc<Mutex<()>>>,
     /// File-system backed secret storage (one file per secret with 0o600 perms).
     pub secrets_store: SecretsStore,
+    /// Managed-service controller (SLIP-106 Part 3). None when services
+    /// framework is not configured (non-rootful runtime or unsupported platform).
+    pub services: Option<Arc<crate::services::ServiceController>>,
 }
 
 impl AppState {
@@ -603,6 +842,14 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
             "/v1/registries/{url}",
             axum::routing::put(handle_set_registry_credential)
                 .delete(handle_remove_registry_credential),
+        )
+        .route(
+            "/v1/services",
+            axum::routing::post(handle_create_service).get(handle_list_services),
+        )
+        .route(
+            "/v1/services/{name}",
+            axum::routing::get(handle_get_service).delete(handle_delete_service),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -3062,6 +3309,240 @@ async fn handle_preview_teardown_all(
     Ok((StatusCode::OK, Json(TeardownAllResponse { torn_down })))
 }
 
+// ─── Service handlers (SLIP-106 Part 3) ───────────────────────────────────────
+
+async fn handle_create_service(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ServiceCreateRequest>,
+) -> Response {
+    let ctrl = match &state.services {
+        Some(c) => c.clone(),
+        None => return service_unavailable(),
+    };
+    let name = match crate::services::ServiceName::parse(&req.name) {
+        Ok(n) => n,
+        Err(e) => {
+            let (st, body) =
+                service_error_to_response(&crate::services::ServiceError::InvalidName(e));
+            return (st, [("cache-control", "no-store")], axum::Json(body)).into_response();
+        }
+    };
+    let provider = match crate::services::ProviderKind::parse(&req.provider) {
+        Ok(p) => p,
+        Err(e) => {
+            let (st, body) = service_error_to_response(&e);
+            return (st, [("cache-control", "no-store")], axum::Json(body)).into_response();
+        }
+    };
+    let major: i64 = match req.version.parse() {
+        Ok(m) => m,
+        Err(_) => {
+            let (st, body) =
+                service_error_to_response(&crate::services::ServiceError::InvalidVersion(format!(
+                    "version '{}' is not a valid major number",
+                    req.version
+                )));
+            return (st, [("cache-control", "no-store")], axum::Json(body)).into_response();
+        }
+    };
+    let (version, _) = match crate::services::resolve_catalog(major) {
+        Ok(v) => v,
+        Err(e) => {
+            let (st, body) = service_error_to_response(&e);
+            return (st, [("cache-control", "no-store")], axum::Json(body)).into_response();
+        }
+    };
+    let spec = match crate::services::ServiceSpec::new(
+        name.clone(),
+        provider,
+        version,
+        crate::services::PostgresConfig {},
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            let (st, body) = service_error_to_response(&e);
+            return (st, [("cache-control", "no-store")], axum::Json(body)).into_response();
+        }
+    };
+    match ctrl.add(spec).await {
+        Ok(()) => {
+            let resp = match ctrl.status(&name).await {
+                Ok(s) => ServiceResponse {
+                    schema: "slip.service/v1",
+                    name: s.name.as_str().to_string(),
+                    provider: s.provider.as_str().to_string(),
+                    version: s.version,
+                    phase: s.phase.as_str().to_string(),
+                    health: s.health.map(|h| h.as_str().to_string()),
+                    generation: Some(s.generation),
+                },
+                Err(_) => ServiceResponse {
+                    schema: "slip.service/v1",
+                    name: name.as_str().to_string(),
+                    provider: provider.as_str().to_string(),
+                    version: "18.4".to_string(),
+                    phase: "provisioning".to_string(),
+                    health: None,
+                    generation: None,
+                },
+            };
+            (
+                StatusCode::CREATED,
+                [("cache-control", "no-store")],
+                axum::Json(resp),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let (st, body) = service_error_to_response(&e);
+            (st, [("cache-control", "no-store")], axum::Json(body)).into_response()
+        }
+    }
+}
+
+async fn handle_list_services(State(state): State<Arc<AppState>>) -> Response {
+    let ctrl = match &state.services {
+        Some(c) => c.clone(),
+        None => return service_unavailable(),
+    };
+    match ctrl.list().await {
+        Ok(svcs) => {
+            let resp = ServiceListResponse {
+                schema: "slip.services/v1",
+                services: svcs
+                    .iter()
+                    .map(|s| ServiceSummaryResponse {
+                        name: s.name.as_str().to_string(),
+                        provider: s.provider.as_str().to_string(),
+                        version: s.version.clone(),
+                        phase: s.phase.as_str().to_string(),
+                        health: s.health.map(|h| h.as_str().to_string()),
+                    })
+                    .collect(),
+            };
+            (
+                StatusCode::OK,
+                [("cache-control", "no-store")],
+                axum::Json(resp),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let (st, body) = service_error_to_response(&e);
+            (st, [("cache-control", "no-store")], axum::Json(body)).into_response()
+        }
+    }
+}
+
+async fn handle_get_service(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let ctrl = match &state.services {
+        Some(c) => c.clone(),
+        None => return service_unavailable(),
+    };
+    let svc_name = match crate::services::ServiceName::parse(&name) {
+        Ok(n) => n,
+        Err(e) => {
+            let (st, body) =
+                service_error_to_response(&crate::services::ServiceError::InvalidName(e));
+            return (st, [("cache-control", "no-store")], axum::Json(body)).into_response();
+        }
+    };
+    match ctrl.status(&svc_name).await {
+        Ok(s) => {
+            let resp = ServiceResponse {
+                schema: "slip.service/v1",
+                name: s.name.as_str().to_string(),
+                provider: s.provider.as_str().to_string(),
+                version: s.version,
+                phase: s.phase.as_str().to_string(),
+                health: s.health.map(|h| h.as_str().to_string()),
+                generation: Some(s.generation),
+            };
+            (
+                StatusCode::OK,
+                [("cache-control", "no-store")],
+                axum::Json(resp),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let (st, body) = service_error_to_response(&e);
+            (st, [("cache-control", "no-store")], axum::Json(body)).into_response()
+        }
+    }
+}
+
+async fn handle_delete_service(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    query: Result<
+        axum::extract::Query<ServiceDeleteQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> Response {
+    // If generation is missing, return a structured 400 error (not axum's
+    // default plain-text rejection).
+    let query = match query {
+        Ok(q) => q,
+        Err(_) => {
+            let body = ServiceErrorResponse {
+                error: ServiceErrorBody {
+                    code: "invalid_request".to_string(),
+                    message: "missing or invalid 'generation' query parameter".to_string(),
+                    remedy: Some(
+                        "pass ?generation=<n> with the current generation from GET /v1/services/{name}"
+                            .to_string(),
+                    ),
+                },
+            };
+            return (
+                StatusCode::BAD_REQUEST,
+                [("cache-control", "no-store")],
+                axum::Json(body),
+            )
+                .into_response();
+        }
+    };
+    let ctrl = match &state.services {
+        Some(c) => c.clone(),
+        None => return service_unavailable(),
+    };
+    let svc_name = match crate::services::ServiceName::parse(&name) {
+        Ok(n) => n,
+        Err(e) => {
+            let (st, body) =
+                service_error_to_response(&crate::services::ServiceError::InvalidName(e));
+            return (st, [("cache-control", "no-store")], axum::Json(body)).into_response();
+        }
+    };
+    match ctrl.remove(&svc_name, query.generation, query.force).await {
+        Ok(result) => {
+            let resp = ServiceDeleteResponse {
+                schema: "slip.service.rm/v1",
+                removed: result.removed,
+                retained: ServiceRetainedInfo {
+                    data: result.retained_data,
+                    secrets: result.retained_secrets,
+                },
+                affected_apps: result.affected_apps,
+            };
+            (
+                StatusCode::OK,
+                [("cache-control", "no-store")],
+                axum::Json(resp),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let (st, body) = service_error_to_response(&e);
+            (st, [("cache-control", "no-store")], axum::Json(body)).into_response()
+        }
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3177,6 +3658,7 @@ mod tests {
             preview_locks: DashMap::new(),
             renew_locks: DashMap::new(),
             secrets_store: SecretsStore::new(secrets_path).unwrap(),
+            services: None,
         })
     }
 
@@ -3483,6 +3965,7 @@ mod tests {
                 p
             })
             .unwrap(),
+            services: None,
         });
 
         let app = build_router(state_inner);
@@ -3540,6 +4023,7 @@ mod tests {
                 p
             })
             .unwrap(),
+            services: None,
         });
 
         let app = build_router(state);
@@ -3824,6 +4308,7 @@ mod tests {
                 p
             })
             .unwrap(),
+            services: None,
         });
 
         let app = build_router(state);
@@ -4214,6 +4699,7 @@ mod tests {
                 p
             })
             .unwrap(),
+            services: None,
         });
 
         let app = build_router(state);
@@ -4385,6 +4871,7 @@ mod tests {
                 p
             })
             .unwrap(),
+            services: None,
         });
         let app = build_router(state);
 
@@ -4494,6 +4981,7 @@ mod tests {
                 p
             })
             .unwrap(),
+            services: None,
         });
         let app = build_router(state.clone());
 
@@ -4867,6 +5355,7 @@ mod tests {
                 p
             })
             .unwrap(),
+            services: None,
         });
 
         let app = build_router(state);
@@ -5164,6 +5653,7 @@ mod tests {
             preview_locks: DashMap::new(),
             renew_locks: DashMap::new(),
             secrets_store: secrets_store.clone(),
+            services: None,
         });
 
         // Set a secret via the store directly
@@ -5840,6 +6330,7 @@ path = "/tmp/slip-test"
             preview_locks: DashMap::new(),
             renew_locks: DashMap::new(),
             secrets_store: SecretsStore::new(secrets_path).unwrap(),
+            services: None,
         });
 
         // Step 1: Register an app via POST /v1/apps
@@ -5984,6 +6475,7 @@ path = "/tmp/slip-test"
             preview_locks: DashMap::new(),
             renew_locks: DashMap::new(),
             secrets_store: SecretsStore::new(secrets_path).unwrap(),
+            services: None,
         });
 
         // Create app
@@ -6123,6 +6615,7 @@ path = "/tmp/slip-test"
             preview_locks: DashMap::new(),
             renew_locks: DashMap::new(),
             secrets_store: SecretsStore::new(secrets_path).unwrap(),
+            services: None,
         });
 
         let app = build_router(state.clone());
@@ -7102,6 +7595,7 @@ path = "/tmp/slip-test"
             preview_locks: DashMap::new(),
             renew_locks: DashMap::new(),
             secrets_store: SecretsStore::new(secrets_path).unwrap(),
+            services: None,
         })
     }
 

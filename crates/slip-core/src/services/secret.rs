@@ -712,6 +712,32 @@ mod _linux {
         ) -> Result<(), SecretBundleError> {
             self.cleanup_generation_internal(generation)
         }
+
+        /// Return validated mount tokens for the active generation's
+        /// `raw_password` and `pgpass` files, plus the non-secret generation
+        /// name. This is the provider-safe path: the provider mounts these
+        /// files read-only and never sees plaintext.
+        ///
+        /// Reads `active.gen`, then `validate_bind_source_file` on both files
+        /// of that generation (revalidate-then-return). On ambiguous pointer
+        /// errors, the caller must reread — never blind-regenerate.
+        pub fn active_secret_mounts(
+            &self,
+        ) -> Result<crate::services::spec::ActiveSecretMounts, SecretBundleError> {
+            let generation = self.read_active_pointer()?;
+            let raw_rel = self.gen_file_rel(&generation, RAW_PASSWORD_FILE);
+            let pgpass_rel = self.gen_file_rel(&generation, PGPASS_FILE);
+            let raw_token = self.storage.validate_bind_source_file(&raw_rel)?;
+            let pgpass_token = self.storage.validate_bind_source_file(&pgpass_rel)?;
+            // Revalidate both tokens before returning (defense in depth).
+            raw_token.revalidate()?;
+            pgpass_token.revalidate()?;
+            Ok(crate::services::spec::ActiveSecretMounts {
+                generation,
+                raw_password_path: raw_token.canonical_path().to_path_buf(),
+                pgpass_path: pgpass_token.canonical_path().to_path_buf(),
+            })
+        }
     }
 
     /// Tracks the state of a `generate()` call for rollback. Independent of
@@ -747,6 +773,13 @@ mod _linux {
                 Err(SecretBundleError::Storage(StorageError::NotFound(_))) => Ok(None),
                 Err(e) => Err(ServiceError::Internal(redact_error(&e))),
             }
+        }
+
+        fn active_secret_mounts(
+            &self,
+        ) -> Result<crate::services::spec::ActiveSecretMounts, ServiceError> {
+            InstanceSecretBundle::active_secret_mounts(self)
+                .map_err(|e| ServiceError::Internal(redact_error(&e)))
         }
     }
 
@@ -899,9 +932,26 @@ mod _linux {
         fields
     }
 
-    /// Redact an error to a safe string without secret content.
+    /// Redact an error to a safe string without secret content or host paths.
+    /// Strips absolute path references and generation/instance directory names.
     pub(crate) fn redact_error(e: &SecretBundleError) -> String {
-        format!("{e}")
+        let raw = format!("{e}");
+        redact_paths(&raw)
+    }
+
+    /// Strip absolute paths and directory components from a string.
+    fn redact_paths(s: &str) -> String {
+        // Replace any absolute path (starting with /) with a placeholder.
+        let mut result = s.to_string();
+        while let Some(pos) = result.find('/') {
+            // Find the end of the path component.
+            let end = result[pos..]
+                .find(|c: char| c.is_whitespace() || c == ',' || c == ')')
+                .map(|e| pos + e)
+                .unwrap_or(result.len());
+            result.replace_range(pos..end, "<path>");
+        }
+        result
     }
 
     // ─── Tests (Linux-only) ───────────────────────────────────────────────

@@ -217,6 +217,13 @@ mod _linux {
         root_dev: u64,
         #[allow(dead_code)]
         root_ino: u64,
+        /// Test-only fault injector for `fsync_descendant_dir`. In production
+        /// this is always None. When set, the hook is called with the relative
+        /// path; if it returns `Err`, `fsync_descendant_dir` returns that error
+        /// instead of performing the real fsync.
+        #[cfg(test)]
+        fsync_fault_hook:
+            std::sync::Mutex<Option<Box<dyn Fn(&str) -> Result<(), StorageError> + Send + Sync>>>,
     }
 
     impl ServiceStorage {
@@ -305,6 +312,8 @@ mod _linux {
                 root_path,
                 root_dev: st.st_dev,
                 root_ino: st.st_ino,
+                #[cfg(test)]
+                fsync_fault_hook: std::sync::Mutex::new(None),
             })
         }
 
@@ -522,8 +531,29 @@ mod _linux {
         /// Open a descendant directory, fsync it, and drop the FD. Used to
         /// durably persist a rename into a parent directory.
         pub fn fsync_descendant_dir(&self, rel: &str) -> Result<(), StorageError> {
+            // Test-only fault injection: if a hook is set, call it instead
+            // of performing the real fsync. This allows testing that callers
+            // propagate fsync failures correctly.
+            #[cfg(test)]
+            {
+                if let Some(hook) = self.fsync_fault_hook.lock().unwrap().as_ref() {
+                    return hook(rel);
+                }
+            }
             let fd = self.open_descendant_dir_raw(rel)?;
             rustix::fs::fsync(&fd).map_err(|e| StorageError::Io(e.into()))
+        }
+
+        /// Set a test-only fault hook for `fsync_descendant_dir`. When set,
+        /// the hook is called with the relative path instead of performing
+        /// the real fsync. If the hook returns `Err`, that error is returned
+        /// to the caller. This is only available in test builds.
+        #[cfg(test)]
+        pub fn set_fsync_fault_hook<F>(&self, hook: F)
+        where
+            F: Fn(&str) -> Result<(), StorageError> + Send + Sync + 'static,
+        {
+            *self.fsync_fault_hook.lock().unwrap() = Some(Box::new(hook));
         }
 
         /// Open a descendant directory raw (without the 0700 mode check).
