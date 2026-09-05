@@ -197,14 +197,22 @@ mod _linux {
     ///
     /// Bound to exactly one [`InstanceId`] at construction. The namespace is
     /// `<root>/<instance-id>/`. No method accepts a different instance.
-    pub struct InstanceSecretBundle {
+    ///
+    /// The bundle borrows the [`ServiceStorage`] for its lifetime rather than
+    /// owning a copy. This preserves the descriptor-confined ownership model
+    /// from Part 2: the controller owns the single `ServiceStorage` (with its
+    /// unique `OwnedFd` and test-only fault-hook `Mutex`), and every bundle
+    /// built inside `add`/`ensure_one`/`remove` borrows it for the duration of
+    /// the call. The bundle never outlives the controller.
+    pub struct InstanceSecretBundle<'a> {
         instance_id: InstanceId,
-        storage: ServiceStorage,
+        storage: &'a ServiceStorage,
         /// Test-only fault injector. In production this is always None.
         /// The hook is called at each fault boundary in `generate()`.
         /// If the hook returns an error, `generate()` treats it as a
         /// real failure at that boundary and triggers rollback.
         #[cfg(test)]
+        #[allow(clippy::type_complexity)]
         fault_hook:
             std::sync::Mutex<Option<Box<dyn Fn(FaultPoint) -> Result<(), String> + Send + Sync>>>,
     }
@@ -234,11 +242,11 @@ mod _linux {
         AfterRename,
     }
 
-    impl InstanceSecretBundle {
+    impl<'a> InstanceSecretBundle<'a> {
         /// Construct a bundle bound to `instance_id`. The instance directory
         /// `<root>/<instance-id>` must already exist.
         pub fn new(
-            storage: ServiceStorage,
+            storage: &'a ServiceStorage,
             instance_id: InstanceId,
         ) -> Result<Self, SecretBundleError> {
             // Verify the instance directory exists and is a valid 0700 dir.
@@ -270,7 +278,7 @@ mod _linux {
         #[cfg(test)]
         fn check_fault(&self, point: FaultPoint) -> Result<(), SecretBundleError> {
             if let Some(hook) = self.fault_hook.lock().unwrap().as_ref() {
-                hook(point).map_err(|msg| SecretBundleError::Internal(msg))?;
+                hook(point).map_err(SecretBundleError::Internal)?;
             }
             Ok(())
         }
@@ -758,7 +766,7 @@ mod _linux {
         }
     }
 
-    impl InstanceSecretCapability for InstanceSecretBundle {
+    impl<'a> InstanceSecretCapability for InstanceSecretBundle<'a> {
         fn instance_id(&self) -> &InstanceId {
             &self.instance_id
         }
@@ -783,7 +791,7 @@ mod _linux {
         }
     }
 
-    impl std::fmt::Debug for InstanceSecretBundle {
+    impl<'a> std::fmt::Debug for InstanceSecretBundle<'a> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("InstanceSecretBundle")
                 .field("instance_id", &self.instance_id.as_str())
@@ -971,12 +979,10 @@ mod _linux {
             (d, s)
         }
 
-        fn make_bundle() -> (tempfile::TempDir, InstanceSecretBundle) {
-            let (d, s) = make_storage();
+        fn make_bundle(s: &ServiceStorage) -> InstanceSecretBundle<'_> {
             let id = InstanceId::generate().unwrap();
             let _ = s.create_descendant_dir(id.as_str()).unwrap();
-            let bundle = InstanceSecretBundle::new(s, id).expect("bundle new must succeed");
-            (d, bundle)
+            InstanceSecretBundle::new(s, id).expect("bundle new must succeed")
         }
 
         fn skip_if_nonroot() -> bool {
@@ -1112,7 +1118,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             // If we got here, InstanceSecretBundle::new succeeded.
             let _id = bundle.instance_id();
         }
@@ -1122,7 +1129,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             let generation = bundle.generate().unwrap();
             let active = bundle.read_active_pointer().unwrap();
             assert_eq!(active, generation);
@@ -1135,7 +1143,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             bundle.generate().unwrap();
             let bytes = bundle.read_raw_password().unwrap();
             let s = String::from_utf8(bytes.as_bytes().to_vec()).unwrap();
@@ -1151,7 +1160,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             let gen1 = bundle.generate().unwrap();
             let gen2 = bundle.rotate().unwrap();
             assert_ne!(gen1, gen2);
@@ -1170,7 +1180,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             let generation = bundle.generate().unwrap();
             let err = bundle.cleanup_generation(&generation).unwrap_err();
             assert!(matches!(err, SecretBundleError::ActiveGeneration { .. }));
@@ -1181,7 +1192,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             let gen1 = bundle.generate().unwrap();
             let _gen2 = bundle.rotate().unwrap();
             bundle.cleanup_generation(&gen1).unwrap();
@@ -1202,7 +1214,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             let _gen1 = bundle.generate().unwrap();
             let pw1 = bundle.read_raw_password().unwrap();
             let _gen2 = bundle.rotate().unwrap();
@@ -1215,7 +1228,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             let id = bundle.instance_id().clone();
             let cap: &dyn InstanceSecretCapability = &bundle;
             assert_eq!(cap.instance_id(), &id);
@@ -1226,7 +1240,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             let generation = bundle.generate().unwrap();
             let pgpass_rel = format!(
                 "{}/{}/{PGPASS_FILE}",
@@ -1247,7 +1262,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             let _generation = bundle.generate().unwrap();
             let ptr_rel = bundle.pointer_rel();
             bundle.storage.unlink_descendant(&ptr_rel).unwrap();
@@ -1263,7 +1279,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             let _generation = bundle.generate().unwrap();
             let cap: &dyn InstanceSecretCapability = &bundle;
             let pw = cap.read_superuser().unwrap().unwrap();
@@ -1275,7 +1292,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             let cap: &dyn InstanceSecretCapability = &bundle;
             assert!(cap.read_superuser().unwrap().is_none());
         }
@@ -1285,7 +1303,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             let generation = bundle.generate().unwrap();
             let gen_rel = format!("{}/{}", bundle.instance_id.as_str(), generation.as_str());
             // The generation directory exists.
@@ -1297,7 +1316,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             bundle.generate().unwrap();
             // Read the pgpass file directly and validate it.
             let generation = bundle.read_active_pointer().unwrap();
@@ -1318,7 +1338,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             let generation = bundle.generate().unwrap();
             // Replace raw_password with empty content.
             let raw_rel = format!(
@@ -1337,7 +1358,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             let generation = bundle.generate().unwrap();
             let raw_rel = format!(
                 "{}/{}/{RAW_PASSWORD_FILE}",
@@ -1371,7 +1393,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             let generation = bundle.generate().unwrap();
             let raw_rel = format!(
                 "{}/{}/{RAW_PASSWORD_FILE}",
@@ -1394,7 +1417,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             let generation = bundle.generate().unwrap();
             // Replace pgpass with a valid format but different password.
             let pgpass_rel = format!(
@@ -1418,7 +1442,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             bundle.generate().unwrap();
             // The normal read should succeed and the decoded pgpass
             // password must equal the raw password.
@@ -1431,7 +1456,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             // Generate twice. The first generation is retained (not
             // cleaned by rollback). The second generates a new one.
             let gen1 = bundle.generate().unwrap();
@@ -1465,7 +1491,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             bundle.set_fault_hook(|point| {
                 if point == FaultPoint::AfterRawFile {
                     Err("fault: after raw file".to_string())
@@ -1484,7 +1511,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             bundle.set_fault_hook(|point| {
                 if point == FaultPoint::AfterPgpassFile {
                     Err("fault: after pgpass".to_string())
@@ -1502,7 +1530,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             bundle.set_fault_hook(|point| {
                 if point == FaultPoint::AfterFilesValidated {
                     Err("fault: after files validated".to_string())
@@ -1520,7 +1549,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             bundle.set_fault_hook(|point| {
                 if point == FaultPoint::AfterTempWrite {
                     Err("fault: after temp write".to_string())
@@ -1539,7 +1569,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             bundle.set_fault_hook(|point| {
                 if point == FaultPoint::AfterTempFsync {
                     Err("fault: after temp fsync".to_string())
@@ -1557,7 +1588,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             bundle.set_fault_hook(|point| {
                 if point == FaultPoint::AtRename {
                     Err("fault: at rename".to_string())
@@ -1576,7 +1608,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             bundle.set_fault_hook(|point| {
                 if point == FaultPoint::AfterRename {
                     Err("fault: after rename".to_string())
@@ -1612,7 +1645,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             bundle.set_fault_hook(|point| {
                 if point == FaultPoint::AfterMkdir {
                     Err("fault: after mkdir".to_string())
@@ -1630,7 +1664,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             bundle.set_fault_hook(|point| {
                 if point == FaultPoint::AfterMkdirFsync {
                     Err("fault: after mkdir fsync".to_string())
@@ -1648,7 +1683,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             // Capture the instance dir path for checking temp files.
             let instance_id = bundle.instance_id().as_str().to_string();
             bundle.set_fault_hook(|point| {
@@ -1673,7 +1709,8 @@ mod _linux {
             if skip_if_nonroot() {
                 return;
             }
-            let (_d, bundle) = make_bundle();
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
             bundle.set_fault_hook(|point| {
                 if point == FaultPoint::AfterRawFile {
                     Err("fault: after raw file".to_string())

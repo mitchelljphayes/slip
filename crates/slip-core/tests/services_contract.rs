@@ -19,8 +19,6 @@
 
 #![cfg(target_os = "linux")]
 
-use std::time::Duration;
-
 use slip_core::runtime::RuntimeBackend;
 use slip_core::services::{
     ProviderKind, ServiceController, ServiceName, ServiceSpec, ServiceUsageReader, resolve_catalog,
@@ -40,7 +38,7 @@ async fn rootful_podman_available() -> Option<slip_core::PodmanBackend> {
 
 /// Helper: create a test service controller with a temp DB and services root.
 fn make_controller(
-    runtime: std::sync::Arc<slip_core::PodmanBackend>,
+    runtime: std::sync::Arc<dyn RuntimeBackend>,
     services_root: &std::path::Path,
     storage: slip_core::services::ServiceStorage,
 ) -> ServiceController {

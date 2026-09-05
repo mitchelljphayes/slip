@@ -855,7 +855,7 @@ impl ServiceProvider for PostgresProvider {
             // must inspect. This is the fail-closed behavior.
             #[cfg(target_os = "linux")]
             {
-                let marker = BootstrapMarker {
+                let complete_marker = BootstrapMarker {
                     installation_id: ctx.installation_id().to_string(),
                     instance_id: state.instance_id().as_str().to_string(),
                     provider: "postgres".to_string(),
@@ -867,8 +867,10 @@ impl ServiceProvider for PostgresProvider {
                 // Atomic rewrite: write temp + rename + parent fsync.
                 // All steps are mandatory — errors propagate.
                 let tmp_rel = format!("{}.tmp", marker_rel);
+                // Clean up any stale temp from a prior crash (ignore NotFound).
+                let _ = storage.unlink_descendant(&tmp_rel);
                 storage
-                    .write_file_exclusive(&tmp_rel, marker.to_json().as_bytes())
+                    .write_file_exclusive(&tmp_rel, complete_marker.to_json().as_bytes())
                     .map_err(|_| ServiceError::FilesystemCheck {
                         service: spec.name().as_str().to_string(),
                         reason: "failed to write marker temp file".to_string(),
@@ -884,12 +886,57 @@ impl ServiceProvider for PostgresProvider {
                 // marker may not survive a crash, so we must not claim
                 // successful initialization.
                 let parent_rel = spec.name().as_str();
-                storage
-                    .fsync_descendant_dir(parent_rel)
-                    .map_err(|_| ServiceError::FilesystemCheck {
+                if storage.fsync_descendant_dir(parent_rel).is_err() {
+                    // The rename succeeded but the fsync failed. The visible
+                    // marker is Complete, but the durability barrier was not
+                    // achieved. We must not leave a Complete marker after a
+                    // reported failure — a subsequent provision would trust
+                    // the marker and skip the bootstrap, treating incomplete
+                    // durability as complete.
+                    //
+                    // Compensating action: restore an Initializing marker
+                    // (atomic temp+rename) so a retry will Block (fail-closed)
+                    // rather than adopt potentially-undurable Complete state.
+                    // If the compensation itself fails, we still return the
+                    // original durability error — we never claim success. The
+                    // error message is honest about residual uncertainty.
+                    let init_marker = BootstrapMarker {
+                        installation_id: ctx.installation_id().to_string(),
+                        instance_id: state.instance_id().as_str().to_string(),
+                        provider: "postgres".to_string(),
+                        data_major: state.data_major(),
+                        layout: "v1".to_string(),
+                        generation: mounts.generation.as_str().to_string(),
+                        phase: MarkerPhase::Initializing,
+                    };
+                    // Best-effort compensation: write Initializing temp,
+                    // rename over Complete, fsync parent again. Any failure
+                    // here is noted in the error reason but does not change
+                    // the outcome — we always return Err(FilesystemCheck).
+                    let comp_tmp = format!("{}.comp.tmp", marker_rel);
+                    let _ = storage.unlink_descendant(&comp_tmp);
+                    let comp_reason = match storage
+                        .write_file_exclusive(&comp_tmp, init_marker.to_json().as_bytes())
+                        .and_then(|_| storage.rename_descendant(&comp_tmp, &marker_rel))
+                        .and_then(|_| storage.fsync_descendant_dir(parent_rel))
+                    {
+                        Ok(()) => {
+                            // Compensation succeeded: marker is now Initializing.
+                            // A retry will Block (initializing marker detected).
+                            "failed to fsync parent directory after marker finalize — initialization may not be durable; marker restored to initializing".to_string()
+                        }
+                        Err(_) => {
+                            // Compensation failed: marker may still be Complete
+                            // but the error was returned, so the controller will
+                            // not persist Ready. The operator must inspect.
+                            "failed to fsync parent directory after marker finalize — initialization may not be durable; compensating marker restore also failed, marker may be stale".to_string()
+                        }
+                    };
+                    return Err(ServiceError::FilesystemCheck {
                         service: spec.name().as_str().to_string(),
-                        reason: "failed to fsync parent directory after marker finalize — initialization may not be durable".to_string(),
-                    })?;
+                        reason: comp_reason,
+                    });
+                }
             }
 
             info!(
@@ -2630,7 +2677,7 @@ mod tests {
     mod marker_tests {
         use super::*;
         use crate::services::spec::{FakeInstanceSecrets, InstanceSecretCapability};
-        use crate::services::storage::ServiceStorage;
+        use crate::services::storage::{ServiceStorage, StorageError};
 
         /// Create a test storage root under a tempdir with root-owned 0700
         /// layout. This requires running as root (CI service-security job).
@@ -2652,14 +2699,12 @@ mod tests {
             runtime: &'a RecordingRuntime,
             storage: &'a ServiceStorage,
             state: &'a ServiceState,
-            mounts: &'a ActiveSecretMounts,
+            secrets: &'a FakeInstanceSecrets,
         ) -> ProviderContext<'a> {
-            let secrets =
-                FakeInstanceSecrets::with_mounts(state.instance_id().clone(), mounts.clone());
             let root = std::path::Path::new("/tmp/services");
             ProviderContext::new(
                 runtime as &dyn crate::runtime::RuntimeBackend,
-                &secrets as &dyn InstanceSecretCapability,
+                secrets as &dyn InstanceSecretCapability,
                 root,
                 "slip",
                 "test-install",
@@ -2696,7 +2741,9 @@ mod tests {
                 .create_descendant_dir("pg")
                 .expect("create pre-existing dir");
 
-            let ctx = make_provider_ctx(&rt, &storage, &state, &mounts);
+            let secrets =
+                FakeInstanceSecrets::with_mounts(state.instance_id().clone(), mounts.clone());
+            let ctx = make_provider_ctx(&rt, &storage, &state, &secrets);
             let result = provider.provision(&ctx, &spec, &state).await;
 
             // Should be Blocked because the directory pre-existed without a marker.
@@ -2746,8 +2793,7 @@ mod tests {
             storage.set_fsync_fault_hook(move |rel: &str| {
                 if rel == svc_name {
                     // Inject a synthetic I/O error.
-                    Err(StorageError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    Err(StorageError::Io(std::io::Error::other(
                         "injected fsync failure",
                     )))
                 } else {
@@ -2792,7 +2838,9 @@ mod tests {
                 pids_limit: 0,
             });
 
-            let ctx = make_provider_ctx(&rt, &storage, &state, &mounts);
+            let secrets =
+                FakeInstanceSecrets::with_mounts(state.instance_id().clone(), mounts.clone());
+            let ctx = make_provider_ctx(&rt, &storage, &state, &secrets);
             let result = provider.provision(&ctx, &spec, &state).await;
 
             // The provision must fail — fsync failure must not be swallowed.
@@ -2825,12 +2873,12 @@ mod tests {
                 }
             }
 
-            // Verify the marker is NOT complete — it should be either
-            // absent (initializing was written but not finalized) or
-            // still in initializing state. A complete marker would mean
-            // we claimed successful initialization despite fsync failure.
-            let marker_rel = format!("pg/.slip-bootstrap");
-            match storage.read_file(&marker_rel, 4096) {
+            // Verify the marker is NOT complete — the compensating restore
+            // should have replaced the Complete marker with Initializing.
+            // A complete marker would mean we claimed successful
+            // initialization despite fsync failure.
+            let marker_rel = "pg/.slip-bootstrap";
+            match storage.read_file(marker_rel, 4096) {
                 Ok(data) => {
                     let marker = BootstrapMarker::from_json(&String::from_utf8_lossy(&data))
                         .expect("marker should be valid JSON");
@@ -2839,19 +2887,291 @@ mod tests {
                         MarkerPhase::Complete,
                         "marker must NOT be complete after fsync failure"
                     );
+                    // The compensating restore should have set Initializing.
+                    assert_eq!(
+                        marker.phase,
+                        MarkerPhase::Initializing,
+                        "marker should be Initializing after compensating restore"
+                    );
                 }
                 Err(crate::services::storage::StorageError::NotFound(_)) => {
-                    // Marker temp was written but rename may have succeeded
-                    // before the fsync error. In that case the marker exists
-                    // as "complete" from the rename, but the fsync failure
-                    // means it may not be durable. The error propagation
-                    // is the key assertion — the caller knows it's not safe.
-                    // This is acceptable: the error was returned, so the
-                    // controller will not persist Ready.
+                    // Acceptable if the provision failed before reaching
+                    // marker finalize (e.g. storage identity checks, or
+                    // the Blocked path for unmarked pre-existing dirs).
+                    // The error was returned, so the controller will not
+                    // persist Ready.
                 }
                 Err(_) => {
                     // Other read errors are acceptable in test env.
                 }
+            }
+        }
+
+        /// Test: successful marker finalize on a fresh directory.
+        /// Verifies the marker is Complete after a successful provision
+        /// (write temp + rename + parent fsync all succeed).
+        #[tokio::test]
+        async fn marker_successful_finalize_writes_complete() {
+            let (_tmp, storage) = match test_storage() {
+                Some(v) => v,
+                None => return,
+            };
+
+            let rt = RecordingRuntime::new(true);
+            let provider = PostgresProvider::new();
+            let spec = sample_spec("pg");
+            let state = sample_state("pg");
+            let mounts = sample_mounts();
+
+            // Queue a healthy inspect response.
+            let container_id = rt.next_id();
+            let labels = BTreeMap::new();
+            rt.queue_inspect(crate::runtime::ServiceContainerInspect {
+                container_id: container_id.clone(),
+                name: Some("slip-service-pg".to_string()),
+                hostname: Some("slip-service-pg".to_string()),
+                labels,
+                repo_digests: vec![],
+                mounts: vec![],
+                networks: vec!["slip".to_string()],
+                network: "slip".to_string(),
+                network_aliases: vec!["pg".to_string()],
+                restart_policy: "unless-stopped".to_string(),
+                health_status: "healthy".to_string(),
+                port_bindings: vec![],
+                running: true,
+                privileged: false,
+                no_new_privileges: true,
+                read_only_rootfs: false,
+                cap_drop: vec!["ALL".to_string()],
+                cap_add: vec![],
+                security_options: vec!["no-new-privileges:true".to_string()],
+                memory_limit: 0,
+                nano_cpus: 0,
+                pids_limit: 0,
+            });
+
+            let secrets =
+                FakeInstanceSecrets::with_mounts(state.instance_id().clone(), mounts.clone());
+            let ctx = make_provider_ctx(&rt, &storage, &state, &secrets);
+            let result = provider.provision(&ctx, &spec, &state).await;
+
+            // Provision should succeed (no fsync fault injected).
+            match result {
+                Ok(_) => {
+                    // Verify marker is Complete.
+                    let marker_rel = "pg/.slip-bootstrap";
+                    let data = storage
+                        .read_file(marker_rel, 4096)
+                        .expect("marker should exist after successful provision");
+                    let marker = BootstrapMarker::from_json(&String::from_utf8_lossy(&data))
+                        .expect("marker should be valid JSON");
+                    assert_eq!(
+                        marker.phase,
+                        MarkerPhase::Complete,
+                        "marker should be Complete after successful finalize"
+                    );
+                }
+                Err(ServiceError::Blocked(_, _)) | Err(ServiceError::FilesystemCheck { .. }) => {
+                    // Acceptable if provision failed before marker finalize
+                    // (e.g. container creation checks in the fake runtime).
+                }
+                Err(e) => panic!("unexpected error from provision: {e:?}"),
+            }
+        }
+
+        /// Test: a valid Complete marker allows re-provision (data reuse).
+        /// Verifies that when a Complete marker exists with matching fields,
+        /// provision falls through to container creation without blocking.
+        #[tokio::test]
+        async fn marker_valid_complete_allows_reprovision() {
+            let (_tmp, storage) = match test_storage() {
+                Some(v) => v,
+                None => return,
+            };
+
+            let rt = RecordingRuntime::new(true);
+            let provider = PostgresProvider::new();
+            let spec = sample_spec("pg");
+            let state = sample_state("pg");
+            let mounts = sample_mounts();
+
+            // Pre-create the data directory and write a valid Complete marker.
+            storage
+                .create_descendant_dir("pg")
+                .expect("create data dir");
+
+            let complete_marker = BootstrapMarker {
+                installation_id: "test-install".to_string(),
+                instance_id: state.instance_id().as_str().to_string(),
+                provider: "postgres".to_string(),
+                data_major: state.data_major(),
+                layout: "v1".to_string(),
+                generation: mounts.generation.as_str().to_string(),
+                phase: MarkerPhase::Complete,
+            };
+            // Write marker directly (use exclusive write to the marker path).
+            // The marker file doesn't exist yet, so O_EXCL will succeed.
+            storage
+                .write_file_exclusive("pg/.slip-bootstrap", complete_marker.to_json().as_bytes())
+                .expect("write complete marker");
+            // Fsync the parent to make it durable.
+            storage
+                .fsync_descendant_dir("pg")
+                .expect("fsync parent after marker write");
+
+            // Queue a healthy inspect response for the provision attempt.
+            let container_id = rt.next_id();
+            let labels = BTreeMap::new();
+            rt.queue_inspect(crate::runtime::ServiceContainerInspect {
+                container_id: container_id.clone(),
+                name: Some("slip-service-pg".to_string()),
+                hostname: Some("slip-service-pg".to_string()),
+                labels,
+                repo_digests: vec![],
+                mounts: vec![],
+                networks: vec!["slip".to_string()],
+                network: "slip".to_string(),
+                network_aliases: vec!["pg".to_string()],
+                restart_policy: "unless-stopped".to_string(),
+                health_status: "healthy".to_string(),
+                port_bindings: vec![],
+                running: true,
+                privileged: false,
+                no_new_privileges: true,
+                read_only_rootfs: false,
+                cap_drop: vec!["ALL".to_string()],
+                cap_add: vec![],
+                security_options: vec!["no-new-privileges:true".to_string()],
+                memory_limit: 0,
+                nano_cpus: 0,
+                pids_limit: 0,
+            });
+
+            let secrets =
+                FakeInstanceSecrets::with_mounts(state.instance_id().clone(), mounts.clone());
+            let ctx = make_provider_ctx(&rt, &storage, &state, &secrets);
+            let result = provider.provision(&ctx, &spec, &state).await;
+
+            // Should NOT be Blocked with "unmarked pre-existing" — the
+            // Complete marker should allow re-provision.
+            match &result {
+                Ok(_) => {
+                    // Provision succeeded — data was reused.
+                }
+                Err(ServiceError::Blocked(_, reason)) => {
+                    // If blocked, it must NOT be the "unmarked pre-existing"
+                    // reason — the Complete marker was found and validated.
+                    assert!(
+                        !reason.contains("unmarked pre-existing"),
+                        "should not block on unmarked pre-existing when Complete marker exists: {reason}"
+                    );
+                }
+                Err(ServiceError::FilesystemCheck { .. }) => {
+                    // Acceptable if container creation failed in the fake runtime.
+                }
+                Err(e) => panic!("unexpected error from re-provision: {e:?}"),
+            }
+
+            // The marker should still be Complete after re-provision.
+            let marker_rel = "pg/.slip-bootstrap";
+            if let Ok(data) = storage.read_file(marker_rel, 4096) {
+                let marker = BootstrapMarker::from_json(&String::from_utf8_lossy(&data))
+                    .expect("marker should be valid JSON");
+                assert_eq!(
+                    marker.phase,
+                    MarkerPhase::Complete,
+                    "marker should remain Complete after re-provision"
+                );
+            }
+        }
+
+        /// Test: compensation failure leaves the error honest about
+        /// residual uncertainty. The fsync fault hook injects failure on
+        /// every call to the service data directory, so both the original
+        // finalize fsync and the compensating fsync fail. The error must
+        // still propagate (never Ok), and the reason must mention the
+        // compensation failure.
+        #[tokio::test]
+        async fn marker_fsync_failure_with_compensation_failure_propagates() {
+            let (_tmp, storage) = match test_storage() {
+                Some(v) => v,
+                None => return,
+            };
+
+            let rt = RecordingRuntime::new(true);
+            let provider = PostgresProvider::new();
+            let spec = sample_spec("pg");
+            let state = sample_state("pg");
+            let mounts = sample_mounts();
+
+            // Inject fsync failure on every call to the service dir —
+            // both the original finalize and the compensating restore.
+            let svc_name = spec.name().as_str().to_string();
+            storage.set_fsync_fault_hook(move |rel: &str| {
+                if rel == svc_name {
+                    Err(StorageError::Io(std::io::Error::other(
+                        "injected fsync failure",
+                    )))
+                } else {
+                    Ok(())
+                }
+            });
+
+            // Queue a healthy inspect response.
+            let container_id = rt.next_id();
+            let labels = BTreeMap::new();
+            rt.queue_inspect(crate::runtime::ServiceContainerInspect {
+                container_id: container_id.clone(),
+                name: Some("slip-service-pg".to_string()),
+                hostname: Some("slip-service-pg".to_string()),
+                labels,
+                repo_digests: vec![],
+                mounts: vec![],
+                networks: vec!["slip".to_string()],
+                network: "slip".to_string(),
+                network_aliases: vec!["pg".to_string()],
+                restart_policy: "unless-stopped".to_string(),
+                health_status: "healthy".to_string(),
+                port_bindings: vec![],
+                running: true,
+                privileged: false,
+                no_new_privileges: true,
+                read_only_rootfs: false,
+                cap_drop: vec!["ALL".to_string()],
+                cap_add: vec![],
+                security_options: vec!["no-new-privileges:true".to_string()],
+                memory_limit: 0,
+                nano_cpus: 0,
+                pids_limit: 0,
+            });
+
+            let secrets =
+                FakeInstanceSecrets::with_mounts(state.instance_id().clone(), mounts.clone());
+            let ctx = make_provider_ctx(&rt, &storage, &state, &secrets);
+            let result = provider.provision(&ctx, &spec, &state).await;
+
+            // Must fail — never claim success after fsync failure.
+            assert!(
+                result.is_err(),
+                "provision must not succeed when fsync fails (even if compensation also fails)"
+            );
+
+            // The error must be FilesystemCheck with a reason mentioning
+            // the compensation failure (honest about residual uncertainty).
+            if let Err(ServiceError::FilesystemCheck { reason, .. }) = &result {
+                assert!(
+                    !reason.contains("/"),
+                    "error reason must not contain paths: {reason}"
+                );
+                assert!(
+                    reason.contains("fsync") || reason.contains("durability"),
+                    "error should mention fsync/durability: {reason}"
+                );
+                assert!(
+                    reason.contains("compensat"),
+                    "error should mention compensation failure: {reason}"
+                );
             }
         }
     }

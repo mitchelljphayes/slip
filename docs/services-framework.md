@@ -133,7 +133,14 @@ docker.io/library/postgres:18.4-bookworm@sha256:882236b897e39051d2368c5ccc6cda94
 
 ## Crash consistency
 
-1. **Bootstrap marker**: `initializing` → `complete` (atomic, after verified readiness)
+1. **Bootstrap marker**: `initializing` → `complete` (atomic, after verified
+   readiness). If the parent-directory fsync after the `complete` rename fails,
+   the provider restores an `initializing` marker via a compensating atomic
+   temp+rename+fsync and returns a `FilesystemCheck` error — the controller
+   never persists `Ready` for a marker whose durability barrier failed. If the
+   compensating restore also fails, the error is honest about residual
+   uncertainty (the marker may be stale). A subsequent provision attempt sees
+   `initializing` and Blocks (operator must inspect).
 2. **Secret generation**: once, before provision; never on ambiguous pointer
 3. **Container ID**: persisted only after create + start + readiness succeeds
 4. **Remove**: verify full ownership tuple → stop/remove container → atomic delete-and-retain

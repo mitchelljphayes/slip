@@ -302,9 +302,8 @@ impl ServiceController {
                 }
 
                 // Create secret bundle and generate if no active pointer.
-                let bundle =
-                    InstanceSecretBundle::new(storage.clone(), state.instance_id().clone())
-                        .map_err(|e| ServiceError::Internal(e.to_string()))?;
+                let bundle = InstanceSecretBundle::new(storage, state.instance_id().clone())
+                    .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
                 // Check if active pointer exists; generate only if absent.
                 match bundle.read_active_pointer() {
@@ -315,7 +314,7 @@ impl ServiceController {
                         ..
                     }) => {
                         // No active generation — generate.
-                        bundle.generate().map_err(|e| {
+                        bundle.generate().map_err(|_| {
                             ServiceError::Internal("secret generation failed".to_string())
                         })?;
                     }
@@ -641,25 +640,44 @@ impl ServiceController {
         let spec = svc.to_spec()?;
         provider.validate(&spec)?;
 
-        let secrets = self.make_secret_capability(&state)?;
-        let ctx = ProviderContext::new(
-            self.runtime.as_ref(),
-            secrets.as_ref(),
-            &self.services_root,
-            &self.network,
-            &self.installation_id,
-            &state,
-        )?
-        .with_storage(
-            #[cfg(target_os = "linux")]
-            self.storage.as_ref(),
-            #[cfg(not(target_os = "linux"))]
-            None,
-        );
-
-        // Run ensure with a deadline.
-        let ensure_result =
-            tokio::time::timeout(PER_SERVICE_DEADLINE, provider.ensure(&ctx, &spec, &state)).await;
+        // Build secret capability and provider context. Setup failures
+        // (e.g. storage unsupported on non-Linux, instance binding mismatch)
+        // are routed through the same permanent/transient classification +
+        // CAS persistence as provider ensure errors, so that permanent
+        // setup failures are persisted as Blocked (and skipped on subsequent
+        // ticks) rather than propagating without state persistence.
+        //
+        // `secrets` must outlive `ctx` (ProviderContext borrows the trait
+        // object), so both are kept in the same scope via a match that
+        // either builds ctx (keeping secrets alive) or carries the error.
+        let ensure_result = match self.make_secret_capability(&state) {
+            Ok(secrets) => {
+                match ProviderContext::new(
+                    self.runtime.as_ref(),
+                    secrets.as_ref(),
+                    &self.services_root,
+                    &self.network,
+                    &self.installation_id,
+                    &state,
+                ) {
+                    Ok(base_ctx) => {
+                        let ctx = base_ctx.with_storage(
+                            #[cfg(target_os = "linux")]
+                            self.storage.as_ref(),
+                            #[cfg(not(target_os = "linux"))]
+                            None,
+                        );
+                        tokio::time::timeout(
+                            PER_SERVICE_DEADLINE,
+                            provider.ensure(&ctx, &spec, &state),
+                        )
+                        .await
+                    }
+                    Err(e) => Ok(Err(e)),
+                }
+            }
+            Err(e) => Ok(Err(e)),
+        };
 
         match ensure_result {
             Ok(Ok(outcome)) => {
@@ -885,18 +903,23 @@ impl ServiceController {
     }
 
     /// Build the secret capability for a state's instance (Linux only).
+    ///
+    /// The returned `Arc<dyn InstanceSecretCapability + 'a>` borrows
+    /// `self.storage` for the lifetime of `&'a self`. The bundle never
+    /// outlives the controller — every caller uses the capability within the
+    /// same `add`/`ensure_one`/`remove` scope and drops it before returning.
     #[cfg(target_os = "linux")]
-    fn make_secret_capability(
-        &self,
+    fn make_secret_capability<'a>(
+        &'a self,
         state: &ServiceState,
-    ) -> Result<Arc<dyn InstanceSecretCapability>, ServiceError> {
+    ) -> Result<Arc<dyn InstanceSecretCapability + 'a>, ServiceError> {
         let storage = self.storage.as_ref().ok_or_else(|| {
             ServiceError::Blocked(
                 state.service_name().as_str().to_string(),
                 "service storage is supported on Linux only".to_string(),
             )
         })?;
-        let bundle = InstanceSecretBundle::new(storage.clone(), state.instance_id().clone())
+        let bundle = InstanceSecretBundle::new(storage, state.instance_id().clone())
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
         Ok(Arc::new(bundle))
     }
@@ -1615,10 +1638,12 @@ mod tests {
             );
         }
 
-        // On Linux, the controller would persist Blocked and return Err.
+        // On Linux, the controller persists Blocked via CAS and returns Err.
         #[cfg(target_os = "linux")]
         {
-            let _ = result;
+            // The ensure_one call should have returned an error.
+            assert!(result.is_err(), "ensure_one should fail with Blocked");
+
             // Verify the state was persisted as Blocked.
             let db = ctrl.db.clone();
             let state_row = tokio::task::spawn_blocking(move || {
@@ -1627,16 +1652,102 @@ mod tests {
             })
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .expect("state row should exist after ensure_one");
 
-            if let Some(row) = state_row {
-                assert_eq!(
-                    row.phase(),
-                    LifecyclePhase::Blocked,
-                    "permanent error should persist Blocked phase"
-                );
-            }
+            assert_eq!(
+                state_row.phase(),
+                LifecyclePhase::Blocked,
+                "permanent error should persist Blocked phase"
+            );
+
+            // Second ensure_one call should skip (Blocked fast-path, no retry).
+            let result2 = ctrl.ensure_one(&ServiceName::parse("perm").unwrap()).await;
+            assert!(
+                result2.is_ok(),
+                "ensure_one should skip Blocked services (no retry storm)"
+            );
         }
+
+        let _ = state;
+    }
+
+    /// Verify that a setup failure (make_secret_capability returning Blocked)
+    /// is persisted as Blocked and that a subsequent ensure_one skips it
+    /// (no retry storm). This is the cross-platform version that tests the
+    /// error routing without depending on Linux-specific storage.
+    #[tokio::test]
+    async fn controller_ensure_one_setup_failure_persists_blocked_and_skips_retry() {
+        let rt = Arc::new(CtrlRuntime::new(true));
+        let usage: Arc<dyn ServiceUsageReader> = Arc::new(FakeUsageReader::new(HashMap::new()));
+        let ctrl = test_controller(rt, usage);
+
+        // Insert a service in Provisioning (no container_id — ensure will
+        // try to provision, which requires secrets/storage).
+        let spec = sample_spec("setup-fail");
+        let state = {
+            let db = ctrl.db.clone();
+            let spec_clone = spec.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut conn = db.0.lock().unwrap();
+                let state = ServiceState::for_provisioning(
+                    spec_clone.name().clone(),
+                    spec_clone.provider(),
+                    spec_clone.version().clone(),
+                    ResolvedImage::parse(PG18_4_REF).unwrap(),
+                    Utc::now(),
+                )
+                .unwrap();
+                ServiceRepository::insert_service_and_state(
+                    &mut conn,
+                    &spec_clone,
+                    &state,
+                    Utc::now(),
+                )
+                .unwrap();
+                state
+            })
+            .await
+            .unwrap()
+        };
+
+        // ensure_one: make_secret_capability returns Blocked (no storage on
+        // non-Linux, or storage None on Linux test controller). The error
+        // must be routed through classification and persisted as Blocked.
+        let result = ctrl
+            .ensure_one(&ServiceName::parse("setup-fail").unwrap())
+            .await;
+        assert!(result.is_err(), "ensure_one should fail with Blocked");
+        assert!(
+            matches!(result.unwrap_err(), ServiceError::Blocked(_, _)),
+            "expected Blocked from setup failure"
+        );
+
+        // Verify the state was persisted as Blocked on all platforms.
+        let db = ctrl.db.clone();
+        let state_row = tokio::task::spawn_blocking(move || {
+            let conn = db.0.lock().unwrap();
+            ServiceRepository::get_state(&conn, &ServiceName::parse("setup-fail").unwrap())
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("state row should exist after ensure_one");
+
+        assert_eq!(
+            state_row.phase(),
+            LifecyclePhase::Blocked,
+            "setup failure should persist Blocked phase"
+        );
+
+        // Second ensure_one should skip (Blocked fast-path).
+        let result2 = ctrl
+            .ensure_one(&ServiceName::parse("setup-fail").unwrap())
+            .await;
+        assert!(
+            result2.is_ok(),
+            "ensure_one should skip already-Blocked services (no retry storm)"
+        );
 
         let _ = state;
     }

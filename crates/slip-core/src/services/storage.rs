@@ -210,7 +210,14 @@ mod _linux {
     /// as relative components beneath the held `/` FD using full
     /// `RESOLVE_BENEATH | NO_SYMLINKS | NO_XDEV` flags. All descendant
     /// operations are relative to that held root FD.
-    #[derive(Debug)]
+    // In production builds the derived Debug is sound: all fields are Debug.
+    // In test builds the #[cfg(test)] fsync_fault_hook field is a
+    // `Mutex<Option<Box<dyn Fn...>>>` and `dyn Fn` is not Debug, so we supply
+    // a manual Debug impl below that omits the hook and the raw root_fd
+    // handle (never printing kernel descriptor state or test injection
+    // internals). Both paths keep Debug available so call sites that
+    // Debug-format a ServiceStorage compile in all build modes.
+    #[cfg_attr(not(test), derive(Debug))]
     pub struct ServiceStorage {
         root_fd: OwnedFd,
         root_path: PathBuf,
@@ -222,8 +229,24 @@ mod _linux {
         /// path; if it returns `Err`, `fsync_descendant_dir` returns that error
         /// instead of performing the real fsync.
         #[cfg(test)]
+        #[allow(clippy::type_complexity)]
         fsync_fault_hook:
             std::sync::Mutex<Option<Box<dyn Fn(&str) -> Result<(), StorageError> + Send + Sync>>>,
+    }
+
+    #[cfg(test)]
+    impl std::fmt::Debug for ServiceStorage {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            // Omit root_fd (raw kernel descriptor) and the test-only fault
+            // hook (dyn Fn is not Debug and carries no secret material).
+            // root_path/root_dev/root_ino are diagnostics-safe (the trusted
+            // root identity, not secret bytes).
+            f.debug_struct("ServiceStorage")
+                .field("root_path", &self.root_path)
+                .field("root_dev", &self.root_dev)
+                .field("root_ino", &self.root_ino)
+                .finish_non_exhaustive()
+        }
     }
 
     impl ServiceStorage {
@@ -992,7 +1015,7 @@ mod _linux {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
         loop {
-            let n = file.read(&mut chunk).map_err(|e| StorageError::Io(e))?;
+            let n = file.read(&mut chunk).map_err(StorageError::Io)?;
             if n == 0 {
                 break;
             }
@@ -1009,8 +1032,8 @@ mod _linux {
 
     pub(crate) fn write_all_and_fsync(file: &File, data: &[u8]) -> Result<(), StorageError> {
         let mut file = file;
-        file.write_all(data).map_err(|e| StorageError::Io(e))?;
-        file.sync_all().map_err(|e| StorageError::Io(e))?;
+        file.write_all(data).map_err(StorageError::Io)?;
+        file.sync_all().map_err(StorageError::Io)?;
         Ok(())
     }
 
@@ -1313,7 +1336,7 @@ mod _linux {
             }
             let d = make_root();
             let s = ServiceStorage::new(d.path()).unwrap();
-            s.write_file_exclusive("f", &vec![b'a'; 200]).unwrap();
+            s.write_file_exclusive("f", &[b'a'; 200]).unwrap();
             assert!(s.read_file("f", 100).is_err());
         }
 
