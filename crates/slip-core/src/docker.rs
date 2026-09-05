@@ -1,6 +1,6 @@
 //! Docker client wrapper around bollard for container lifecycle management.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 
 use bollard::Docker;
@@ -804,6 +804,409 @@ impl RuntimeBackend for DockerClient {
             });
 
         Box::pin(stream)
+    }
+
+    // ── Service-safe operations (SLIP-106 Part 3) ───────────────────────────
+
+    fn is_rootful(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        // Check docker info for rootless mode. Require affirmative
+        // rootless=false (or absent with no rootless indicator) to pass.
+        // Fail closed on any connection error or ambiguous state.
+        Box::pin(async move {
+            match self.docker.info().await {
+                Ok(info) => {
+                    // Check security_options for explicit "rootless" flag.
+                    let is_rootless = info
+                        .security_options
+                        .as_ref()
+                        .map(|opts| opts.iter().any(|o| o.contains("rootless")))
+                        .unwrap_or(false);
+                    // Also check the DockerInfo for rootless field if available.
+                    // Bollard's DockerInfo may not expose rootless directly,
+                    // but security_options with "rootless" is the standard
+                    // indicator. If security_options is absent, assume rootful
+                    // only if we can connect (fail closed on ambiguity).
+                    !is_rootless
+                }
+                Err(_) => {
+                    // Can't connect to daemon — fail closed.
+                    false
+                }
+            }
+        })
+    }
+
+    fn create_and_start_service<'a>(
+        &'a self,
+        spec: &'a crate::runtime::ServiceContainerSpec,
+    ) -> Pin<Box<dyn Future<Output = Result<String, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Revalidate the image is digest-pinned (already enforced by spec
+            // construction, but defense in depth at the runtime boundary).
+            let image_ref = spec.image().repo_digest();
+
+            // Mounts: structured Mount API, bind propagation rprivate.
+            let mounts: Vec<Mount> = spec
+                .mounts()
+                .iter()
+                .map(|m| Mount {
+                    typ: Some(MountTypeEnum::BIND),
+                    source: Some(m.host_source.clone()),
+                    target: Some(m.dest.clone()),
+                    read_only: Some(m.read_only),
+                    bind_options: Some(MountBindOptions {
+                        propagation: Some(MountBindOptionsPropagationEnum::RPRIVATE),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect();
+
+            // Healthcheck
+            let healthcheck = bollard::models::HealthConfig {
+                test: Some(spec.healthcheck().test_cmd.clone()),
+                interval: Some(spec.healthcheck().interval_secs * 1_000_000_000),
+                timeout: Some(spec.healthcheck().timeout_secs * 1_000_000_000),
+                retries: Some(spec.healthcheck().retries),
+                start_period: Some(spec.healthcheck().start_period_secs * 1_000_000_000),
+                ..Default::default()
+            };
+
+            // Security: no-new-privileges, minimal caps, read-only rootfs
+            let security_opt = vec!["no-new-privileges:true".to_string()];
+            let cap_drop = vec!["ALL".to_string()];
+
+            let tmpfs: Option<HashMap<String, String>> = if spec.security().tmpfs_mounts.is_empty()
+            {
+                None
+            } else {
+                Some(spec.security().tmpfs_mounts.iter().cloned().collect())
+            };
+
+            let host_config = HostConfig {
+                restart_policy: Some(bollard::models::RestartPolicy {
+                    name: Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED),
+                    ..Default::default()
+                }),
+                port_bindings: None, // No host ports for services
+                network_mode: Some(spec.network().to_string()),
+                binds: None, // Using mounts, not binds
+                mounts: Some(mounts),
+                memory: spec.resources().memory_bytes,
+                nano_cpus: spec.resources().nano_cpus,
+                pids_limit: spec.resources().pids_limit,
+                security_opt: Some(security_opt),
+                cap_drop: Some(cap_drop),
+                readonly_rootfs: Some(spec.security().read_only_rootfs),
+                tmpfs,
+                ..Default::default()
+            };
+
+            let env_vec: Vec<String> = spec.env().iter().map(|(k, v)| format!("{k}={v}")).collect();
+
+            let config: Config<String> = Config {
+                image: Some(image_ref),
+                env: Some(env_vec),
+                labels: Some(spec.labels().clone().into_iter().collect()),
+                host_config: Some(host_config),
+                hostname: Some(spec.hostname().to_string()),
+                healthcheck: Some(healthcheck),
+                ..Default::default()
+            };
+
+            let create_opts = CreateContainerOptions {
+                name: spec.name().to_string(),
+                platform: None::<String>,
+            };
+
+            debug!(name = %spec.name(), "creating service container (docker)");
+            let response = self
+                .docker
+                .create_container(Some(create_opts), config)
+                .await
+                .map_err(|e| RuntimeError::ContainerError(e.to_string()))?;
+
+            let container_id = response.id;
+            debug!(container_id = %container_id, "service container created, starting");
+            self.docker
+                .start_container(&container_id, None::<StartContainerOptions<String>>)
+                .await
+                .map_err(|e| RuntimeError::ContainerError(e.to_string()))?;
+
+            info!(container_id = %container_id, "service container started (docker)");
+            Ok(container_id)
+        })
+    }
+
+    fn inspect_service<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<crate::runtime::ServiceContainerInspect, RuntimeError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let info = self
+                .docker
+                .inspect_container(container_id, None)
+                .await
+                .map_err(|e| {
+                    if let bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    } = e
+                    {
+                        RuntimeError::ContainerError("container not found".to_string())
+                    } else {
+                        RuntimeError::ContainerError(e.to_string())
+                    }
+                })?;
+
+            let labels = info
+                .config
+                .as_ref()
+                .and_then(|c| c.labels.as_ref())
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect::<BTreeMap<String, String>>()
+                })
+                .unwrap_or_default();
+
+            // Get repo_digests from the image inspect, not container inspect.
+            // The container's `Image` field is the image config digest; we need
+            // the repo-digest form for comparison.
+            let repo_digests = if let Some(image_id) = info.image.as_ref() {
+                match self.docker.inspect_image(image_id).await {
+                    Ok(img_info) => img_info.repo_digests.unwrap_or_default(),
+                    Err(_) => vec![],
+                }
+            } else {
+                vec![]
+            };
+
+            let mounts = info
+                .mounts
+                .as_ref()
+                .map(|ms| {
+                    ms.iter()
+                        .map(|m| {
+                            (
+                                m.source.clone().unwrap_or_default(),
+                                m.destination.clone().unwrap_or_default(),
+                                !m.rw.unwrap_or(true),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            // Network info
+            let (network, network_aliases) = info
+                .network_settings
+                .as_ref()
+                .and_then(|ns| ns.networks.as_ref())
+                .and_then(|nets| nets.iter().next())
+                .map(|(net_name, ep)| {
+                    let aliases = ep.aliases.clone().unwrap_or_default();
+                    (net_name.clone(), aliases)
+                })
+                .unwrap_or_default();
+
+            let restart_policy = info
+                .host_config
+                .as_ref()
+                .and_then(|hc| hc.restart_policy.as_ref())
+                .and_then(|rp| rp.name.as_ref())
+                .map(|n| format!("{n:?}").to_lowercase().replace('_', "-"))
+                .unwrap_or_else(|| "no".to_string());
+
+            let health_status = info
+                .state
+                .as_ref()
+                .and_then(|s| s.health.as_ref())
+                .and_then(|h| h.status.as_ref())
+                .map(|s| format!("{s:?}").to_lowercase().replace('_', "-"))
+                .unwrap_or_else(|| "none".to_string());
+
+            let port_bindings: Vec<(u16, Option<String>)> = info
+                .host_config
+                .as_ref()
+                .and_then(|hc| hc.port_bindings.as_ref())
+                .map(|pb| {
+                    pb.iter()
+                        .flat_map(|(key, bindings)| {
+                            // key is like "5432/tcp"
+                            let port: u16 = key
+                                .split('/')
+                                .next()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            if let Some(binds) = bindings {
+                                binds
+                                    .iter()
+                                    .map(|b| (port, b.host_port.clone()))
+                                    .collect::<Vec<_>>()
+                            } else {
+                                vec![]
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
+
+            // Use the daemon-returned full container ID, not the requested arg.
+            let daemon_id = info.id.clone().unwrap_or_else(|| container_id.to_string());
+
+            // Security-relevant fields from HostConfig.
+            let host_config = info.host_config.as_ref();
+            let privileged = host_config.and_then(|hc| hc.privileged).unwrap_or(false);
+            let read_only_rootfs = host_config
+                .and_then(|hc| hc.readonly_rootfs)
+                .unwrap_or(false);
+            let memory_limit = host_config.and_then(|hc| hc.memory).unwrap_or(0);
+            let nano_cpus = host_config.and_then(|hc| hc.nano_cpus).unwrap_or(0);
+            let pids_limit = host_config.and_then(|hc| hc.pids_limit).unwrap_or(0);
+            let cap_drop = host_config
+                .and_then(|hc| hc.cap_drop.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            let cap_add = host_config
+                .and_then(|hc| hc.cap_add.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            let security_options = host_config
+                .and_then(|hc| hc.security_opt.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            let no_new_privileges = security_options
+                .iter()
+                .any(|s| s.contains("no-new-privileges"));
+
+            // Collect all network names (must be exactly one for services).
+            let networks: Vec<String> = info
+                .network_settings
+                .as_ref()
+                .and_then(|ns| ns.networks.as_ref())
+                .map(|nets| nets.keys().cloned().collect())
+                .unwrap_or_default();
+
+            // Hostname and name from the config/inspect.
+            let hostname = info.config.as_ref().and_then(|c| c.hostname.clone());
+            let name = info.name.clone();
+
+            Ok(crate::runtime::ServiceContainerInspect {
+                container_id: daemon_id,
+                name,
+                hostname,
+                labels,
+                repo_digests,
+                mounts,
+                networks,
+                network,
+                network_aliases,
+                restart_policy,
+                health_status,
+                port_bindings,
+                running,
+                privileged,
+                no_new_privileges,
+                read_only_rootfs,
+                cap_drop,
+                cap_add,
+                security_options,
+                memory_limit,
+                nano_cpus,
+                pids_limit,
+            })
+        })
+    }
+
+    fn exec_service_probe<'a>(
+        &'a self,
+        container_id: &'a str,
+        argv: &'a [&'a str],
+        env: &'a [(&'a str, &'a str)],
+        timeout: std::time::Duration,
+        max_output_bytes: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Create the exec instance with static argv and allowlisted env.
+            let env_vec: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            let exec = self
+                .docker
+                .create_exec(
+                    container_id,
+                    CreateExecOptions {
+                        cmd: Some(argv.iter().map(|s| s.to_string()).collect()),
+                        env: Some(env_vec),
+                        attach_stdout: Some(true),
+                        attach_stderr: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|_e| {
+                    // Sanitize: no runtime internals in error text.
+                    RuntimeError::ExecFailed("exec creation failed".to_string())
+                })?;
+
+            // Start the exec with a timeout.
+            let exec_future = async {
+                let mut output_buf: Vec<u8> = Vec::new();
+                match self
+                    .docker
+                    .start_exec(&exec.id, None::<bollard::exec::StartExecOptions>)
+                    .await
+                {
+                    Ok(StartExecResults::Attached { mut output, .. }) => {
+                        while let Some(item) = output.next().await {
+                            match item {
+                                Ok(log) => {
+                                    let bytes: &[u8] = log.as_ref();
+                                    if output_buf.len() + bytes.len() <= max_output_bytes {
+                                        output_buf.extend_from_slice(bytes);
+                                    } else if output_buf.len() < max_output_bytes {
+                                        let remaining = max_output_bytes - output_buf.len();
+                                        output_buf.extend_from_slice(&bytes[..remaining]);
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    Ok(StartExecResults::Detached) => {}
+                    Err(_) => {
+                        return Err(RuntimeError::ExecFailed("exec start failed".to_string()));
+                    }
+                }
+
+                // Check the exit code.
+                let inspect = self.docker.inspect_exec(&exec.id).await;
+                match inspect {
+                    Ok(info) => {
+                        let exit_code = info.exit_code.unwrap_or(-1);
+                        if exit_code == 0 {
+                            Ok(())
+                        } else {
+                            Err(RuntimeError::ExecFailed(format!(
+                                "exec exited with code {exit_code}"
+                            )))
+                        }
+                    }
+                    Err(_) => Err(RuntimeError::ExecFailed("exec inspect failed".to_string())),
+                }
+            };
+
+            tokio::time::timeout(timeout, exec_future)
+                .await
+                .map_err(|_| RuntimeError::ExecFailed("exec timed out".to_string()))?
+        })
     }
 }
 

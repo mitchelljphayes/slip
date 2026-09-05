@@ -198,6 +198,13 @@ pub struct ServiceRepository;
 impl ServiceRepository {
     // ── Installation ID ────────────────────────────────────────────────────
 
+    /// Convenience: ensure installation ID via a `Db` wrapper.
+    pub fn ensure_installation_id_via_db(
+        db: &crate::db::Db,
+    ) -> Result<String, ServiceRepositoryError> {
+        db.with_conn(Self::ensure_installation_id)
+    }
+
     /// Get the persistent installation ID, generating one if absent.
     ///
     /// The installation ID is a random 128-bit hex string generated once per

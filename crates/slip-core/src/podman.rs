@@ -41,6 +41,8 @@ pub struct PodmanBackend {
     client: Docker,
     /// Path to the `podman` CLI binary (default: `"podman"`).
     podman_path: String,
+    /// The connected socket path (for rootful verification).
+    socket_path: String,
 }
 
 impl PodmanBackend {
@@ -64,6 +66,7 @@ impl PodmanBackend {
         Ok(Self {
             client,
             podman_path,
+            socket_path,
         })
     }
 
@@ -760,6 +763,342 @@ impl RuntimeBackend for PodmanBackend {
             });
 
         Box::pin(stream)
+    }
+
+    // ── Service-safe operations (SLIP-106 Part 3) ───────────────────────────
+
+    fn is_rootful(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        // Rootful = /run/podman/podman.sock or /var/run/podman/podman.sock.
+        // XDG_RUNTIME_DIR-derived = rootless.
+        let is_root = self.socket_path == "/run/podman/podman.sock"
+            || self.socket_path == "/var/run/podman/podman.sock";
+        Box::pin(async move { is_root })
+    }
+
+    fn create_and_start_service<'a>(
+        &'a self,
+        spec: &'a crate::runtime::ServiceContainerSpec,
+    ) -> Pin<Box<dyn Future<Output = Result<String, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            let image_ref = spec.image().repo_digest();
+
+            let mounts: Vec<Mount> = spec
+                .mounts()
+                .iter()
+                .map(|m| Mount {
+                    typ: Some(MountTypeEnum::BIND),
+                    source: Some(m.host_source.clone()),
+                    target: Some(m.dest.clone()),
+                    read_only: Some(m.read_only),
+                    bind_options: Some(MountBindOptions {
+                        propagation: Some(MountBindOptionsPropagationEnum::RPRIVATE),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect();
+
+            let healthcheck = bollard::models::HealthConfig {
+                test: Some(spec.healthcheck().test_cmd.clone()),
+                interval: Some(spec.healthcheck().interval_secs * 1_000_000_000),
+                timeout: Some(spec.healthcheck().timeout_secs * 1_000_000_000),
+                retries: Some(spec.healthcheck().retries),
+                start_period: Some(spec.healthcheck().start_period_secs * 1_000_000_000),
+                ..Default::default()
+            };
+
+            let security_opt = vec!["no-new-privileges:true".to_string()];
+            let cap_drop = vec!["ALL".to_string()];
+
+            let tmpfs: Option<HashMap<String, String>> = if spec.security().tmpfs_mounts.is_empty()
+            {
+                None
+            } else {
+                Some(spec.security().tmpfs_mounts.iter().cloned().collect())
+            };
+
+            let host_config = HostConfig {
+                restart_policy: Some(bollard::models::RestartPolicy {
+                    name: Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED),
+                    ..Default::default()
+                }),
+                port_bindings: None,
+                network_mode: Some(spec.network().to_string()),
+                binds: None,
+                mounts: Some(mounts),
+                memory: spec.resources().memory_bytes,
+                nano_cpus: spec.resources().nano_cpus,
+                pids_limit: spec.resources().pids_limit,
+                security_opt: Some(security_opt),
+                cap_drop: Some(cap_drop),
+                readonly_rootfs: Some(spec.security().read_only_rootfs),
+                tmpfs,
+                ..Default::default()
+            };
+
+            let env_vec: Vec<String> = spec.env().iter().map(|(k, v)| format!("{k}={v}")).collect();
+
+            let config: Config<String> = Config {
+                image: Some(image_ref),
+                env: Some(env_vec),
+                labels: Some(spec.labels().clone().into_iter().collect()),
+                host_config: Some(host_config),
+                hostname: Some(spec.hostname().to_string()),
+                healthcheck: Some(healthcheck),
+                ..Default::default()
+            };
+
+            let create_opts = CreateContainerOptions {
+                name: spec.name().to_string(),
+                platform: None::<String>,
+            };
+
+            debug!(name = %spec.name(), "creating service container (podman)");
+            let response = self
+                .client
+                .create_container(Some(create_opts), config)
+                .await
+                .map_err(|e| RuntimeError::ContainerError(e.to_string()))?;
+
+            let container_id = response.id;
+            debug!(container_id = %container_id, "service container created, starting (podman)");
+            self.client
+                .start_container(&container_id, None::<StartContainerOptions<String>>)
+                .await
+                .map_err(|e| RuntimeError::ContainerError(e.to_string()))?;
+
+            info!(container_id = %container_id, "service container started (podman)");
+            Ok(container_id)
+        })
+    }
+
+    fn inspect_service<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<crate::runtime::ServiceContainerInspect, RuntimeError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let info = self
+                .client
+                .inspect_container(container_id, None)
+                .await
+                .map_err(|e| {
+                    if let bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    } = e
+                    {
+                        RuntimeError::ContainerError("container not found".to_string())
+                    } else {
+                        RuntimeError::ContainerError(e.to_string())
+                    }
+                })?;
+
+            let labels = info
+                .config
+                .as_ref()
+                .and_then(|c| c.labels.as_ref())
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect::<std::collections::BTreeMap<String, String>>()
+                })
+                .unwrap_or_default();
+
+            let repo_digests = if let Some(image_id) = info.image.as_ref() {
+                match self.client.inspect_image(image_id).await {
+                    Ok(img_info) => img_info.repo_digests.unwrap_or_default(),
+                    Err(_) => vec![],
+                }
+            } else {
+                vec![]
+            };
+
+            let mounts = info
+                .mounts
+                .as_ref()
+                .map(|ms| {
+                    ms.iter()
+                        .map(|m| {
+                            (
+                                m.source.clone().unwrap_or_default(),
+                                m.destination.clone().unwrap_or_default(),
+                                !m.rw.unwrap_or(true),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            let (network, network_aliases) = info
+                .network_settings
+                .as_ref()
+                .and_then(|ns| ns.networks.as_ref())
+                .and_then(|nets| nets.iter().next())
+                .map(|(net_name, ep)| (net_name.clone(), ep.aliases.clone().unwrap_or_default()))
+                .unwrap_or_default();
+
+            let restart_policy = info
+                .host_config
+                .as_ref()
+                .and_then(|hc| hc.restart_policy.as_ref())
+                .and_then(|rp| rp.name.as_ref())
+                .map(|n| format!("{n:?}").to_lowercase().replace('_', "-"))
+                .unwrap_or_else(|| "no".to_string());
+
+            let health_status = info
+                .state
+                .as_ref()
+                .and_then(|s| s.health.as_ref())
+                .and_then(|h| h.status.as_ref())
+                .map(|s| format!("{s:?}").to_lowercase().replace('_', "-"))
+                .unwrap_or_else(|| "none".to_string());
+
+            let port_bindings: Vec<(u16, Option<String>)> = info
+                .host_config
+                .as_ref()
+                .and_then(|hc| hc.port_bindings.as_ref())
+                .map(|pb| {
+                    pb.iter()
+                        .flat_map(|(key, bindings)| {
+                            let port: u16 = key
+                                .split('/')
+                                .next()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            if let Some(binds) = bindings {
+                                binds
+                                    .iter()
+                                    .map(|b| (port, b.host_port.clone()))
+                                    .collect::<Vec<_>>()
+                            } else {
+                                vec![]
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
+
+            // Use the daemon-returned full container ID, not the requested arg.
+            let daemon_id = info.id.clone().unwrap_or_else(|| container_id.to_string());
+
+            // Security-relevant fields from HostConfig.
+            let host_config = info.host_config.as_ref();
+            let privileged = host_config.and_then(|hc| hc.privileged).unwrap_or(false);
+            let read_only_rootfs = host_config
+                .and_then(|hc| hc.readonly_rootfs)
+                .unwrap_or(false);
+            let memory_limit = host_config.and_then(|hc| hc.memory).unwrap_or(0);
+            let nano_cpus = host_config.and_then(|hc| hc.nano_cpus).unwrap_or(0);
+            let pids_limit = host_config.and_then(|hc| hc.pids_limit).unwrap_or(0);
+            let cap_drop = host_config
+                .and_then(|hc| hc.cap_drop.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            let cap_add = host_config
+                .and_then(|hc| hc.cap_add.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            let security_options = host_config
+                .and_then(|hc| hc.security_opt.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            let no_new_privileges = security_options
+                .iter()
+                .any(|s| s.contains("no-new-privileges"));
+
+            // Collect all network names (must be exactly one for services).
+            let networks: Vec<String> = info
+                .network_settings
+                .as_ref()
+                .and_then(|ns| ns.networks.as_ref())
+                .map(|nets| nets.keys().cloned().collect())
+                .unwrap_or_default();
+
+            let hostname = info.config.as_ref().and_then(|c| c.hostname.clone());
+            let name = info.name.clone();
+
+            Ok(crate::runtime::ServiceContainerInspect {
+                container_id: daemon_id,
+                name,
+                hostname,
+                labels,
+                repo_digests,
+                mounts,
+                networks,
+                network,
+                network_aliases,
+                restart_policy,
+                health_status,
+                port_bindings,
+                running,
+                privileged,
+                no_new_privileges,
+                read_only_rootfs,
+                cap_drop,
+                cap_add,
+                security_options,
+                memory_limit,
+                nano_cpus,
+                pids_limit,
+            })
+        })
+    }
+
+    fn exec_service_probe<'a>(
+        &'a self,
+        container_id: &'a str,
+        argv: &'a [&'a str],
+        env: &'a [(&'a str, &'a str)],
+        timeout: std::time::Duration,
+        max_output_bytes: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        let podman_path = self.podman_path.clone();
+        Box::pin(async move {
+            // Build a static argv with no shell. Podman exec syntax:
+            //   podman exec [OPTIONS] CONTAINER COMMAND [ARG...]
+            // --env must come BEFORE the container ID, not after.
+            let mut cmd = tokio::process::Command::new(&podman_path);
+            cmd.arg("exec");
+            for (k, v) in env {
+                cmd.arg("--env").arg(format!("{k}={v}"));
+            }
+            cmd.arg(container_id);
+            cmd.args(argv);
+            // Discard stdout/stderr entirely — output is never returned to
+            // callers and may contain secret-adjacent text. Using null()
+            // prevents unbounded buffering (OOM protection).
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+            cmd.kill_on_drop(true);
+
+            let mut child = cmd
+                .spawn()
+                .map_err(|_| RuntimeError::ExecFailed("failed to spawn podman exec".to_string()))?;
+
+            // Wait with timeout. Output is discarded (null stdio).
+            let _ = max_output_bytes; // accepted for API symmetry; output is null
+            let status = tokio::time::timeout(timeout, child.wait())
+                .await
+                .map_err(|_| RuntimeError::ExecFailed("exec timed out".to_string()))?
+                .map_err(|_| RuntimeError::ExecFailed("exec failed".to_string()))?;
+
+            if status.success() {
+                Ok(())
+            } else {
+                let code = status.code().unwrap_or(-1);
+                Err(RuntimeError::ExecFailed(format!(
+                    "exec exited with code {code}"
+                )))
+            }
+        })
     }
 }
 

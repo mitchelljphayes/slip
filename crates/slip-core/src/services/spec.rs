@@ -11,6 +11,7 @@
 //! implementation belong to Part 3 and are intentionally absent here.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use chrono::{DateTime, Utc};
@@ -27,7 +28,7 @@ use crate::services::name::ServiceName;
 /// Serialized as the lowercase string `"postgres"` -- this is the `type`
 /// field in a future `[services.<name>]` manifest. Adding a provider is a code
 /// change; arbitrary provider input is rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     Postgres,
@@ -859,15 +860,35 @@ fn canonicalize_value(value: serde_json::Value) -> serde_json::Value {
 
 // ─── Instance-scoped secret capability ─────────────────────────────────────────
 
+/// Validated, provider-safe secret mount tokens for an active generation.
+///
+/// This is the provider-safe alternative to `read_superuser()`. The provider
+/// receives validated bind-source file tokens (canonical host paths) for the
+/// active `raw_password` and `pgpass` files, plus the non-secret generation
+/// name for ownership-label comparison. The provider never sees plaintext
+/// secret material — it mounts these files into the container.
+///
+/// On non-Linux (or when the bundle has no active generation), the capability
+/// returns `Unsupported`.
+#[derive(Debug, Clone)]
+pub struct ActiveSecretMounts {
+    /// The active generation name (non-secret, 32 hex).
+    pub generation: crate::services::secret::GenerationName,
+    /// Canonical host path of the raw_password file.
+    pub raw_password_path: PathBuf,
+    /// Canonical host path of the pgpass file.
+    pub pgpass_path: PathBuf,
+}
+
 /// An instance-scoped secret capability bound to one validated `InstanceId`.
 ///
 /// This object is constructed with a specific instance identity and only
 /// exposes operations relative to that instance. Providers cannot pass an
 /// arbitrary `SecretRef` -- the capability is bound at construction and
-/// only offers operations for its bound instance. Cross-instance reads are
+/// only offers operations for its instance. Cross-instance reads are
 /// unrepresentable because there is no `read(secret_ref)` method.
 ///
-/// Part 2 will provide the concrete implementation with descriptor-confined
+/// Part 2 provides the concrete implementation with descriptor-confined
 /// filesystem access. Part 1 defines the interface so the `ServiceProvider`
 /// trait compiles without leaking the unrestricted `SecretsStore`.
 pub trait InstanceSecretCapability: Send + Sync {
@@ -876,20 +897,53 @@ pub trait InstanceSecretCapability: Send + Sync {
 
     /// Read the superuser secret for this instance.
     /// Returns `Ok(None)` if the secret does not exist.
+    ///
+    /// **Not for provider use**: this returns plaintext and invites leakage.
+    /// Providers should use [`active_secret_mounts`](Self::active_secret_mounts)
+    /// instead. Retained for test compatibility.
     fn read_superuser(&self) -> Result<Option<String>, ServiceError>;
+
+    /// Return validated mount tokens for the active generation's `raw_password`
+    /// and `pgpass` files, plus the non-secret generation name.
+    ///
+    /// This is the provider-safe path: the provider mounts these files
+    /// read-only into the container and never sees plaintext. Default
+    /// returns `Unsupported` (fakes override for test configuration).
+    fn active_secret_mounts(&self) -> Result<ActiveSecretMounts, ServiceError> {
+        Err(ServiceError::Internal(
+            "active_secret_mounts not supported by this capability".to_string(),
+        ))
+    }
 }
 
 /// A fake implementation for testing. Returns the provided value or `None`.
 /// Bound to a specific instance ID and rejects cross-instance access by
 /// construction (there is no method that accepts a different instance).
+///
+/// For provider tests that need `active_secret_mounts`, use
+/// [`FakeInstanceSecrets::with_mounts`](Self::with_mounts).
 pub struct FakeInstanceSecrets {
     instance_id: InstanceId,
     value: Option<String>,
+    mounts: Option<ActiveSecretMounts>,
 }
 
 impl FakeInstanceSecrets {
     pub fn new(instance_id: InstanceId, value: Option<String>) -> Self {
-        Self { instance_id, value }
+        Self {
+            instance_id,
+            value,
+            mounts: None,
+        }
+    }
+
+    /// Create a fake with configured mount tokens (for provider tests).
+    pub fn with_mounts(instance_id: InstanceId, mounts: ActiveSecretMounts) -> Self {
+        Self {
+            instance_id,
+            value: None,
+            mounts: Some(mounts),
+        }
     }
 }
 
@@ -900,6 +954,12 @@ impl InstanceSecretCapability for FakeInstanceSecrets {
 
     fn read_superuser(&self) -> Result<Option<String>, ServiceError> {
         Ok(self.value.clone())
+    }
+
+    fn active_secret_mounts(&self) -> Result<ActiveSecretMounts, ServiceError> {
+        self.mounts
+            .clone()
+            .ok_or_else(|| ServiceError::Internal("no mounts configured on fake".to_string()))
     }
 }
 
@@ -925,6 +985,7 @@ pub struct ProviderContext<'a> {
     services_root: &'a std::path::Path,
     network: &'a str,
     installation_id: &'a str,
+    storage: Option<&'a crate::services::storage::ServiceStorage>,
 }
 
 impl<'a> ProviderContext<'a> {
@@ -949,7 +1010,17 @@ impl<'a> ProviderContext<'a> {
             services_root,
             network,
             installation_id,
+            storage: None,
         })
+    }
+
+    /// Set the storage accessor (Linux only). Non-Linux callers omit this.
+    pub fn with_storage(
+        mut self,
+        storage: Option<&'a crate::services::storage::ServiceStorage>,
+    ) -> Self {
+        self.storage = storage;
+        self
     }
 
     pub fn runtime(&self) -> &dyn RuntimeBackend {
@@ -966,6 +1037,10 @@ impl<'a> ProviderContext<'a> {
     }
     pub fn installation_id(&self) -> &str {
         self.installation_id
+    }
+    /// Linux-only storage accessor; `None` on non-Linux.
+    pub fn storage(&self) -> Option<&crate::services::storage::ServiceStorage> {
+        self.storage
     }
 }
 
@@ -1124,6 +1199,15 @@ pub enum ServiceError {
     ContainerNotFound,
     #[error("readiness check failed: {0}")]
     ReadinessFailed(String),
+    /// A state conflict: a different spec already exists for this name, or
+    /// the caller's observed generation is stale. The `reason` is a
+    /// sanitized, non-secret description with a prescriptive remedy.
+    #[error("conflict: {0}")]
+    Conflict(String),
+    /// Concurrent modification: the CAS (compare-and-swap) on persisted state
+    /// failed because another caller modified the row between read and write.
+    #[error("concurrent modification detected (generation mismatch)")]
+    ConcurrentModification,
 }
 
 #[cfg(test)]
@@ -1745,5 +1829,193 @@ mod tests {
             PostgresConfig {},
         )
         .unwrap()
+    }
+
+    // ── Phase 1: ServiceContainerSpec validation ────────────────────────────
+
+    fn sample_pinned_image() -> crate::services::image_ref::PinnedImageRef {
+        crate::services::image_ref::PinnedImageRef::parse(
+            "docker.io/library/postgres:18.4-bookworm@sha256:882236b897e39051d2368c5ccc6cda944904723506b2dfc97f2a8f5bc9afa382",
+        )
+        .unwrap()
+    }
+
+    fn sample_healthcheck() -> crate::runtime::ServiceHealthcheck {
+        crate::runtime::ServiceHealthcheck {
+            test_cmd: vec!["pg_isready".into(), "-U".into(), "postgres".into()],
+            interval_secs: 10,
+            timeout_secs: 5,
+            retries: 5,
+            start_period_secs: 30,
+        }
+    }
+
+    #[test]
+    fn service_container_spec_valid() {
+        let spec = crate::runtime::ServiceContainerSpec::new(
+            "slip-service-pg".to_string(),
+            "slip-service-pg".to_string(),
+            sample_pinned_image(),
+            "slip".to_string(),
+            vec!["pg".to_string()],
+            vec![],
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            sample_healthcheck(),
+            crate::runtime::ServiceResourceLimits::default(),
+            crate::runtime::ServiceSecurityOpts::default(),
+        );
+        assert!(spec.is_ok(), "valid spec must succeed");
+        let spec = spec.unwrap();
+        assert_eq!(spec.name(), "slip-service-pg");
+        assert_eq!(spec.network(), "slip");
+        assert!(spec.restart_unless_stopped());
+    }
+
+    #[test]
+    fn service_container_spec_rejects_wrong_name_prefix() {
+        let spec = crate::runtime::ServiceContainerSpec::new(
+            "pg".to_string(), // missing slip-service- prefix
+            "pg".to_string(),
+            sample_pinned_image(),
+            "slip".to_string(),
+            vec!["pg".to_string()],
+            vec![],
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            sample_healthcheck(),
+            crate::runtime::ServiceResourceLimits::default(),
+            crate::runtime::ServiceSecurityOpts::default(),
+        );
+        assert!(spec.is_err());
+    }
+
+    #[test]
+    fn service_container_spec_rejects_empty_network() {
+        let spec = crate::runtime::ServiceContainerSpec::new(
+            "slip-service-pg".to_string(),
+            "slip-service-pg".to_string(),
+            sample_pinned_image(),
+            "".to_string(),
+            vec!["pg".to_string()],
+            vec![],
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            sample_healthcheck(),
+            crate::runtime::ServiceResourceLimits::default(),
+            crate::runtime::ServiceSecurityOpts::default(),
+        );
+        assert!(spec.is_err());
+    }
+
+    #[test]
+    fn service_container_spec_rejects_empty_aliases() {
+        let spec = crate::runtime::ServiceContainerSpec::new(
+            "slip-service-pg".to_string(),
+            "slip-service-pg".to_string(),
+            sample_pinned_image(),
+            "slip".to_string(),
+            vec![],
+            vec![],
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            sample_healthcheck(),
+            crate::runtime::ServiceResourceLimits::default(),
+            crate::runtime::ServiceSecurityOpts::default(),
+        );
+        assert!(spec.is_err());
+    }
+
+    #[test]
+    fn service_container_spec_rejects_secret_env_key() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("POSTGRES_PASSWORD".to_string(), "secret".to_string());
+        let spec = crate::runtime::ServiceContainerSpec::new(
+            "slip-service-pg".to_string(),
+            "slip-service-pg".to_string(),
+            sample_pinned_image(),
+            "slip".to_string(),
+            vec!["pg".to_string()],
+            vec![],
+            env,
+            std::collections::BTreeMap::new(),
+            sample_healthcheck(),
+            crate::runtime::ServiceResourceLimits::default(),
+            crate::runtime::ServiceSecurityOpts::default(),
+        );
+        assert!(spec.is_err());
+    }
+
+    #[test]
+    fn service_container_spec_accepts_password_file_env_key() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "POSTGRES_PASSWORD_FILE".to_string(),
+            "/run/secrets/slip-raw-password".to_string(),
+        );
+        let spec = crate::runtime::ServiceContainerSpec::new(
+            "slip-service-pg".to_string(),
+            "slip-service-pg".to_string(),
+            sample_pinned_image(),
+            "slip".to_string(),
+            vec!["pg".to_string()],
+            vec![],
+            env,
+            std::collections::BTreeMap::new(),
+            sample_healthcheck(),
+            crate::runtime::ServiceResourceLimits::default(),
+            crate::runtime::ServiceSecurityOpts::default(),
+        );
+        assert!(spec.is_ok(), "POSTGRES_PASSWORD_FILE must be accepted");
+    }
+
+    // ── Phase 1: active_secret_mounts default ────────────────────────────────
+
+    #[test]
+    fn fake_instance_secrets_active_mounts_default_unsupported() {
+        let id = InstanceId::generate().unwrap();
+        let caps = FakeInstanceSecrets::new(id, Some("v".to_string()));
+        assert!(caps.active_secret_mounts().is_err());
+    }
+
+    #[test]
+    fn fake_instance_secrets_with_mounts() {
+        let id = InstanceId::generate().unwrap();
+        let generation = crate::services::secret::GenerationName::generate().unwrap();
+        let mounts = ActiveSecretMounts {
+            generation,
+            raw_password_path: std::path::PathBuf::from("/tmp/raw"),
+            pgpass_path: std::path::PathBuf::from("/tmp/pgpass"),
+        };
+        let caps = FakeInstanceSecrets::with_mounts(id.clone(), mounts);
+        let result = caps.active_secret_mounts().unwrap();
+        assert_eq!(
+            result.raw_password_path,
+            std::path::PathBuf::from("/tmp/raw")
+        );
+        assert_eq!(result.pgpass_path, std::path::PathBuf::from("/tmp/pgpass"));
+    }
+
+    // ── Phase 1: ServiceError variants ───────────────────────────────────────
+
+    #[test]
+    fn service_error_conflict_display() {
+        let e = ServiceError::Conflict("spec differs".to_string());
+        assert!(e.to_string().contains("conflict"));
+    }
+
+    #[test]
+    fn service_error_concurrent_modification_display() {
+        let e = ServiceError::ConcurrentModification;
+        assert!(e.to_string().contains("concurrent"));
+    }
+
+    // ── Phase 1: is_rootful default ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fake_runtime_is_rootful_defaults_false() {
+        let rt = FakeRuntime;
+        let rootful = rt.is_rootful().await;
+        assert!(!rootful, "default is_rootful must be false (fail closed)");
     }
 }

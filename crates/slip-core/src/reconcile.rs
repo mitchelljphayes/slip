@@ -76,6 +76,8 @@ pub struct ReconcileContext {
     pub acme_email: Option<String>,
     /// ACME CA URL override (None = production LE).
     pub acme_ca: Option<String>,
+    /// Service controller for managed-service ensure (SLIP-106 Part 3).
+    pub services: Option<Arc<crate::services::ServiceController>>,
 }
 
 impl ReconcileContext {
@@ -94,6 +96,7 @@ impl ReconcileContext {
             listen_addr: state.config.server.listen.to_string(),
             acme_email: crate::config::resolve_acme_email(&state.config),
             acme_ca: state.config.caddy.acme_ca.clone(),
+            services: state.services.clone(),
         }
     }
 }
@@ -168,6 +171,14 @@ pub async fn reconcile_tick(
     ctx: &ReconcileContext,
     backoff: &ExponentialBuilder,
 ) -> ReconcileSummary {
+    // ── 0. Service ensure (SLIP-106 Part 3) — before apps ───────────────────
+    // Services may be dependencies of apps; ensure they converge first.
+    // Bounded by half the interval, collect-and-continue.
+    if let Some(ctrl) = &ctx.services {
+        let svc_budget = Duration::from_secs(30);
+        ctrl.ensure_all(svc_budget).await;
+    }
+
     // ── 1. Re-apply infrastructure idempotently (collect-and-continue) ──────
     // These are cheap no-ops when the state already matches (GET-then-apply).
     if let Err(e) = ctx.caddy.bootstrap().await {
@@ -1047,6 +1058,7 @@ mod tests {
             listen_addr: "127.0.0.1:7890".to_string(),
             acme_email: None,
             acme_ca: None,
+            services: None,
         };
 
         // Verify the webhook route exists after bootstrap_deploy.
@@ -1238,6 +1250,7 @@ mod tests {
             listen_addr: "127.0.0.1:7890".to_string(),
             acme_email: None,
             acme_ca: None,
+            services: None,
         };
         let backoff = default_backoff();
 
@@ -1311,6 +1324,7 @@ mod tests {
             listen_addr: "127.0.0.1:7890".to_string(),
             acme_email: None,
             acme_ca: None,
+            services: None,
         };
         let backoff = default_backoff();
 

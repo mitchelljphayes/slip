@@ -319,6 +319,57 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to open database at {}: {e}", db_path.display()))?;
     tracing::info!(path = %db_path.display(), "deploy history database opened");
 
+    // ── Initialize service controller (SLIP-106 Part 3) ──────────────────────
+    let installation_id = {
+        let db_clone = db.clone();
+        slip_core::services::ServiceRepository::ensure_installation_id_via_db(&db_clone)
+            .map_err(|e| anyhow::anyhow!("failed to ensure installation_id: {e}"))?
+    };
+
+    let services_root = slip_config.storage.path.join("services");
+    let runtime_clone = runtime.clone();
+
+    #[cfg(target_os = "linux")]
+    let service_storage = {
+        match slip_core::services::ServiceStorage::new(&services_root) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %services_root.display(),
+                    "service storage initialization failed (services will be unavailable)"
+                );
+                None
+            }
+        }
+    };
+
+    let apps_snapshot = apps.clone();
+    let usage = std::sync::Arc::new(slip_core::services::AppConfigUsageReader::new(
+        std::sync::Arc::new(tokio::sync::RwLock::new(apps_snapshot)),
+    ));
+
+    let service_controller = std::sync::Arc::new(slip_core::services::ServiceController::new(
+        db.clone(),
+        runtime_clone,
+        services_root.clone(),
+        "slip".to_string(),
+        installation_id,
+        usage,
+        #[cfg(target_os = "linux")]
+        service_storage,
+    ));
+
+    // Check if runtime is rootful for service support.
+    let svc_rootful = service_controller.is_rootful().await;
+    if !svc_rootful {
+        tracing::warn!(
+            "service framework: runtime is not rootful — service operations will fail closed"
+        );
+    } else {
+        tracing::info!("service framework: rootful runtime detected");
+    }
+
     // ── Load persisted preview states ────────────────────────────────────────
     let persisted_previews = load_preview_states(&state_dir);
     if !persisted_previews.is_empty() {
@@ -366,6 +417,7 @@ async fn main() -> anyhow::Result<()> {
         preview_locks: DashMap::new(),
         renew_locks: DashMap::new(),
         secrets_store,
+        services: Some(service_controller.clone()),
     });
 
     // ── Populate in-memory deploy cache from SQLite ──────────────────────────
@@ -389,6 +441,17 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Spawn background tasks ────────────────────────────────────────────────
     tokio::spawn(preview_reaper(state.clone()));
+
+    // Service startup ensure (SLIP-106 Part 3) — bounded, non-blocking.
+    // Runs a single ensure pass over all services after startup; the periodic
+    // reconcile loop handles ongoing convergence.
+    if let Some(ctrl) = &state.services {
+        let ctrl_clone = ctrl.clone();
+        tokio::spawn(async move {
+            ctrl_clone.startup_ensure().await;
+        });
+        tracing::info!("service startup ensure spawned (bounded, non-blocking)");
+    }
 
     // Caddy reconcile loop — self-heals routes, deploy-webhook, and TLS after
     // a Caddy restart or missed webhook. Safety net, not the primary update
