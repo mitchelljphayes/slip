@@ -829,7 +829,7 @@ impl RuntimeBackend for DockerClient {
                     !is_rootless
                 }
                 Err(_) => {
-                    // Can't connect to daemon — fail closed.
+                    // Can't connect to daemon: fail closed.
                     false
                 }
             }

@@ -552,7 +552,7 @@ fn service_error_to_response(
             "invalid service name".to_string(),
             Some("use a lowercase DNS label (1-63 chars, no __ or --)".to_string()),
         ),
-        // Conflict: sanitize — the internal message may contain repo error text.
+        // Conflict: sanitize: the internal message may contain repo error text.
         // Classify by checking for known conflict patterns to give the right remedy.
         crate::services::ServiceError::Conflict(msg) => {
             if msg.contains("generation") {
@@ -602,7 +602,7 @@ fn service_error_to_response(
             "service not found".to_string(),
             Some("the service may have been removed; run `slip services list`".to_string()),
         ),
-        // Blocked: sanitize — the reason may contain runtime error text.
+        // Blocked: sanitize: the reason may contain runtime error text.
         crate::services::ServiceError::Blocked(_, reason) => {
             // Classify the blocked reason for a useful remedy.
             if reason.contains("rootful") {
@@ -1240,7 +1240,7 @@ async fn handle_delete_app(
         warn!(app = %name, error = %e, "failed to remove secrets during app deletion");
     }
 
-    // Delete config file
+    // Best-effort cleanup: config file is not needed after app deletion.
     let config_dir = state.config_dir.clone();
     let name_clone = name.clone();
     tokio::task::spawn_blocking(move || {
@@ -2385,7 +2385,7 @@ async fn handle_app_status(
         ))
     })?;
 
-    // Get runtime state.
+    // Read the cached runtime state (populated by the reconcile loop).
     let runtime_state = state.app_states.read().await.get(&name).cloned();
 
     let status_str = match &runtime_state {
@@ -3660,6 +3660,85 @@ mod tests {
             secrets_store: SecretsStore::new(secrets_path).unwrap(),
             services: None,
         })
+    }
+
+    /// Observation-only bounded poll of the **handler-written** app config on
+    /// disk. Reads the filesystem via `load_config` until `predicate` returns
+    /// `Some`, or the deadline elapses.
+    ///
+    /// This helper NEVER writes to disk. It only observes what the POST/PATCH
+    /// handler's `spawn_blocking` task has actually persisted, so the test
+    /// asserts real handler behavior, not test-side state.
+    ///
+    /// The POST/PATCH handlers persist via fire-and-forget
+    /// `tokio::task::spawn_blocking` (api.rs:1055, 1169). Under heavy parallel
+    /// test load the blocking thread pool can starve that task for several
+    /// seconds. The 10 s deadline is generous enough for any reasonable host
+    /// while still bounding the test. On timeout, the last observed state and
+    /// any load error are surfaced in the panic message for diagnosis.
+    ///
+    /// **Residual production issue:** because the handlers' writes are
+    /// fire-and-forget and non-serialized per app, a stale POST write can
+    /// land after a PATCH write and clobber it. This helper observes that
+    /// behavior faithfully — it does not mask it. See the production ticket
+    /// noted in ci-test-isolation.md.
+    async fn poll_config_on_disk<T, F>(
+        config_dir: &std::path::Path,
+        app_name: &str,
+        predicate: F,
+    ) -> T
+    where
+        F: Fn(&crate::config::AppConfig) -> Option<T>,
+        T: std::fmt::Debug,
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut last_state: Option<String> = None;
+        let mut last_error: Option<String> = None;
+        loop {
+            match crate::config::load_config(config_dir) {
+                Ok((_, apps)) => {
+                    if let Some(cfg) = apps.get(app_name) {
+                        last_state = Some(format!(
+                            "name={}, image={}, port={:?}, health.path={:?}",
+                            cfg.app.name, cfg.app.image, cfg.routing.port, cfg.health.path
+                        ));
+                        if let Some(v) = predicate(cfg) {
+                            return v;
+                        }
+                    } else {
+                        last_state = Some(format!(
+                            "app '{app_name}' not in loaded apps: {:?}",
+                            apps.keys().collect::<Vec<_>>()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    last_error = Some(format!("{e:?}"));
+                }
+            }
+
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "poll_config_on_disk timed out after 10s waiting for app '{app_name}' \
+                     to match predicate on disk.\n\
+                     Last observed state: {}\n\
+                     Last load_config error: {}\n\
+                     apps dir exists: {}\n\
+                     apps dir contents: {:?}",
+                    last_state.unwrap_or_else(|| "(never loaded)".to_string()),
+                    last_error.unwrap_or_else(|| "(none)".to_string()),
+                    config_dir.join("apps").exists(),
+                    std::fs::read_dir(config_dir.join("apps"))
+                        .ok()
+                        .map(|d| d
+                            .filter_map(|e| e.ok().map(|e| e.path().display().to_string()))
+                            .collect::<Vec<_>>())
+                        .unwrap_or_else(|| vec!["(read_dir failed)".to_string()]),
+                );
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// Build a valid deploy request body.
@@ -6290,8 +6369,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config_dir = tmp.path().to_path_buf();
 
-        // Create a minimal slip.toml so load_config can find it.
-        let slip_toml = r#"
+        // Use the tempdir for storage too, so save_last_applied writes stay
+        // inside the per-test tempdir rather than hitting /tmp/slip-test or
+        // /var/lib/slip (shared across parallel tests).
+        let slip_toml = format!(
+            r#"
 [server]
 listen = "0.0.0.0:7890"
 
@@ -6299,21 +6381,29 @@ listen = "0.0.0.0:7890"
 admin_api = "http://localhost:2019"
 
 [auth]
-secret = "test-secret"
+secret = "global-secret"
 
 [registry]
 
 [storage]
-path = "/tmp/slip-test"
-"#;
-        std::fs::write(config_dir.join("slip.toml"), slip_toml).unwrap();
+path = {storage_path:?}
+"#,
+            storage_path = config_dir.join("storage")
+        );
+        std::fs::write(config_dir.join("slip.toml"), &slip_toml).unwrap();
 
         let secrets_tmp = tempfile::tempdir().expect("tempdir for secrets");
         let secrets_path = secrets_tmp.path().to_path_buf();
         Box::leak(Box::new(secrets_tmp));
 
+        // Parse the slip.toml so AppState.config matches the on-disk config
+        // (storage path included), avoiding the prior mismatch where
+        // test_slip_config() defaulted storage to /var/lib/slip.
+        let (parsed_cfg, _) =
+            crate::config::load_config(&config_dir).expect("parse test slip.toml");
+
         let state = Arc::new(AppState {
-            config: test_slip_config(),
+            config: parsed_cfg,
             apps: RwLock::new(HashMap::new()),
             config_dir: config_dir.clone(),
             deploy_locks: DashMap::new(),
@@ -6402,15 +6492,23 @@ path = "/tmp/slip-test"
             "secrets should be settable immediately"
         );
 
-        // Step 4: Simulate restart, re-load config from disk
-        let (_reloaded_cfg, reloaded_apps) =
-            crate::config::load_config(&config_dir).expect("should reload config from disk");
+        // Step 4: Simulate restart — re-load config from disk and verify the
+        // POST handler's fire-and-forget spawn_blocking write has landed.
+        // We poll (observation-only, no test-side writes) until the handler's
+        // persisted config is visible via load_config.
+        let reloaded = poll_config_on_disk(&config_dir, "liveapp", |cfg| {
+            if cfg.app.name == "liveapp"
+                && cfg.app.image == "ghcr.io/org/liveapp:latest"
+                && cfg.routing.port == Some(8080)
+                && cfg.health.path.as_deref() == Some("/healthz")
+            {
+                Some(cfg.clone())
+            } else {
+                None
+            }
+        })
+        .await;
 
-        assert!(
-            reloaded_apps.contains_key("liveapp"),
-            "app should survive restart (persisted to disk)"
-        );
-        let reloaded = &reloaded_apps["liveapp"];
         assert_eq!(reloaded.app.name, "liveapp");
         assert_eq!(reloaded.app.image, "ghcr.io/org/liveapp:latest");
         assert_eq!(reloaded.routing.port, Some(8080));
@@ -6420,7 +6518,7 @@ path = "/tmp/slip-test"
             "health config should be persisted"
         );
 
-        // Step 5: Verify the generated TOML has the managed-by header
+        // Step 5: Verify the generated TOML has the managed-by header.
         let toml_path = config_dir.join("apps").join("liveapp.toml");
         assert!(toml_path.exists(), "generated TOML should exist");
         let toml_content = std::fs::read_to_string(&toml_path).unwrap();
@@ -6436,7 +6534,11 @@ path = "/tmp/slip-test"
         let tmp = tempfile::tempdir().expect("tempdir");
         let config_dir = tmp.path().to_path_buf();
 
-        let slip_toml = r#"
+        // Use the tempdir for storage too, so save_last_applied writes stay
+        // inside the per-test tempdir rather than hitting /tmp/slip-test or
+        // /var/lib/slip (shared across parallel tests).
+        let slip_toml = format!(
+            r#"
 [server]
 listen = "0.0.0.0:7890"
 
@@ -6444,21 +6546,30 @@ listen = "0.0.0.0:7890"
 admin_api = "http://localhost:2019"
 
 [auth]
-secret = "test-secret"
+secret = "global-secret"
 
 [registry]
 
 [storage]
-path = "/tmp/slip-test"
-"#;
-        std::fs::write(config_dir.join("slip.toml"), slip_toml).unwrap();
+path = {storage_path:?}
+"#,
+            storage_path = config_dir.join("storage")
+        );
+        std::fs::write(config_dir.join("slip.toml"), &slip_toml).unwrap();
 
         let secrets_tmp = tempfile::tempdir().expect("tempdir for secrets");
         let secrets_path = secrets_tmp.path().to_path_buf();
         Box::leak(Box::new(secrets_tmp));
 
+        // Parse the slip.toml we just wrote so AppState.config matches the
+        // on-disk config (storage path included). This avoids the previous
+        // mismatch where AppState used test_slip_config() (default storage
+        // /var/lib/slip) while slip.toml pointed elsewhere.
+        let (parsed_cfg, _) =
+            crate::config::load_config(&config_dir).expect("parse test slip.toml");
+
         let state = Arc::new(AppState {
-            config: test_slip_config(),
+            config: parsed_cfg,
             apps: RwLock::new(HashMap::new()),
             config_dir: config_dir.clone(),
             deploy_locks: DashMap::new(),
@@ -6497,6 +6608,22 @@ path = "/tmp/slip-test"
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
 
+        // Observe the POST handler's persisted config on disk BEFORE patching.
+        // This ensures the initial fire-and-forget spawn_blocking write has
+        // completed, so a late POST write cannot clobber the subsequent PATCH
+        // write (residual production hazard noted in ci-test-isolation.md).
+        let _initial = poll_config_on_disk(&config_dir, "updateapp", |cfg| {
+            if cfg.app.name == "updateapp"
+                && cfg.routing.port == Some(8080)
+                && cfg.health.path.as_deref() == Some("/healthz")
+            {
+                Some(cfg.clone())
+            } else {
+                None
+            }
+        })
+        .await;
+
         // Update health path via PATCH
         let patch_body = serde_json::json!({
             "health": {"path": "/readyz"},
@@ -6522,12 +6649,20 @@ path = "/tmp/slip-test"
             assert_eq!(cfg.health.path.as_deref(), Some("/readyz"));
         }
 
-        // Simulate restart
-        let (_reloaded_cfg, reloaded_apps) =
-            crate::config::load_config(&config_dir).expect("should reload config from disk");
+        // Simulate restart — observation-only poll for the PATCH handler's
+        // persisted config on disk (no test-side writes).
+        let reloaded = poll_config_on_disk(&config_dir, "updateapp", |cfg| {
+            if cfg.app.name == "updateapp"
+                && cfg.routing.port == Some(9090)
+                && cfg.health.path.as_deref() == Some("/readyz")
+            {
+                Some(cfg.clone())
+            } else {
+                None
+            }
+        })
+        .await;
 
-        assert!(reloaded_apps.contains_key("updateapp"));
-        let reloaded = &reloaded_apps["updateapp"];
         assert_eq!(
             reloaded.routing.port,
             Some(9090),
@@ -6580,25 +6715,33 @@ path = "/tmp/slip-test"
         let tmp = tempfile::tempdir().expect("tempdir");
         let config_dir = tmp.path().to_path_buf();
 
-        let slip_toml = r#"
+        let slip_toml = format!(
+            r#"
 [server]
 listen = "0.0.0.0:7890"
 [caddy]
 admin_api = "http://localhost:2019"
 [auth]
-secret = "test-secret"
+secret = "global-secret"
 [registry]
 [storage]
-path = "/tmp/slip-test"
-"#;
-        std::fs::write(config_dir.join("slip.toml"), slip_toml).unwrap();
+path = {storage_path:?}
+"#,
+            storage_path = config_dir.join("storage")
+        );
+        std::fs::write(config_dir.join("slip.toml"), &slip_toml).unwrap();
 
         let secrets_tmp = tempfile::tempdir().expect("tempdir for secrets");
         let secrets_path = secrets_tmp.path().to_path_buf();
         Box::leak(Box::new(secrets_tmp));
 
+        // Parse the slip.toml so AppState.config matches the on-disk config,
+        // keeping storage writes inside the per-test tempdir.
+        let (parsed_cfg, _) =
+            crate::config::load_config(&config_dir).expect("parse test slip.toml");
+
         let state = Arc::new(AppState {
-            config: test_slip_config(),
+            config: parsed_cfg,
             apps: RwLock::new(HashMap::new()),
             config_dir: config_dir.clone(),
             deploy_locks: DashMap::new(),
@@ -6999,7 +7142,7 @@ path = "/tmp/slip-test"
             );
         }
 
-        // Deploy cache: latest deploy is stuck in HealthChecking (non-terminal).
+        // Setup: seed a non-terminal HealthChecking deploy to test the stuck-deploy path.
         let stuck_ctx = DeployContext {
             id: "dep_stuck001".to_string(),
             app: APP_NAME.to_string(),
@@ -7081,7 +7224,7 @@ path = "/tmp/slip-test"
                     status: AppStatus::Running,
                     current_tag: Some("v1.0.0".to_string()),
                     current_container_id: Some("abc123".to_string()),
-                    current_port: Some(1), // nothing listening → refused
+                    current_port: Some(1), // port 1: nothing listens, so the probe gets a refusal
                     deployed_at: Some(Utc::now()),
                     kind: Some("container".to_string()),
                     ..Default::default()
@@ -7202,7 +7345,7 @@ path = "/tmp/slip-test"
             let cfg = apps.get_mut(APP_NAME).expect("test app exists");
             cfg.health = HealthConfig {
                 path: Some("/healthz".to_string()),
-                expect_status: None, // → default 200-399 at probe time
+                expect_status: None, // default status range 200-399 applied at probe time
                 ..Default::default()
             };
         }

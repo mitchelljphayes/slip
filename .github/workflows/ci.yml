@@ -185,6 +185,9 @@ jobs:
           # to prevent a false green from portables alone.
 
           # Group 1: Linux-specific tests (nested in _linux module).
+          # Use conditional capture so bash -e does not abort before we
+          # can print output and assert the passed-test count.
+          LINUX_EXIT=0
           sudo env -i \
             PATH="$PATH" \
             HOME="$HOME" \
@@ -192,10 +195,16 @@ jobs:
             "$TEST_BIN" --test-threads=1 \
             'services::storage::_linux::tests::' \
             'services::secret::_linux::tests::' \
-            > /tmp/linux-tests.txt 2>&1
-          LINUX_EXIT=$?
+            > /tmp/linux-tests.txt 2>&1 || LINUX_EXIT=$?
           cat /tmp/linux-tests.txt
-          LINUX_PASSED=$(grep -oP 'test result: ok\. \K\d+' /tmp/linux-tests.txt | tail -1)
+          # Preserve the original cargo/test-binary exit code: if nonzero,
+          # exit immediately with that status rather than falling through
+          # to the zero-tests guard (which would overwrite 101 with 1).
+          if [ "$LINUX_EXIT" -ne 0 ]; then
+            echo "ERROR: Linux-specific test binary exited $LINUX_EXIT - see output above"
+            exit "$LINUX_EXIT"
+          fi
+          LINUX_PASSED=$(grep -oP 'test result: ok\. \K\d+' /tmp/linux-tests.txt | tail -1 || true)
           if [ -z "$LINUX_PASSED" ] || [ "$LINUX_PASSED" -eq 0 ]; then
             echo "ERROR: 0 Linux-specific tests passed."
             echo "The _linux::tests:: filters may not match any tests."
@@ -211,6 +220,7 @@ jobs:
           fi
 
           # Group 2: Portable tests (image_ref + secret portable).
+          PORTABLE_EXIT=0
           sudo env -i \
             PATH="$PATH" \
             HOME="$HOME" \
@@ -218,20 +228,18 @@ jobs:
             "$TEST_BIN" --test-threads=1 \
             'services::image_ref::tests::' \
             'services::secret::portable_tests::' \
-            > /tmp/portable-tests.txt 2>&1
-          PORTABLE_EXIT=$?
+            > /tmp/portable-tests.txt 2>&1 || PORTABLE_EXIT=$?
           cat /tmp/portable-tests.txt
-          PORTABLE_PASSED=$(grep -oP 'test result: ok\. \K\d+' /tmp/portable-tests.txt | tail -1)
+          if [ "$PORTABLE_EXIT" -ne 0 ]; then
+            echo "ERROR: portable test binary exited $PORTABLE_EXIT - see output above"
+            exit "$PORTABLE_EXIT"
+          fi
+          PORTABLE_PASSED=$(grep -oP 'test result: ok\. \K\d+' /tmp/portable-tests.txt | tail -1 || true)
           if [ -z "$PORTABLE_PASSED" ] || [ "$PORTABLE_PASSED" -eq 0 ]; then
             echo "ERROR: 0 portable tests passed."
             exit 1
           fi
           echo "Portable tests passed: $PORTABLE_PASSED"
-
-          # Exit non-zero if either group failed.
-          if [ $LINUX_EXIT -ne 0 ] || [ $PORTABLE_EXIT -ne 0 ]; then
-            exit 1
-          fi
       - name: Cleanup
         if: always()
         run: rm -rf /tmp/slip-test /tmp/slip-service-test /tmp/cargo-test-json.txt /tmp/test-output.txt /tmp/linux-tests.txt /tmp/portable-tests.txt
@@ -257,23 +265,33 @@ jobs:
           sudo curl -s --unix-socket /run/podman/podman.sock http://localhost/v5.0.0/libpod/info >/dev/null && echo "rootful Podman socket OK"
       - name: Run services contract tests
         run: |
+          set -o pipefail
           # Run the ignored contract tests. Fail if any test fails or if
           # zero tests run (guards against cfg/ignore mistakes).
-          OUTPUT=$(sudo -E env -i \
+          # Use conditional capture with pipefail so bash -e does not abort
+          # before we can print output and assert the passed-test count.
+          EXIT_CODE=0
+          sudo -E env -i \
             PATH="$PATH" \
             HOME="$HOME" \
             RUST_BACKTRACE=1 \
-            cargo test -p slip-core --test services_contract -- --ignored --test-threads=1 2>&1)
-          EXIT_CODE=$?
-          echo "$OUTPUT"
+            cargo test -p slip-core --test services_contract -- --ignored --test-threads=1 \
+            2>&1 | tee /tmp/svc-contract.log || EXIT_CODE=$?
+          # Preserve the original cargo exit code: if nonzero, exit
+          # immediately with that status rather than falling through to
+          # the zero-tests guard (which would overwrite 101 with 1).
+          if [ "$EXIT_CODE" -ne 0 ]; then
+            echo "ERROR: contract tests exited $EXIT_CODE - see output above"
+            exit "$EXIT_CODE"
+          fi
           # Assert non-zero test count to prevent false-green from no tests.
-          PASSED=$(echo "$OUTPUT" | grep -oP 'test result: ok\. \K\d+' | tail -1)
+          PASSED=$(grep -oP 'test result: ok\. \K\d+' /tmp/svc-contract.log | tail -1 || true)
           if [ -z "$PASSED" ] || [ "$PASSED" -eq 0 ]; then
-            echo "ERROR: 0 contract tests passed — the test filter or cfg may be broken"
+            echo "ERROR: 0 contract tests passed - the test filter or cfg may be broken"
             exit 1
           fi
           echo "Contract tests passed: $PASSED"
-          exit $EXIT_CODE
+          exit "$EXIT_CODE"
       - name: Cleanup
         if: always()
         run: |

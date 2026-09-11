@@ -1072,7 +1072,7 @@ impl RuntimeBackend for PodmanBackend {
             }
             cmd.arg(container_id);
             cmd.args(argv);
-            // Discard stdout/stderr entirely — output is never returned to
+            // Discard stdout/stderr entirely: output is never returned to
             // callers and may contain secret-adjacent text. Using null()
             // prevents unbounded buffering (OOM protection).
             cmd.stdout(std::process::Stdio::null());
