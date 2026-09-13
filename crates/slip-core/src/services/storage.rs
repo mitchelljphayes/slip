@@ -10,9 +10,17 @@
 //! - **Safe root open**: `/` is opened with `openat2` using empty resolve
 //!   flags (you cannot confine beneath `/` itself). The configured absolute
 //!   root is then opened as relative components beneath the held `/` FD using
-//!   `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV`. Kernel
-//!   support is probed by opening `.` relative to the held `/` FD with full
-//!   flags; `ENOSYS` fails closed.
+//!   `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` — ancestor mount crossings are
+//!   permitted because the configured root is administrator-controlled and
+//!   commonly lives across a mount boundary (e.g. `/var` on FCOS, a separate
+//!   data volume). Kernel support for the stronger descendant flags is probed
+//!   by opening `.` relative to the held `/` FD with
+//!   `RESOLVE_BENEATH | NO_SYMLINKS | NO_XDEV`; `ENOSYS` fails closed.
+//! - **Descendant mount confinement**: every post-root `openat2` (parent
+//!   resolution, pgdata validation, secret/file access, and
+//!   `ValidatedBindSource::revalidate`) uses the full
+//!   `RESOLVE_BENEATH | NO_SYMLINKS | NO_XDEV` so any mount introduced below
+//!   the acquired root is rejected with `EXDEV` by the kernel.
 //! - **Descriptor-relative mutations**: every multi-component mutation first
 //!   opens its parent directory descriptor-confined, then `mkdirat`/
 //!   `renameat`/`unlinkat`/`statat` operates on a single validated basename.
@@ -189,12 +197,24 @@ mod _linux {
 
     use super::{BindObjectKind, StorageError};
 
-    /// Full resolve flags for confined resolution beneath a held FD.
-    const RESOLVE_FLAGS: ResolveFlags = {
-        ResolveFlags::BENEATH
-            .union(ResolveFlags::NO_SYMLINKS)
-            .union(ResolveFlags::NO_XDEV)
-    };
+    /// Resolve flags for **trusted configured-root acquisition** from the
+    /// held `/` FD. Permits ancestor mount crossings (`/var` is a separate
+    /// mount on FCOS and the configured root commonly lives across it) but
+    /// still forbids symlinks and escapes beneath `/`.
+    ///
+    /// The configured absolute path is administrator-controlled. Omitting
+    /// `NO_XDEV` here does not let an unprivileged actor create or adopt a
+    /// UID-0, mode-0700 root or mount a filesystem — those require
+    /// privileges. `from_root_fd` independently `fstat`s the opened object
+    /// and requires a real directory, UID 0, and exact mode 0700 before
+    /// adoption.
+    const ROOT_RESOLVE_FLAGS: ResolveFlags = ResolveFlags::BENEATH.union(ResolveFlags::NO_SYMLINKS);
+
+    /// Resolve flags for **every descendant operation** beneath the acquired
+    /// trusted root FD. Adds `NO_XDEV` so any mount introduced below the root
+    /// (including a same-superblock bind mount) is rejected with `EXDEV` by
+    /// the kernel.
+    const DESCENDANT_RESOLVE_FLAGS: ResolveFlags = ROOT_RESOLVE_FLAGS.union(ResolveFlags::NO_XDEV);
 
     /// Expected UID for production root-owned storage.
     const EXPECTED_UID: u32 = 0;
@@ -202,14 +222,23 @@ mod _linux {
     const DIR_MODE: u32 = 0o700;
     /// Expected mode for secret files.
     const FILE_MODE: u32 = 0o600;
+    /// Expected mode for the postgres `pgdata` child directory. This is the
+    /// only exception to the 0700 policy: the postgres entrypoint's `gosu
+    /// postgres` re-run needs to traverse the mount root, which requires
+    /// 0755 so UID 999 can search the directory. The 0700 parent (data dir
+    /// root) holds the bootstrap marker and is never mounted.
+    const PGDATA_DIR_MODE: u32 = 0o755;
 
     /// Descriptor-confined, root-owned service storage primitive.
     ///
     /// The trusted root is opened once at construction. `/` is opened safely
     /// with empty resolve flags, then the configured absolute root is opened
-    /// as relative components beneath the held `/` FD using full
-    /// `RESOLVE_BENEATH | NO_SYMLINKS | NO_XDEV` flags. All descendant
-    /// operations are relative to that held root FD.
+    /// as relative components beneath the held `/` FD using
+    /// `RESOLVE_BENEATH | NO_SYMLINKS` (without `NO_XDEV`, permitting ancestor
+    /// mount crossings — the configured root is administrator-controlled).
+    /// All descendant operations are relative to that held root FD and use
+    /// the full `RESOLVE_BENEATH | NO_SYMLINKS | NO_XDEV` so any mount below
+    /// the acquired root is rejected.
     // In production builds the derived Debug is sound: all fields are Debug.
     // In test builds the #[cfg(test)] fsync_fault_hook field is a
     // `Mutex<Option<Box<dyn Fn...>>>` and `dyn Fn` is not Debug, so we supply
@@ -253,14 +282,21 @@ mod _linux {
         /// Open and validate the trusted root.
         ///
         /// `/` is opened with `openat2` and empty resolve flags (you cannot
-        /// confine beneath `/` itself). Kernel support is probed by opening
-        /// `.` relative to the held `/` FD with full flags; `ENOSYS` fails
+        /// confine beneath `/` itself). Kernel support for descendant
+        /// enforcement is probed by opening `.` relative to the held `/` FD
+        /// with `RESOLVE_BENEATH | NO_SYMLINKS | NO_XDEV`; `ENOSYS` fails
         /// closed. The configured absolute root is then opened as relative
         /// components beneath the held `/` FD using
-        /// `RESOLVE_BENEATH | NO_SYMLINKS | NO_XDEV`.
+        /// `RESOLVE_BENEATH | NO_SYMLINKS` (without `NO_XDEV`) — ancestor
+        /// mount crossings are permitted because the configured root is
+        /// administrator-controlled and commonly lives across a mount
+        /// boundary (e.g. `/var` on FCOS, a separate data volume).
         ///
-        /// The root must exist, be a directory, owned by UID 0, have mode
-        /// 0700, and be on a single device.
+        /// The root must exist, be a directory, owned by UID 0, and have mode
+        /// 0700. `from_root_fd` `fstat`s the opened object and enforces this
+        /// before adoption. Once the trusted root FD is acquired, every
+        /// descendant `openat2` uses the full descendant flags including
+        /// `NO_XDEV`, so mounts below the root are rejected.
         pub fn new(root: &Path) -> Result<Self, StorageError> {
             if !root.is_absolute() {
                 return Err(StorageError::EscapesRoot(root.to_path_buf()));
@@ -283,15 +319,17 @@ mod _linux {
                 }
             })?;
 
-            // Probe openat2 + full flags by opening "." relative to the
-            // held "/" FD. ENOSYS means the kernel does not support
-            // openat2 at all (or does not support the resolve flags).
+            // Probe openat2 + descendant flags by opening "." relative to
+            // the held "/" FD. ENOSYS means the kernel does not support
+            // openat2 at all (or does not support the descendant resolve
+            // flags). This proves the kernel can enforce NO_XDEV on
+            // descendant operations, which is the stronger requirement.
             let probe = openat2(
                 &slash_fd,
                 ".",
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
                 Mode::empty(),
-                RESOLVE_FLAGS,
+                DESCENDANT_RESOLVE_FLAGS,
             );
             match probe {
                 Ok(_probe_fd) => { /* full flags supported */ }
@@ -301,7 +339,9 @@ mod _linux {
 
             // The configured root is absolute. Strip the leading '/' and
             // open the relative remainder beneath the held "/" FD using
-            // full resolve flags. If the root IS "/", use slash_fd directly.
+            // ROOT_RESOLVE_FLAGS (without NO_XDEV — ancestor mount crossings
+            // are permitted for the administrator-controlled configured root).
+            // If the root IS "/", use slash_fd directly.
             let rel = root
                 .strip_prefix("/")
                 .map_err(|_| StorageError::EscapesRoot(root.to_path_buf()))?;
@@ -315,12 +355,20 @@ mod _linux {
             validate_relative(rel_str)?;
             let rel_cstr =
                 CString::new(rel_str).map_err(|_| StorageError::EscapesRoot(root.to_path_buf()))?;
+            // Open the configured root relative to the held "/" FD using
+            // ROOT_RESOLVE_FLAGS (without NO_XDEV). The configured absolute
+            // path is administrator-controlled and may legitimately cross a
+            // mount boundary (e.g. /var on FCOS, a separate data volume).
+            // BENEATH still prevents escape beneath "/", NO_SYMLINKS still
+            // rejects symlinks in ancestors and the final component, and
+            // from_root_fd fstats the opened object requiring a real
+            // directory, UID 0, and exact mode 0700 before adoption.
             let root_fd = openat2(
                 &slash_fd,
                 &rel_cstr,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
                 Mode::empty(),
-                RESOLVE_FLAGS,
+                ROOT_RESOLVE_FLAGS,
             )
             .map_err(|e| map_openat2_err(e, root))?;
 
@@ -359,7 +407,7 @@ mod _linux {
                 &cstr,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
                 Mode::empty(),
-                RESOLVE_FLAGS,
+                DESCENDANT_RESOLVE_FLAGS,
             )
             .map_err(|e| map_openat2_err(e, &self.root_path.join(rel)))?;
             let st = fstat(&fd).map_err(|e| StorageError::Io(e.into()))?;
@@ -395,6 +443,93 @@ mod _linux {
             name: &crate::services::name::ServiceName,
         ) -> Result<OwnedFd, StorageError> {
             self.create_descendant_dir(name.as_str())
+        }
+
+        /// Create a `pgdata` child directory inside an existing service
+        /// data directory, with mode 0755 (not the default 0700). This is
+        /// a narrow policy exception for the postgres provider: the
+        /// entrypoint's `gosu postgres` re-run needs to traverse the mount
+        /// root, which requires 0755 so UID 999 can search the directory.
+        ///
+        /// The parent (`<root>/<parent>`) must already exist as a verified
+        /// 0700 root-owned directory. The child (`<root>/<parent>/pgdata`)
+        /// is created via descriptor-relative `mkdirat` with mode 0755,
+        /// then opened with `openat2(RESOLVE_BENEATH|NO_SYMLINKS|NO_XDEV)`
+        /// and `fstat`-verified: real directory, UID 0, exact mode 0755,
+        /// same device. On `AlreadyExists`, the existing directory is
+        /// validated rather than accepted blindly.
+        ///
+        /// Returns a `ValidatedBindSource` token carrying the verified
+        /// identity (UID, mode, device, inode) for later revalidation
+        /// before the runtime create call.
+        pub fn create_pgdata_child(
+            &self,
+            parent_rel: &str,
+            child_name: &str,
+        ) -> Result<ValidatedBindSource, StorageError> {
+            // Validate the child name: no path components, no traversal.
+            validate_relative(child_name)?;
+            if child_name.contains('/') {
+                return Err(StorageError::InvalidComponent(
+                    "pgdata child name must be a single component".to_string(),
+                ));
+            }
+
+            let child_rel = format!("{parent_rel}/{child_name}");
+
+            // Try to create the directory with mode 0755. If it already
+            // exists, fall through to validation.
+            let (parent_fd, basename) = self.resolve_parent(&child_rel)?;
+            let cstr = CString::new(basename.as_bytes())
+                .map_err(|_| StorageError::InvalidComponent(basename.clone()))?;
+            match mkdirat(
+                &parent_fd,
+                &cstr,
+                Mode::RUSR
+                    | Mode::WUSR
+                    | Mode::XUSR
+                    | Mode::RGRP
+                    | Mode::XGRP
+                    | Mode::ROTH
+                    | Mode::XOTH,
+            ) {
+                Ok(()) => {}
+                Err(Errno::EXIST) => {
+                    // Already exists — validate below.
+                }
+                Err(e) => return Err(map_mkdir_err(e, &self.root_path.join(&child_rel))),
+            }
+
+            // Open and verify the child directory with the 0755 policy.
+            // We use a dedicated verification path rather than
+            // open_descendant_dir (which checks 0700).
+            let cstr2 = CString::new(child_rel.as_bytes())
+                .map_err(|_| StorageError::InvalidComponent(child_rel.clone()))?;
+            let fd = openat2(
+                &self.root_fd,
+                &cstr2,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+                DESCENDANT_RESOLVE_FLAGS,
+            )
+            .map_err(|e| map_openat2_err(e, &self.root_path.join(&child_rel)))?;
+            let st = fstat(&fd).map_err(|e| StorageError::Io(e.into()))?;
+            verify_dir_identity(
+                &st,
+                &self.root_path.join(&child_rel),
+                EXPECTED_UID,
+                PGDATA_DIR_MODE,
+            )?;
+            verify_same_device(&st, self.root_dev, &self.root_path.join(&child_rel))?;
+
+            ValidatedBindSource::new_with_mode(
+                fd,
+                &self.root_fd,
+                &self.root_path,
+                &child_rel,
+                BindObjectKind::Directory,
+                PGDATA_DIR_MODE,
+            )
         }
 
         /// Validate and create a [`ValidatedBindSource`] token for a
@@ -433,7 +568,7 @@ mod _linux {
                 &cstr,
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
-                RESOLVE_FLAGS,
+                DESCENDANT_RESOLVE_FLAGS,
             )
             .map_err(|e| map_openat2_err(e, &self.root_path.join(rel)))?;
             let st = fstat(&fd).map_err(|e| StorageError::Io(e.into()))?;
@@ -459,7 +594,7 @@ mod _linux {
                 &cstr,
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
-                RESOLVE_FLAGS,
+                DESCENDANT_RESOLVE_FLAGS,
             )
             .map_err(|e| map_openat2_err(e, &self.root_path.join(rel)))?;
             let st = fstat(&fd).map_err(|e| StorageError::Io(e.into()))?;
@@ -492,7 +627,7 @@ mod _linux {
                 &cstr,
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::RUSR | Mode::WUSR,
-                RESOLVE_FLAGS,
+                DESCENDANT_RESOLVE_FLAGS,
             )
             .map_err(|e| map_openat2_err(e, &self.root_path.join(rel)))?;
             let st = fstat(&fd).map_err(|e| StorageError::Io(e.into()))?;
@@ -590,7 +725,7 @@ mod _linux {
                 &cstr,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
                 Mode::empty(),
-                RESOLVE_FLAGS,
+                DESCENDANT_RESOLVE_FLAGS,
             )
             .map_err(|e| map_openat2_err(e, &self.root_path.join(rel)))?;
             let st = fstat(&fd).map_err(|e| StorageError::Io(e.into()))?;
@@ -687,6 +822,27 @@ mod _linux {
             rel: &str,
             kind: BindObjectKind,
         ) -> Result<Self, StorageError> {
+            let expected_mode = match kind {
+                BindObjectKind::Directory => DIR_MODE,
+                BindObjectKind::File => FILE_MODE,
+            };
+            Self::new_with_mode(source_fd, root_fd, root_path, rel, kind, expected_mode)
+        }
+
+        /// Construct a token with an explicit expected mode. Used by
+        /// `create_pgdata_child` which requires 0755 instead of the default
+        /// 0700. The caller must have already verified the identity via
+        /// `verify_dir_identity` / `verify_file_identity` with the same
+        /// mode; this constructor re-checks to fail closed on any
+        /// discrepancy.
+        fn new_with_mode(
+            source_fd: OwnedFd,
+            root_fd: &OwnedFd,
+            root_path: &Path,
+            rel: &str,
+            kind: BindObjectKind,
+            expected_mode: u32,
+        ) -> Result<Self, StorageError> {
             let root_dup = dup_fd(root_fd.as_fd())?;
             let st = fstat(&source_fd).map_err(|e| StorageError::Io(e.into()))?;
             // Verify file type matches expected kind before token creation.
@@ -711,10 +867,6 @@ mod _linux {
                 });
             }
             // Verify mode.
-            let expected_mode = match kind {
-                BindObjectKind::Directory => DIR_MODE,
-                BindObjectKind::File => FILE_MODE,
-            };
             if (st.st_mode & 0o7777) != expected_mode {
                 return Err(StorageError::WrongMode {
                     path: root_path.join(rel),
@@ -753,8 +905,14 @@ mod _linux {
                 }
                 BindObjectKind::File => OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             };
-            let fd = openat2(&self.root_fd, &cstr, flags, Mode::empty(), RESOLVE_FLAGS)
-                .map_err(|e| map_openat2_err(e, &self.canonical_path))?;
+            let fd = openat2(
+                &self.root_fd,
+                &cstr,
+                flags,
+                Mode::empty(),
+                DESCENDANT_RESOLVE_FLAGS,
+            )
+            .map_err(|e| map_openat2_err(e, &self.canonical_path))?;
             let st = fstat(&fd).map_err(|e| StorageError::Io(e.into()))?;
 
             let ft = FileType::from_raw_mode(st.st_mode);
@@ -1318,7 +1476,7 @@ mod _linux {
                 &cstr,
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
-                RESOLVE_FLAGS,
+                DESCENDANT_RESOLVE_FLAGS,
             )
             .unwrap();
             let file = fd_into_file(fd).unwrap();
@@ -1395,6 +1553,490 @@ mod _linux {
             // Use unlink_descendant_dir for directories.
             s.unlink_descendant_dir("dir").unwrap();
             assert!(s.open_descendant_dir("dir").is_err());
+        }
+
+        // ─── pgdata child policy tests ───────────────────────────────
+
+        #[test]
+        fn pgdata_child_creates_0755_root_owned() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let d = make_root();
+            let s = ServiceStorage::new(d.path()).unwrap();
+            s.create_descendant_dir("svc").unwrap();
+            let token = s.create_pgdata_child("svc", "pgdata").unwrap();
+            assert_eq!(token.uid(), 0);
+            assert_eq!(token.mode(), 0o755);
+            // The parent stays 0700.
+            let parent_meta = fs::metadata(d.path().join("svc")).unwrap();
+            assert_eq!(
+                parent_meta.permissions().mode() & 0o7777,
+                0o700,
+                "parent data dir must stay 0700"
+            );
+            // The child is 0755.
+            let child_meta = fs::metadata(d.path().join("svc/pgdata")).unwrap();
+            assert_eq!(
+                child_meta.permissions().mode() & 0o7777,
+                0o755,
+                "pgdata child must be 0755"
+            );
+        }
+
+        #[test]
+        fn pgdata_child_rejects_symlink() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let d = make_root();
+            let root = d.path().to_path_buf();
+            let s = ServiceStorage::new(&root).unwrap();
+            s.create_descendant_dir("svc").unwrap();
+            // Create a symlink where pgdata should be.
+            std::os::unix::fs::symlink("/etc", root.join("svc/pgdata")).unwrap();
+            let result = s.create_pgdata_child("svc", "pgdata");
+            assert!(
+                result.is_err(),
+                "symlink pgdata must be rejected, got {result:?}"
+            );
+        }
+
+        #[test]
+        fn pgdata_child_rejects_regular_file() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let d = make_root();
+            let root = d.path().to_path_buf();
+            let s = ServiceStorage::new(&root).unwrap();
+            s.create_descendant_dir("svc").unwrap();
+            // Create a regular file where pgdata should be.
+            fs::write(root.join("svc/pgdata"), b"not a dir").unwrap();
+            let result = s.create_pgdata_child("svc", "pgdata");
+            assert!(result.is_err(), "regular file pgdata must be rejected");
+        }
+
+        #[test]
+        fn pgdata_child_rejects_wrong_mode_0777() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let d = make_root();
+            let root = d.path().to_path_buf();
+            let s = ServiceStorage::new(&root).unwrap();
+            s.create_descendant_dir("svc").unwrap();
+            // Pre-create pgdata at 0777 (wrong mode).
+            fs::create_dir(root.join("svc/pgdata")).unwrap();
+            fs::set_permissions(root.join("svc/pgdata"), fs::Permissions::from_mode(0o777))
+                .unwrap();
+            let result = s.create_pgdata_child("svc", "pgdata");
+            assert!(result.is_err(), "0777 pgdata must be rejected, not adopted");
+        }
+
+        #[test]
+        fn pgdata_child_rejects_wrong_mode_0700() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let d = make_root();
+            let root = d.path().to_path_buf();
+            let s = ServiceStorage::new(&root).unwrap();
+            s.create_descendant_dir("svc").unwrap();
+            // Pre-create pgdata at 0700 (wrong mode for pgdata).
+            fs::create_dir(root.join("svc/pgdata")).unwrap();
+            fs::set_permissions(root.join("svc/pgdata"), fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let result = s.create_pgdata_child("svc", "pgdata");
+            assert!(result.is_err(), "0700 pgdata must be rejected, not adopted");
+        }
+
+        #[test]
+        fn pgdata_child_rejects_non_root_owner() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let d = make_root();
+            let root = d.path().to_path_buf();
+            let s = ServiceStorage::new(&root).unwrap();
+            s.create_descendant_dir("svc").unwrap();
+            // Pre-create pgdata owned by UID 999 (non-root).
+            fs::create_dir(root.join("svc/pgdata")).unwrap();
+            fs::set_permissions(root.join("svc/pgdata"), fs::Permissions::from_mode(0o755))
+                .unwrap();
+            // Chown to non-root using rustix.
+            use rustix::fs::{Gid, Uid, chown};
+            let _ = chown(
+                root.join("svc/pgdata"),
+                Some(Uid::from_raw(999)),
+                Some(Gid::from_raw(999)),
+            );
+            let result = s.create_pgdata_child("svc", "pgdata");
+            assert!(result.is_err(), "non-root-owned pgdata must be rejected");
+        }
+
+        #[test]
+        fn pgdata_child_revalidates_inode() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let d = make_root();
+            let s = ServiceStorage::new(d.path()).unwrap();
+            s.create_descendant_dir("svc").unwrap();
+            let token = s.create_pgdata_child("svc", "pgdata").unwrap();
+            // Immediate revalidation should succeed (same inode).
+            token.revalidate().expect("revalidate must succeed");
+        }
+
+        #[test]
+        fn pgdata_child_no_mutation_on_blocked_root() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let d = make_root();
+            let root = d.path().to_path_buf();
+            let s = ServiceStorage::new(&root).unwrap();
+            // Create a service dir with a pre-existing foreign file at
+            // pgdata position but NO marker — this should Block in the
+            // provider, but here we test the storage layer: the foreign
+            // file must not be modified.
+            s.create_descendant_dir("svc").unwrap();
+            fs::write(root.join("svc/pgdata"), b"foreign data").unwrap();
+            let metadata_before = fs::metadata(root.join("svc/pgdata")).unwrap();
+            let _ = s.create_pgdata_child("svc", "pgdata");
+            // The file must not have been mutated.
+            let metadata_after = fs::metadata(root.join("svc/pgdata")).unwrap();
+            assert_eq!(
+                metadata_before.len(),
+                metadata_after.len(),
+                "blocked pgdata must not be mutated"
+            );
+            assert!(
+                fs::read(root.join("svc/pgdata"))
+                    .unwrap()
+                    .windows(12)
+                    .any(|w| w == b"foreign data"),
+                "blocked pgdata content must be unchanged"
+            );
+        }
+        // ─── mount-boundary policy tests (root + CAP_SYS_ADMIN) ──────────
+
+        /// RAII guard that unmounts a path on drop. Best-effort: if `umount`
+        /// fails (e.g. busy), we log to stderr but do not panic.
+        struct MountGuard {
+            target: PathBuf,
+            mounted: bool,
+        }
+
+        impl Drop for MountGuard {
+            fn drop(&mut self) {
+                if self.mounted {
+                    let status = std::process::Command::new("umount")
+                        .arg(&self.target)
+                        .status();
+                    if !matches!(status, Ok(s) if s.success()) {
+                        eprintln!(
+                            "MountGuard: umount {} failed (best-effort cleanup): {:?}",
+                            self.target.display(),
+                            status
+                        );
+                    }
+                }
+            }
+        }
+
+        /// Skip helper for mount tests: requires root and the `mount`
+        /// command. Prints a clear skip reason.
+        fn skip_if_no_mount_cap() -> bool {
+            if rustix::process::getuid().as_raw() != 0 {
+                eprintln!("skipping mount test: not running as root (requires CAP_SYS_ADMIN)");
+                return true;
+            }
+            // Check that `mount` is available on PATH.
+            if std::process::Command::new("mount")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_err()
+            {
+                eprintln!("skipping mount test: `mount` command not found on PATH");
+                return true;
+            }
+            false
+        }
+
+        /// Mount a tmpfs at `target` and return a guard that unmounts on
+        /// drop. Panics if mount fails.
+        fn mount_tmpfs(target: &Path) -> MountGuard {
+            let status = std::process::Command::new("mount")
+                .args(["-t", "tmpfs", "tmpfs"])
+                .arg(target)
+                .status()
+                .unwrap_or_else(|e| panic!("failed to execute mount: {e}"));
+            assert!(
+                status.success(),
+                "mount -t tmpfs tmpfs {} failed (status: {:?}) — requires root + CAP_SYS_ADMIN",
+                target.display(),
+                status
+            );
+            MountGuard {
+                target: target.to_path_buf(),
+                mounted: true,
+            }
+        }
+
+        /// Bind-mount `source` onto `target` and return a guard.
+        fn mount_bind(source: &Path, target: &Path) -> MountGuard {
+            let status = std::process::Command::new("mount")
+                .args(["--bind"])
+                .arg(source)
+                .arg(target)
+                .status()
+                .unwrap_or_else(|e| panic!("failed to execute mount --bind: {e}"));
+            assert!(
+                status.success(),
+                "mount --bind {} {} failed (status: {:?})",
+                source.display(),
+                target.display(),
+                status
+            );
+            MountGuard {
+                target: target.to_path_buf(),
+                mounted: true,
+            }
+        }
+
+        /// Verify that `path` is a mount point by comparing its `st_dev`
+        /// with its parent's `st_dev`. If they differ, it's on a separate
+        /// mount. (Note: on FCOS /var, st_dev can be the same even across a
+        /// mount boundary, so this is a sufficient but not necessary check.)
+        fn is_mount_point(path: &Path) -> bool {
+            let st_self = rustix::fs::stat(path).ok();
+            let st_parent = rustix::fs::stat(path.parent().unwrap_or(Path::new("/"))).ok();
+            match (st_self, st_parent) {
+                (Some(a), Some(b)) => a.st_dev != b.st_dev,
+                _ => false,
+            }
+        }
+
+        /// Verify that `path` is a mount point using `findmnt -M` which
+        /// checks the kernel mount table (works even when st_dev is the
+        /// same across a mount boundary, as on FCOS /var).
+        fn is_mount_point_findmnt(path: &Path) -> bool {
+            std::process::Command::new("findmnt")
+                .args(["-M"])
+                .arg(path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+
+        #[test]
+        fn storage_constructor_allows_root_on_separate_volume() {
+            if skip_if_no_mount_cap() {
+                return;
+            }
+            // Create a parent tempdir, mount a tmpfs inside it, then create
+            // the storage root on that tmpfs. The constructor must accept
+            // the root even though it crosses a mount boundary from `/`.
+            let parent = tempfile::tempdir().unwrap();
+            let mountpoint = parent.path().join("mnt");
+            fs::create_dir(&mountpoint).unwrap();
+            let _guard = mount_tmpfs(&mountpoint);
+
+            // Verify we actually crossed a mount boundary.
+            assert!(
+                is_mount_point_findmnt(&mountpoint) || is_mount_point(&mountpoint),
+                "test fixture: {} must be a real mount point for this test to be meaningful",
+                mountpoint.display()
+            );
+
+            // Create the storage root on the tmpfs, owned by root, mode 0700.
+            let root = mountpoint.join("slip-root");
+            fs::create_dir(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            // Ensure root ownership (tempdir may already be root, but be
+            // explicit).
+            use rustix::fs::{Gid, Uid, chown};
+            let _ = chown(&root, Some(Uid::from_raw(0)), Some(Gid::from_raw(0)));
+
+            // The constructor must succeed despite the root being on a
+            // separate mount from "/".
+            let s = ServiceStorage::new(&root).unwrap_or_else(|e| {
+                panic!(
+                    "ServiceStorage::new must accept root on separate mount: {e} (root={})",
+                    root.display()
+                )
+            });
+            assert_eq!(s.root_path(), &root);
+        }
+
+        #[test]
+        fn storage_rejects_mount_below_root() {
+            if skip_if_no_mount_cap() {
+                return;
+            }
+            // Construct storage on a valid root, create a child dir, mount
+            // tmpfs on that child, then verify descendant access is rejected
+            // with CrossDevice.
+            let d = make_root();
+            let root = d.path().to_path_buf();
+            let s = ServiceStorage::new(&root).unwrap();
+            s.create_descendant_dir("child").unwrap();
+
+            // Mount tmpfs on the child directory.
+            let child_path = root.join("child");
+            let _guard = mount_tmpfs(&child_path);
+
+            // Verify it's a mount point.
+            assert!(
+                is_mount_point_findmnt(&child_path) || is_mount_point(&child_path),
+                "test fixture: {} must be a real mount point",
+                child_path.display()
+            );
+
+            // open_descendant_dir must reject with CrossDevice (NO_XDEV on
+            // descendant operations).
+            let result = s.open_descendant_dir("child");
+            assert!(
+                matches!(result, Err(StorageError::CrossDevice(_))),
+                "descendant mount crossing must be rejected with CrossDevice, got: {result:?}"
+            );
+
+            // validate_bind_source_dir must also reject.
+            let result = s.validate_bind_source_dir("child");
+            assert!(
+                matches!(result, Err(StorageError::CrossDevice(_))),
+                "validate_bind_source_dir on mount-below-root must reject with CrossDevice, got: {result:?}"
+            );
+        }
+
+        #[test]
+        fn storage_rejects_same_superblock_bind_mount_below_root() {
+            // Same-superblock bind mount: NO_XDEV must still reject even
+            // when st_dev is the same on both sides (the FCOS /var case).
+            if skip_if_no_mount_cap() {
+                return;
+            }
+            let d = make_root();
+            let root = d.path().to_path_buf();
+            let s = ServiceStorage::new(&root).unwrap();
+            s.create_descendant_dir("child").unwrap();
+
+            // Create a source directory on the same filesystem, bind-mount
+            // it onto the child.
+            let src = root.join("bindsrc");
+            fs::create_dir(&src).unwrap();
+            let child_path = root.join("child");
+            let _guard = mount_bind(&src, &child_path);
+
+            // Even if st_dev is the same, NO_XDEV rejects the mount crossing.
+            let result = s.open_descendant_dir("child");
+            assert!(
+                matches!(result, Err(StorageError::CrossDevice(_))),
+                "same-superblock bind mount below root must be rejected by NO_XDEV, got: {result:?}"
+            );
+        }
+
+        #[test]
+        fn storage_constructor_rejects_ancestor_symlink() {
+            // Root acquisition with ROOT_RESOLVE_FLAGS must still reject
+            // symlinks (NO_SYMLINKS is retained). An ancestor symlink in
+            // the configured path must be rejected.
+            if skip_if_nonroot() {
+                return;
+            }
+            let d = make_root();
+            let real = d.path().join("real_root");
+            fs::create_dir(&real).unwrap();
+            fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+            // Create a symlink pointing to real_root as the "configured" root.
+            let link = d.path().join("rootlink");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            // ServiceStorage::new must reject because the final component
+            // is a symlink (NO_SYMLINKS rejects symlinks in resolution).
+            let result = ServiceStorage::new(&link);
+            assert!(
+                result.is_err(),
+                "constructor must reject symlink as configured root, got: {result:?}"
+            );
+        }
+
+        #[test]
+        fn storage_constructor_rejects_intermediate_symlink_in_path() {
+            // An intermediate symlink in the ancestor path must be rejected
+            // by NO_SYMLINKS even with ROOT_RESOLVE_FLAGS.
+            if skip_if_nonroot() {
+                return;
+            }
+            let d = tempfile::tempdir().unwrap();
+            // Create real_root as a valid 0700 root-owned directory.
+            let real_root = d.path().join("real_root");
+            fs::create_dir(&real_root).unwrap();
+            fs::set_permissions(&real_root, fs::Permissions::from_mode(0o700)).unwrap();
+            // Create a symlink "linkdir" -> "real_root".
+            std::os::unix::fs::symlink(&real_root, d.path().join("linkdir")).unwrap();
+            // The configured path goes through the symlink.
+            let configured = d.path().join("linkdir");
+            let result = ServiceStorage::new(&configured);
+            assert!(
+                result.is_err(),
+                "constructor must reject intermediate symlink in root path, got: {result:?}"
+            );
+        }
+
+        #[test]
+        fn storage_constructor_rejects_wrong_uid_root() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let d = tempfile::tempdir().unwrap();
+            let root = d.path().join("wronguid");
+            fs::create_dir(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            // Chown to non-root.
+            use rustix::fs::{Gid, Uid, chown};
+            let _ = chown(&root, Some(Uid::from_raw(999)), Some(Gid::from_raw(999)));
+            let result = ServiceStorage::new(&root);
+            assert!(
+                matches!(result, Err(StorageError::WrongOwner { .. })),
+                "constructor must reject non-root-owned root, got: {result:?}"
+            );
+        }
+
+        #[test]
+        fn storage_constructor_rejects_wrong_mode_root() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let d = tempfile::tempdir().unwrap();
+            let root = d.path().join("wrongmode");
+            fs::create_dir(&root).unwrap();
+            // Wrong mode (0755 instead of 0700).
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+            let result = ServiceStorage::new(&root);
+            assert!(
+                matches!(result, Err(StorageError::WrongMode { .. })),
+                "constructor must reject wrong-mode root, got: {result:?}"
+            );
+        }
+
+        #[test]
+        fn storage_constructor_rejects_non_directory_root() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let d = tempfile::tempdir().unwrap();
+            let root = d.path().join("notafile");
+            fs::write(&root, b"not a directory").unwrap();
+            let result = ServiceStorage::new(&root);
+            assert!(
+                result.is_err(),
+                "constructor must reject non-directory root, got: {result:?}"
+            );
         }
     }
 }

@@ -108,9 +108,18 @@ docker.io/library/postgres:18.4-bookworm@sha256:882236b897e39051d2368c5ccc6cda94
 
 ### Data layout
 
-- Host: `/var/lib/slip/services/<name>` (root-owned, 0700)
-- Container mount: `/var/lib/postgresql` (rw)
+- Host storage root: `/var/lib/slip/services` (root-owned, 0700)
+  - `<name>/` (root-owned, 0700, never mounted)
+    - `.slip-bootstrap` (marker file, 0600)
+    - `pgdata/` (root-owned, 0755, mounted rw into container)
+  - `<instance-id>/` (root-owned, 0700, never mounted)
+    - `active.gen` (generation pointer, 0600)
+    - `<generation>/` (secret directory, 0700)
+      - `raw_password` and `pgpass` (secret files, 0600)
+- Container mount: `/var/lib/postgresql` (rw, bind from `<name>/pgdata`)
 - PG18 default PGDATA: `/var/lib/postgresql/18/docker`
+- Secret mounts: `/run/secrets/slip-raw-password` (ro),
+  `/run/secrets/slip-pgpass` (ro)
 
 ### Security
 
@@ -119,7 +128,13 @@ docker.io/library/postgres:18.4-bookworm@sha256:882236b897e39051d2368c5ccc6cda94
 - `PGPASSFILE=/run/secrets/slip-pgpass` for authenticated readiness probes
 - No host ports (enforced in spec construction and verified on ensure/remove)
 - `unless-stopped` restart policy
-- `no-new-privileges`, all caps dropped
+- `no-new-privileges:true`, `cap_drop: ALL` then `cap_add` of the minimal
+  bootstrap set: `CHOWN`, `DAC_OVERRIDE`, `SETUID`, `SETGID`. The entrypoint
+  uses `gosu postgres` to drop to UID 999, clearing effective/permitted/
+  ambient capabilities. Contract tests verify the actual postgres process
+  has `CapEff=0`, `CapPrm=0`, `CapAmb=0`, `NoNewPrivs=1`, and effective
+  UID 999 after readiness. The four bootstrap caps are limited to the
+  root entrypoint phase before `gosu`.
 - Read-only rootfs disabled (PG entrypoint requires write access on first init)
 - Default seccomp is implicit (no explicit seccomp profile is set; the daemon
   default applies)
@@ -136,7 +151,7 @@ docker.io/library/postgres:18.4-bookworm@sha256:882236b897e39051d2368c5ccc6cda94
 1. **Bootstrap marker**: `initializing` → `complete` (atomic, after verified
    readiness). If the parent-directory fsync after the `complete` rename fails,
    the provider restores an `initializing` marker via a compensating atomic
-   temp+rename+fsync and returns a `FilesystemCheck` error — the controller
+   temp+rename+fsync and returns a `FilesystemCheck` error; the controller
    never persists `Ready` for a marker whose durability barrier failed. If the
    compensating restore also fails, the error is honest about residual
    uncertainty (the marker may be stale). A subsequent provision attempt sees
@@ -162,7 +177,7 @@ docker.io/library/postgres:18.4-bookworm@sha256:882236b897e39051d2368c5ccc6cda94
 
 ## Reconciliation
 
-- **Startup**: bounded ensure pass (60s budget), non-blocking — does not gate API start
+- **Startup**: bounded ensure pass (60s budget), non-blocking; does not gate API start
 - **Periodic**: service ensure runs before app routes in the reconcile tick
 - **Blocked fast-path**: permanent mismatches are persisted once as `Blocked`, not retried
 - **Collect-and-continue**: one bad service doesn't block others
@@ -180,7 +195,15 @@ while slipd is down. The reconcile loop is the slipd-restart safety net.
 
 ## Supported platforms
 
-- **Runtime storage**: Linux only (rootful Podman with openat2 support)
+- **Runtime storage**: Linux only (rootful Podman with openat2 support).
+  The trusted configured root is acquired with `RESOLVE_BENEATH |
+  NO_SYMLINKS` (ancestor mount crossings permitted — the configured root
+  is administrator-controlled and commonly lives across `/var` on FCOS or
+  on a separate data volume). Every descendant operation uses the full
+  `RESOLVE_BENEATH | NO_SYMLINKS | NO_XDEV` so any mount introduced below
+  the acquired root is rejected with `EXDEV` by the kernel. Root
+  owner/mode/type validation and `ValidatedBindSource` token revalidation
+  are unchanged.
 - **macOS dev**: portable tests compile and pass; Linux-gated tests are CI-only
 - **Service operations**: fail closed on non-rootful or non-Linux runtimes
 
@@ -201,7 +224,7 @@ slip services rm <name> [--force]
 `rm` composes two API calls: first `GET /v1/services/{name}` to obtain the
 current generation (a non-secret operational integer), then
 `DELETE /v1/services/{name}?generation=<n>&force=<bool>`. The generation is
-a CAS guard — if the service was modified between the GET and DELETE, the
+a CAS guard; if the service was modified between the GET and DELETE, the
 server returns 409 and the CLI reports a stale-generation conflict.
 
 Exit codes follow the SLIP-86 contract: 0 ok, 1 generic/conflict, 2 usage, 3 auth,

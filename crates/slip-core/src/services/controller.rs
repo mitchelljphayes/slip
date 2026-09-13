@@ -56,7 +56,7 @@ pub trait ServiceUsageReader: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send + 'a>>;
 }
 
-/// Production usage reader — returns empty (no `needs` field in AppConfig yet).
+/// Production usage reader: returns empty (no `needs` field in AppConfig yet).
 pub struct AppConfigUsageReader {
     #[allow(dead_code)]
     apps: Arc<tokio::sync::RwLock<HashMap<String, crate::config::AppConfig>>>,
@@ -73,7 +73,7 @@ impl ServiceUsageReader for AppConfigUsageReader {
         &'a self,
         _name: &'a ServiceName,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send + 'a>> {
-        // No `needs` field in AppConfig yet — SLIP-107 will add it.
+        // No `needs` field in AppConfig yet; SLIP-107 will add it.
         Box::pin(async { vec![] })
     }
 }
@@ -139,7 +139,7 @@ pub struct ServiceRemovalResult {
     pub affected_apps: Vec<String>,
 }
 
-/// The service controller — orchestrates providers, persistence, and locking.
+/// The service controller: orchestrates providers, persistence, and locking.
 pub struct ServiceController {
     db: Db,
     runtime: Arc<dyn RuntimeBackend>,
@@ -235,10 +235,10 @@ impl ServiceController {
         .map_err(ServiceError::from_repo_cas)?;
 
         if let Some(existing_row) = existing {
-            // Same name — check if same spec.
+            // Same name: check if same spec.
             let existing_spec = existing_row.to_spec()?;
             if existing_spec == spec {
-                // Idempotent — touch and return (ensure path handles convergence).
+                // Idempotent: touch and return (ensure path handles convergence).
                 let db = self.db.clone();
                 let name_clone = name.clone();
                 let _ = tokio::task::spawn_blocking(move || {
@@ -284,7 +284,7 @@ impl ServiceController {
         .await
         .map_err(|e| ServiceError::Internal(e.to_string()))??;
 
-        // Generate secret (Linux only — on non-Linux, provision will fail).
+        // Generate secret (Linux only; on non-Linux, provision will fail).
         #[cfg(target_os = "linux")]
         {
             if let Some(storage) = &self.storage {
@@ -308,18 +308,18 @@ impl ServiceController {
                 // Check if active pointer exists; generate only if absent.
                 match bundle.read_active_pointer() {
                     Ok(_) => {
-                        // Active generation exists — reuse it.
+                        // Active generation exists: reuse it.
                     }
                     Err(crate::services::secret::SecretBundleError::ActivePointerNotFound {
                         ..
                     }) => {
-                        // No active generation — generate.
+                        // No active generation: generate.
                         bundle.generate().map_err(|_| {
                             ServiceError::Internal("secret generation failed".to_string())
                         })?;
                     }
                     Err(e) => {
-                        // Ambiguous — reread (the error itself is from a reread).
+                        // Ambiguous: reread (the error itself is from a reread).
                         return Err(ServiceError::Internal(format!(
                             "secret pointer check failed: {e}"
                         )));
@@ -615,11 +615,11 @@ impl ServiceController {
         let (svc, state_row) = result;
         let svc = match svc {
             Some(s) => s,
-            None => return Ok(()), // No desired state — nothing to ensure.
+            None => return Ok(()), // No desired state: nothing to ensure.
         };
         let state_row = match state_row {
             Some(s) => s,
-            None => return Ok(()), // No control state — skip.
+            None => return Ok(()), // No control state: skip.
         };
 
         // Skip if Blocked with same desired hash.
@@ -628,7 +628,7 @@ impl ServiceController {
             return Ok(());
         }
 
-        // Skip if Retained (no desired state — already deleted).
+        // Skip if Retained (no desired state; already deleted).
         if state_row.phase() == LifecyclePhase::Retained {
             return Ok(());
         }
@@ -696,7 +696,7 @@ impl ServiceController {
                     crate::services::spec::EnsureAction::Blocked => LifecyclePhase::Blocked,
                 };
 
-                // Propagate CAS errors — do not silently discard.
+                // Propagate CAS errors: do not silently discard.
                 // A generation mismatch means another caller modified the
                 // state; the container may be unrecorded. Surface as
                 // ConcurrentModification so the caller knows to re-read.
@@ -775,7 +775,7 @@ impl ServiceController {
                 let expected_gen = state.generation();
 
                 if is_permanent {
-                    // Persist as Blocked phase — the fast-path in ensure_one
+                    // Persist as Blocked phase: the fast-path in ensure_one
                     // skips Blocked services on subsequent ticks (no retry
                     // storm). The service stays Blocked until the desired
                     // generation or observed identity changes.
@@ -824,7 +824,7 @@ impl ServiceController {
                         "ensure: permanent error, persisted as Blocked (will skip on next tick)"
                     );
                 } else {
-                    // Transient error — persist Unhealthy, will retry.
+                    // Transient error: persist Unhealthy, will retry.
                     let cas_result = tokio::task::spawn_blocking(move || {
                         let mut conn = db.0.lock().unwrap();
                         ServiceRepository::update_health(
@@ -895,7 +895,7 @@ impl ServiceController {
         }
     }
 
-    /// Startup ensure (bounded, non-blocking — spawned as a task).
+    /// Startup ensure (bounded, non-blocking; spawned as a task).
     pub async fn startup_ensure(&self) {
         tracing::info!("starting service ensure (bounded)");
         self.ensure_all(STARTUP_BUDGET).await;
@@ -906,7 +906,7 @@ impl ServiceController {
     ///
     /// The returned `Arc<dyn InstanceSecretCapability + 'a>` borrows
     /// `self.storage` for the lifetime of `&'a self`. The bundle never
-    /// outlives the controller — every caller uses the capability within the
+    /// outlives the controller: every caller uses the capability within the
     /// same `add`/`ensure_one`/`remove` scope and drops it before returning.
     #[cfg(target_os = "linux")]
     fn make_secret_capability<'a>(
@@ -1299,7 +1299,7 @@ mod tests {
             .unwrap()
         };
 
-        // Remove without force — should be refused.
+        // Remove without force: should be refused.
         let result = ctrl
             .remove(
                 &ServiceName::parse("pg").unwrap(),
@@ -1624,7 +1624,7 @@ mod tests {
         // On Linux with a fake runtime that returns errors, the provider
         // returns Blocked which the controller should persist.
         // On macOS (test env), make_secret_capability returns Blocked
-        // which propagates directly — this is correct fail-closed behavior.
+        // which propagates directly: this is correct fail-closed behavior.
         let result = ctrl.ensure_one(&ServiceName::parse("perm").unwrap()).await;
 
         // On non-Linux the error is returned directly (storage unsupported).
@@ -1682,7 +1682,7 @@ mod tests {
         let usage: Arc<dyn ServiceUsageReader> = Arc::new(FakeUsageReader::new(HashMap::new()));
         let ctrl = test_controller(rt, usage);
 
-        // Insert a service in Provisioning (no container_id — ensure will
+        // Insert a service in Provisioning (no container_id; ensure will
         // try to provision, which requires secrets/storage).
         let spec = sample_spec("setup-fail");
         let state = {

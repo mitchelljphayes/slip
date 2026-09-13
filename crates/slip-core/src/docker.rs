@@ -875,6 +875,7 @@ impl RuntimeBackend for DockerClient {
             // Security: no-new-privileges, minimal caps, read-only rootfs
             let security_opt = vec!["no-new-privileges:true".to_string()];
             let cap_drop = vec!["ALL".to_string()];
+            let cap_add: Vec<String> = spec.security().cap_add.clone();
 
             let tmpfs: Option<HashMap<String, String>> = if spec.security().tmpfs_mounts.is_empty()
             {
@@ -897,6 +898,11 @@ impl RuntimeBackend for DockerClient {
                 pids_limit: spec.resources().pids_limit,
                 security_opt: Some(security_opt),
                 cap_drop: Some(cap_drop),
+                cap_add: if cap_add.is_empty() {
+                    None
+                } else {
+                    Some(cap_add)
+                },
                 readonly_rootfs: Some(spec.security().read_only_rootfs),
                 tmpfs,
                 ..Default::default()
@@ -1101,6 +1107,7 @@ impl RuntimeBackend for DockerClient {
             let name = info.name.clone();
 
             Ok(crate::runtime::ServiceContainerInspect {
+                backend_name: "docker".to_string(),
                 container_id: daemon_id,
                 name,
                 hostname,

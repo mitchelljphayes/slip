@@ -3680,7 +3680,7 @@ mod tests {
     /// **Residual production issue:** because the handlers' writes are
     /// fire-and-forget and non-serialized per app, a stale POST write can
     /// land after a PATCH write and clobber it. This helper observes that
-    /// behavior faithfully — it does not mask it. See the production ticket
+    /// behavior faithfully; it does not mask it. See the production ticket
     /// noted in ci-test-isolation.md.
     async fn poll_config_on_disk<T, F>(
         config_dir: &std::path::Path,
@@ -6492,7 +6492,7 @@ path = {storage_path:?}
             "secrets should be settable immediately"
         );
 
-        // Step 4: Simulate restart — re-load config from disk and verify the
+        // Step 4: Simulate restart: re-load config from disk and verify the
         // POST handler's fire-and-forget spawn_blocking write has landed.
         // We poll (observation-only, no test-side writes) until the handler's
         // persisted config is visible via load_config.
@@ -6649,7 +6649,7 @@ path = {storage_path:?}
             assert_eq!(cfg.health.path.as_deref(), Some("/readyz"));
         }
 
-        // Simulate restart — observation-only poll for the PATCH handler's
+        // Simulate restart: observation-only poll for the PATCH handler's
         // persisted config on disk (no test-side writes).
         let reloaded = poll_config_on_disk(&config_dir, "updateapp", |cfg| {
             if cfg.app.name == "updateapp"

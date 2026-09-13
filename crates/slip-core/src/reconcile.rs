@@ -171,7 +171,7 @@ pub async fn reconcile_tick(
     ctx: &ReconcileContext,
     backoff: &ExponentialBuilder,
 ) -> ReconcileSummary {
-    // ── 0. Service ensure (SLIP-106 Part 3) — before apps ───────────────────
+    // ── 0. Service ensure (SLIP-106 Part 3), before apps ───────────────────
     // Services may be dependencies of apps; ensure they converge first.
     // Bounded by half the interval, collect-and-continue.
     if let Some(ctrl) = &ctx.services {

@@ -1,4 +1,4 @@
-//! Runtime backend abstraction — trait for container/pod lifecycle operations.
+//! Runtime backend abstraction: trait for container/pod lifecycle operations.
 //!
 //! Implemented by `DockerClient` (Docker) and `PodmanBackend` (Podman).
 //! The deploy orchestrator uses `&dyn RuntimeBackend` for all container operations.
@@ -8,7 +8,7 @@
 //! [`RuntimeBackend`] also carries structured service lifecycle methods used by
 //! the managed-service framework: [`create_and_start_service`], [`inspect_service`],
 //! and [`exec_service_probe`]. These are distinct from the app-deploy
-//! [`create_and_start`] method — service containers have stable names, no host
+//! [`create_and_start`] method: service containers have stable names, no host
 //! ports, `unless-stopped` restart policy, OCI healthchecks, ownership labels,
 //! bind mounts, and read-only secret mounts. The service methods default to
 //! `Unsupported` so existing app paths and fakes are unaffected until a runtime
@@ -69,14 +69,19 @@ pub struct ServiceResourceLimits {
     pub pids_limit: Option<i64>,
 }
 
-/// Security options for a service container — fail-closed hardening.
+/// Security options for a service container: fail-closed hardening.
 #[derive(Debug, Clone, Default)]
 pub struct ServiceSecurityOpts {
     /// Read-only root filesystem.
     pub read_only_rootfs: bool,
     /// Tmpfs mounts for writable directories (e.g. `/tmp`, `/run`).
     pub tmpfs_mounts: Vec<(String, String)>,
-    // The following are enforced as "no" by construction — the provider
+    /// Capabilities to add back after `cap_drop: ALL`. The backend always
+    /// drops all capabilities; the provider may add back a minimal set
+    /// required by the service image's entrypoint (e.g. `CHOWN` for
+    /// postgres initdb). Empty = truly zero capabilities.
+    pub cap_add: Vec<String>,
+    // The following are enforced as "no" by construction: the provider
     // sets them, but the backend must reject any container that has them.
     // These fields document the policy; the backend impls enforce the
     // negative invariants.
@@ -164,7 +169,7 @@ impl ServiceContainerSpec {
         // a secret value).
         for key in env.keys() {
             let lower = key.to_lowercase();
-            // Allow *_FILE env vars (e.g. POSTGRES_PASSWORD_FILE) — these point
+            // Allow *_FILE env vars (e.g. POSTGRES_PASSWORD_FILE): these point
             // to mounted secret files, not secret values.
             if lower.ends_with("_file") {
                 continue;
@@ -239,6 +244,8 @@ impl ServiceContainerSpec {
 /// verification. Any mismatch → `Blocked`, zero mutations.
 #[derive(Debug, Clone)]
 pub struct ServiceContainerInspect {
+    /// Backend name ("podman" or "docker") for backend-specific verification.
+    pub backend_name: String,
     /// Full 64-hex container ID as reported by the daemon (not the
     /// requested argument). Used to verify the daemon returned the
     /// expected container.
@@ -440,7 +447,7 @@ pub trait RuntimeBackend: Send + Sync {
     /// Execute a command inside a running container and return its combined output.
     ///
     /// Returns [`RuntimeError::ExecFailed`] if the command exits with a non-zero
-    /// status. Returns [`RuntimeError::Unsupported`] by default — must be
+    /// status. Returns [`RuntimeError::Unsupported`] by default: must be
     /// overridden by runtimes that support exec (Docker, Podman).
     fn exec_in_container<'a>(
         &'a self,
@@ -460,7 +467,7 @@ pub trait RuntimeBackend: Send + Sync {
     ///
     /// Used by `slip status` to find all containers belonging to a slip app
     /// via the `slip.app` label, rather than name substring matching (which
-    /// breaks on truncated tag prefixes — FR §3.11).
+    /// breaks on truncated tag prefixes (FR §3.11).
     ///
     /// Returns containers in any state (running, exited, etc.) so the status
     /// command can report stale containers.
@@ -541,7 +548,7 @@ pub trait RuntimeBackend: Send + Sync {
     /// The argv is a static `&[&str]` (no shell, no interpolation). The env
     /// pairs are allowlisted non-secret settings (e.g.
     /// `PGPASSFILE=/run/secrets/slip-pgpass`). The output is capped at
-    /// `max_output_bytes` and discarded on success — this method returns
+    /// `max_output_bytes` and discarded on success. This method returns
     /// `Ok(())` if the command exits 0, or `Err` with sanitized text on
     /// failure. Never returns stdout/stderr to the caller.
     fn exec_service_probe<'a>(
@@ -586,7 +593,7 @@ pub struct PodInfo {
 /// Lightweight info about a running container, returned by [`RuntimeBackend::list_by_label`].
 ///
 /// Used by `slip status` to discover containers by their `slip.app` label
-/// rather than name substrings (which are truncated in the container name —
+/// rather than name substrings (which are truncated in the container name;
 /// see FR §3.11).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerInfo {

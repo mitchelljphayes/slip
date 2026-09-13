@@ -591,9 +591,32 @@ mod _linux {
         }
 
         /// Read the active generation name from the pointer.
+        ///
+        /// A missing pointer file (`active.gen` itself not found) is
+        /// classified as [`SecretBundleError::ActivePointerNotFound`],
+        /// signaling a new service that has not yet been generated. All
+        /// other failures (missing instance directory, symlink, wrong
+        /// owner/mode, IO error, etc.) are propagated as-is to preserve
+        /// fail-closed behavior.
         pub fn read_active_pointer(&self) -> Result<GenerationName, SecretBundleError> {
             let pointer_rel = self.pointer_rel();
-            let buf = self.storage.read_file(&pointer_rel, 64)?;
+            let buf = self.storage.read_file(&pointer_rel, 64).map_err(|e| {
+                match &e {
+                    StorageError::NotFound(path)
+                        if path
+                            .file_name()
+                            .map(|n| n == ACTIVE_POINTER)
+                            .unwrap_or(false) =>
+                    {
+                        SecretBundleError::ActivePointerNotFound {
+                            instance_id: self.instance_id.as_str().to_string(),
+                        }
+                    }
+                    // Any other NotFound (e.g. missing instance directory)
+                    // or non-NotFound error: fail closed, propagate as-is.
+                    _ => SecretBundleError::Storage(e),
+                }
+            })?;
             let s =
                 String::from_utf8(buf).map_err(|e| SecretBundleError::ActivePointerMalformed {
                     instance_id: self.instance_id.as_str().to_string(),
@@ -778,7 +801,14 @@ mod _linux {
                         .map_err(|e| ServiceError::Internal(format!("password utf8: {e}")))?;
                     Ok(Some(s))
                 }
-                Err(SecretBundleError::Storage(StorageError::NotFound(_))) => Ok(None),
+                // Only ActivePointerNotFound means "no secret has been
+                // generated yet." Any other error (missing generation
+                // files, symlink substitution, wrong owner/mode, IO) is a
+                // real error and must NOT be classified as absence.
+                // Returning None for a present-but-broken pointer could
+                // cause a caller to silently generate new credentials
+                // instead of blocking on the real filesystem error.
+                Err(SecretBundleError::ActivePointerNotFound { .. }) => Ok(None),
                 Err(e) => Err(ServiceError::Internal(redact_error(&e))),
             }
         }
@@ -1296,6 +1326,162 @@ mod _linux {
             let bundle = make_bundle(&s);
             let cap: &dyn InstanceSecretCapability = &bundle;
             assert!(cap.read_superuser().unwrap().is_none());
+        }
+
+        /// Regression: a fresh instance directory (no `active.gen`) must
+        /// produce `ActivePointerNotFound` from `read_active_pointer`, not
+        /// `Storage(NotFound)`. The controller matches `ActivePointerNotFound`
+        /// to trigger initial generation; a `Storage(NotFound)` falls through
+        /// to the catch-all error arm and aborts provisioning.
+        #[test]
+        fn bundle_fresh_instance_active_pointer_not_found_variant() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
+            let err = bundle.read_active_pointer().unwrap_err();
+            assert!(
+                matches!(err, SecretBundleError::ActivePointerNotFound { .. }),
+                "expected ActivePointerNotFound for fresh instance, got {err:?}"
+            );
+        }
+
+        /// Regression: after `generate()`, `read_active_pointer` returns the
+        /// generation. This verifies the full "new service reaches initial
+        /// generation" path: absent pointer -> generate -> active pointer
+        /// resolves to the new generation.
+        #[test]
+        fn bundle_generate_then_read_reaches_initial_generation() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
+            // Pre-condition: no active pointer (ActivePointerNotFound).
+            assert!(matches!(
+                bundle.read_active_pointer().unwrap_err(),
+                SecretBundleError::ActivePointerNotFound { .. }
+            ));
+            // Generate: this is the path the controller takes on a new service.
+            let generation = bundle.generate().unwrap();
+            // Post-condition: active pointer resolves to the new generation.
+            let active = bundle.read_active_pointer().unwrap();
+            assert_eq!(active, generation);
+            // The raw password is readable (full lifecycle).
+            let bytes = bundle.read_raw_password().unwrap();
+            assert_eq!(bytes.len(), 48);
+        }
+
+        /// Negative: a missing instance directory must NOT be classified as
+        /// `ActivePointerNotFound`. It must fail-closed with a `Storage`
+        /// error (the instance directory itself is gone, not just the
+        /// pointer). This preserves the fail-closed invariant: only the
+        /// exact pointer file absence maps to ActivePointerNotFound.
+        #[test]
+        fn bundle_missing_instance_dir_not_active_pointer_not_found() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let (_d, s) = make_storage();
+            let id = InstanceId::generate().unwrap();
+            // Do NOT create the instance directory.
+            // InstanceSecretBundle::new will fail because the dir doesn't exist.
+            let err = InstanceSecretBundle::new(&s, id).unwrap_err();
+            // Must be a Storage error (NotFound for the instance dir), not
+            // ActivePointerNotFound.
+            assert!(
+                !matches!(err, SecretBundleError::ActivePointerNotFound { .. }),
+                "missing instance dir must not be ActivePointerNotFound, got {err:?}"
+            );
+        }
+
+        /// Negative: a malformed pointer (valid file but bad content) must
+        /// NOT be classified as `ActivePointerNotFound`. It must produce
+        /// `ActivePointerMalformed` or `GenerationNameMalformed`.
+        #[test]
+        fn bundle_malformed_pointer_not_active_pointer_not_found() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
+            // Write a malformed pointer (too short, not 32 hex chars).
+            let ptr_rel = bundle.pointer_rel();
+            bundle
+                .storage
+                .write_file_exclusive(&ptr_rel, b"bad\n")
+                .unwrap();
+            let err = bundle.read_active_pointer().unwrap_err();
+            assert!(
+                !matches!(err, SecretBundleError::ActivePointerNotFound { .. }),
+                "malformed pointer must not be ActivePointerNotFound, got {err:?}"
+            );
+        }
+
+        /// Negative: pointer present but raw_password file missing must
+        /// NOT return None from read_superuser. Only ActivePointerNotFound
+        /// (absent pointer) means absence.
+        #[test]
+        fn bundle_pointer_present_missing_raw_password_errors() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
+            let generation = bundle.generate().unwrap();
+            let raw_rel = bundle.gen_file_rel(&generation, RAW_PASSWORD_FILE);
+            bundle.storage.unlink_descendant(&raw_rel).unwrap();
+            let cap: &dyn InstanceSecretCapability = &bundle;
+            let result = cap.read_superuser();
+            assert!(
+                result.is_err(),
+                "pointer-present missing raw_password must error, not return None"
+            );
+        }
+
+        /// Negative: pointer present but pgpass file missing must NOT
+        /// return None from read_superuser.
+        #[test]
+        fn bundle_pointer_present_missing_pgpass_errors() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
+            let generation = bundle.generate().unwrap();
+            let pgpass_rel = bundle.gen_file_rel(&generation, PGPASS_FILE);
+            bundle.storage.unlink_descendant(&pgpass_rel).unwrap();
+            let cap: &dyn InstanceSecretCapability = &bundle;
+            let result = cap.read_superuser();
+            assert!(
+                result.is_err(),
+                "pointer-present missing pgpass must error, not return None"
+            );
+        }
+
+        /// Negative: pointer present but entire generation directory
+        /// removed must NOT return None from read_superuser.
+        #[test]
+        fn bundle_pointer_present_missing_generation_errors() {
+            if skip_if_nonroot() {
+                return;
+            }
+            let (_d, s) = make_storage();
+            let bundle = make_bundle(&s);
+            let generation = bundle.generate().unwrap();
+            let raw_rel = bundle.gen_file_rel(&generation, RAW_PASSWORD_FILE);
+            let pgpass_rel = bundle.gen_file_rel(&generation, PGPASS_FILE);
+            bundle.storage.unlink_descendant(&raw_rel).unwrap();
+            bundle.storage.unlink_descendant(&pgpass_rel).unwrap();
+            let gen_rel = bundle.gen_rel(&generation);
+            bundle.storage.unlink_descendant_dir(&gen_rel).unwrap();
+            let cap: &dyn InstanceSecretCapability = &bundle;
+            let result = cap.read_superuser();
+            assert!(
+                result.is_err(),
+                "pointer-present missing generation must error, not return None"
+            );
         }
 
         #[test]

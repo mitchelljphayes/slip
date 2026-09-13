@@ -246,23 +246,86 @@ jobs:
 
   services-contract:
     name: Services Contract Tests (rootful Podman)
-    runs-on: ubuntu-latest
+    # ubuntu-26.04 is in public preview (no SLA) as of Sep 2026; it is the
+    # only GA-track runner shipping Podman 5.x from the official distro
+    # universe repo. ubuntu-24.04 (current ubuntu-latest) ships Podman 4.9.3,
+    # two major versions behind the macOS dev VM (6.1.1). We accept the
+    # preview caveat because the 4->5 API jump is the critical one and 5.7.0
+    # is close enough to 6.1.1 for Docker-compat contract tests.
+    #
+    # Compatibility matrix (intentional, not exact parity):
+    #   macOS dev VM : Podman 6.1.1, Fedora CoreOS 44, rootful applehv
+    #   CI (here)    : Podman 5.7.0, Ubuntu 26.04,   rootful systemd socket
+    # Both are modern Podman (cgroups v2, SQLite backend, Netavark/Pasta).
+    # The app talks to the Docker-compatible API, not the versioned libpod
+    # REST path, so the /v5.0.0 vs /v6.0.0 path split does not affect tests.
+    # When ubuntu-26.04 reaches GA or Fedora 45 releases, revisit for a
+    # closer match.
+    #
+    # Runner support reference:
+    #   https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2604-Readme.md
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install the pinned toolchain
         run: cargo --version && rustc --version
       - uses: Swatinem/rust-cache@v2
-      - name: Install Podman (if not present)
+      - name: Install Podman from distro apt
         run: |
-          which podman && podman --version && exit 0
-          sudo apt-get update && sudo apt-get install -y podman
+          # Install from the official Ubuntu 26.04 universe repo only.
+          # No PPAs, no static bundles, no source builds, no cross-release
+          # apt mixing (see podman-ci-version-choice.md for rationale).
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y podman
+          fi
+      - name: Verify Podman engine version (pin 5.7.0)
+        run: |
+          # Log the resolved versions for traceability.
+          echo "=== Podman versions ==="
+          podman --version
+          sudo podman --version
+          echo "=== systemd ==="
+          systemctl --version | head -1
+          echo "=== rootful socket unit ==="
+          systemctl cat podman.socket 2>/dev/null | head -5 || true
+
+          # Pin the engine version so a silent distro upgrade cannot drift
+          # the contract test surface. The expected version is the Ubuntu
+          # 26.04 universe package: podman 5.7.0+ds2-3build1.
+          # We assert the engine major.minor.patch is exactly 5.7.0.
+          # The Debian package revision suffix (+ds2-3build1) is not pinned
+          # because it can change without an engine change; the engine
+          # version is the stable contract surface.
+          ver=$(podman --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          if [ -z "$ver" ]; then
+            echo "::error::Could not parse Podman version from: $(podman --version)"
+            exit 1
+          fi
+          if [ "$ver" != "5.7.0" ]; then
+            echo "::error::Podman engine version mismatch: expected 5.7.0, got $ver"
+            echo "::error::A silent upgrade may have drifted the CI Podman. Update the"
+            echo "::error::pin in .github/workflows/ci.yml and the compatibility-matrix"
+            echo "::error::comment after verifying the new version against the macOS dev VM."
+            exit 1
+          fi
+          echo "Podman engine version $ver matches expected 5.7.0"
       - name: Start rootful Podman socket
         run: |
           sudo systemctl enable --now podman.socket
           sudo podman info --format '{{.Host.Security.Rootless}}' || true
-          # Verify the rootful socket is accessible.
-          sudo curl -s --unix-socket /run/podman/podman.sock http://localhost/v5.0.0/libpod/info >/dev/null && echo "rootful Podman socket OK"
+          # Verify the rootful socket is reachable via the Docker-compatible
+          # /_ping endpoint. Do NOT hardcode the versioned libpod API path
+          # (/v5.0.0/libpod/...) because that path changes between Podman
+          # major versions (5.x vs 6.x) and the app uses the Docker compat
+          # API, not the libpod REST surface.
+          if ! sudo curl -sf --unix-socket /run/podman/podman.sock \
+              http://localhost/_ping >/dev/null; then
+            echo "::error::rootful Podman socket did not respond to /_ping"
+            exit 1
+          fi
+          echo "rootful Podman socket OK (Docker-compat /_ping)"
       - name: Run services contract tests
         run: |
           set -o pipefail

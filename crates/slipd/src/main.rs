@@ -15,7 +15,7 @@ use slip_core::{
 };
 use tokio::sync::RwLock;
 
-/// slip deploy daemon — receives webhooks, manages zero-downtime container deploys.
+/// slip deploy daemon: receives webhooks, manages zero-downtime container deploys.
 #[derive(Parser)]
 #[command(name = "slipd", version, about)]
 struct Args {
@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
     // --env-file pre-populates env vars before resolving config placeholders,
     // which only matters in --check mode (the running daemon gets its env vars
     // from its systemd unit). Without --check, the file is parsed but never
-    // used — flag that so an operator doesn't silently expect it to apply.
+    // used; flag that so an operator doesn't silently expect it to apply.
     if args.env_file.is_some() && !args.check {
         tracing::warn!(
             env_file = %args.env_file.as_deref().unwrap_or(""),
@@ -98,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
 
         // Warn-mode: unresolved ${ENV} → warning, exit 0 (the running daemon
         // gets these from its systemd EnvironmentFile; a manual --check
-        // without --env-file should warn, not error — FR §3.10).
+        // without --env-file should warn, not error (FR §3.10).
         match load_config_check(config_path) {
             Ok((cfg, apps, warnings)) => {
                 for w in &warnings {
@@ -203,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(()) => {}
         Err(slip_core::CaddyError::ListenerConflict { server, listener }) => {
             // SLIP-88: Listener conflict is a configuration error, not a transient
-            // failure. Exit with code 78 (EX_CONFIG — sysexits.h) so systemd's
+            // failure. Exit with code 78 (EX_CONFIG, sysexits.h) so systemd's
             // Restart=on-failure does NOT restart (the unit sets
             // RestartPreventExitStatus=78). The user must fix their Caddyfile and
             // restart slipd manually. Using a distinct non-zero code (rather than
@@ -442,7 +442,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Spawn background tasks ────────────────────────────────────────────────
     tokio::spawn(preview_reaper(state.clone()));
 
-    // Service startup ensure (SLIP-106 Part 3) — bounded, non-blocking.
+    // Service startup ensure (SLIP-106 Part 3): bounded, non-blocking.
     // Runs a single ensure pass over all services after startup; the periodic
     // reconcile loop handles ongoing convergence.
     if let Some(ctrl) = &state.services {
@@ -453,7 +453,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("service startup ensure spawned (bounded, non-blocking)");
     }
 
-    // Caddy reconcile loop — self-heals routes, deploy-webhook, and TLS after
+    // Caddy reconcile loop: self-heals routes, deploy-webhook, and TLS after
     // a Caddy restart or missed webhook. Safety net, not the primary update
     // path. Gated behind [caddy.reconcile] (default-on, harmless when no
     // drift). Cancelled via oneshot alongside the HTTP server's graceful
@@ -505,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal)
         .await?;
 
-    // Wait for the reconcile loop to finish (bounded — it should exit promptly
+    // Wait for the reconcile loop to finish (bounded; it should exit promptly
     // once the shutdown oneshot fires, but we cap at 10s to avoid hanging).
     match tokio::time::timeout(Duration::from_secs(10), reconcile_handle).await {
         Ok(Ok(())) => {}
