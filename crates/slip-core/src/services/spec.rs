@@ -1842,7 +1842,12 @@ mod tests {
 
     fn sample_healthcheck() -> crate::runtime::ServiceHealthcheck {
         crate::runtime::ServiceHealthcheck {
-            test_cmd: vec!["pg_isready".into(), "-U".into(), "postgres".into()],
+            test_cmd: vec![
+                "CMD".into(),
+                "pg_isready".into(),
+                "-U".into(),
+                "postgres".into(),
+            ],
             interval_secs: 10,
             timeout_secs: 5,
             retries: 5,
@@ -2017,5 +2022,113 @@ mod tests {
         let rt = FakeRuntime;
         let rootful = rt.is_rootful().await;
         assert!(!rootful, "default is_rootful must be false (fail closed)");
+    }
+
+    // ── Healthcheck exec-form validation ──────────────────────────────────────
+
+    #[test]
+    fn spec_rejects_bare_argv_healthcheck() {
+        // Bare argv without "CMD" discriminator must be rejected at
+        // construction time. Both backends pass test_cmd verbatim, so a
+        // bare argv would produce an invalid healthcheck on the wire.
+        let hc = crate::runtime::ServiceHealthcheck {
+            test_cmd: vec!["pg_isready".into(), "-U".into(), "postgres".into()],
+            interval_secs: 10,
+            timeout_secs: 5,
+            retries: 5,
+            start_period_secs: 30,
+        };
+        let spec = crate::runtime::ServiceContainerSpec::new(
+            "slip-service-pg".to_string(),
+            "slip-service-pg".to_string(),
+            sample_pinned_image(),
+            "slip".to_string(),
+            vec!["pg".to_string()],
+            vec![],
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            hc,
+            crate::runtime::ServiceResourceLimits::default(),
+            crate::runtime::ServiceSecurityOpts::default(),
+        );
+        assert!(spec.is_err(), "bare argv healthcheck must be rejected");
+    }
+
+    #[test]
+    fn spec_rejects_cmd_shell_healthcheck() {
+        // CMD-SHELL runs an untrusted shell string — must never be used
+        // in a managed service healthcheck.
+        let hc = crate::runtime::ServiceHealthcheck {
+            test_cmd: vec!["CMD-SHELL".into(), "pg_isready".into()],
+            interval_secs: 10,
+            timeout_secs: 5,
+            retries: 5,
+            start_period_secs: 30,
+        };
+        let spec = crate::runtime::ServiceContainerSpec::new(
+            "slip-service-pg".to_string(),
+            "slip-service-pg".to_string(),
+            sample_pinned_image(),
+            "slip".to_string(),
+            vec!["pg".to_string()],
+            vec![],
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            hc,
+            crate::runtime::ServiceResourceLimits::default(),
+            crate::runtime::ServiceSecurityOpts::default(),
+        );
+        assert!(spec.is_err(), "CMD-SHELL healthcheck must be rejected");
+    }
+
+    #[test]
+    fn spec_rejects_empty_healthcheck_test_cmd() {
+        let hc = crate::runtime::ServiceHealthcheck {
+            test_cmd: vec![],
+            interval_secs: 10,
+            timeout_secs: 5,
+            retries: 5,
+            start_period_secs: 30,
+        };
+        let spec = crate::runtime::ServiceContainerSpec::new(
+            "slip-service-pg".to_string(),
+            "slip-service-pg".to_string(),
+            sample_pinned_image(),
+            "slip".to_string(),
+            vec!["pg".to_string()],
+            vec![],
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            hc,
+            crate::runtime::ServiceResourceLimits::default(),
+            crate::runtime::ServiceSecurityOpts::default(),
+        );
+        assert!(spec.is_err(), "empty test_cmd must be rejected");
+    }
+
+    #[test]
+    fn spec_rejects_cmd_with_no_arguments() {
+        // "CMD" alone with no command to run is invalid.
+        let hc = crate::runtime::ServiceHealthcheck {
+            test_cmd: vec!["CMD".into()],
+            interval_secs: 10,
+            timeout_secs: 5,
+            retries: 5,
+            start_period_secs: 30,
+        };
+        let spec = crate::runtime::ServiceContainerSpec::new(
+            "slip-service-pg".to_string(),
+            "slip-service-pg".to_string(),
+            sample_pinned_image(),
+            "slip".to_string(),
+            vec!["pg".to_string()],
+            vec![],
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            hc,
+            crate::runtime::ServiceResourceLimits::default(),
+            crate::runtime::ServiceSecurityOpts::default(),
+        );
+        assert!(spec.is_err(), "CMD with no arguments must be rejected");
     }
 }

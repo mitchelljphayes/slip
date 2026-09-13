@@ -76,6 +76,20 @@ pub const PG18_4_REF: &str = "docker.io/library/postgres:18.4-bookworm@sha256:88
 /// connections".
 const PG_CAP_ADD: &[&str] = &["CHOWN", "DAC_OVERRIDE", "SETUID", "SETGID"];
 
+/// The OCI exec-form healthcheck `Test` for the Postgres provider.
+///
+/// This is the exact argv that lands in `HealthConfig.Test` on the wire.
+/// The first element is the Docker/Podman exec-form discriminator `"CMD"`,
+/// followed by the bare `pg_isready` command with no password argument.
+/// Both the Docker and Podman backends pass `ServiceHealthcheck.test_cmd`
+/// verbatim to `HealthConfig.test`, so this constant is the single source
+/// of truth for what the daemon receives.
+///
+/// The contract test (`services_contract.rs`) references this constant to
+/// verify the configured healthcheck matches the known-safe argv.
+pub const PG_HEALTHCHECK_TEST_CMD: &[&str] =
+    &["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"];
+
 /// Subdirectory inside the service data directory that is bind-mounted into
 /// the container at `/var/lib/postgresql`. The data dir root stays 0700
 /// root:root (for `ServiceStorage` and the bootstrap marker); this subdir
@@ -412,13 +426,10 @@ impl PostgresProvider {
         );
 
         let healthcheck = crate::runtime::ServiceHealthcheck {
-            test_cmd: vec![
-                "pg_isready".to_string(),
-                "-U".to_string(),
-                "postgres".to_string(),
-                "-d".to_string(),
-                "postgres".to_string(),
-            ],
+            test_cmd: PG_HEALTHCHECK_TEST_CMD
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             interval_secs: 10,
             timeout_secs: 5,
             retries: 5,
@@ -2512,6 +2523,43 @@ mod tests {
         let dests: Vec<_> = secret_mounts.iter().map(|m| m.dest.as_str()).collect();
         assert!(dests.contains(&"/run/secrets/slip-raw-password"));
         assert!(dests.contains(&"/run/secrets/slip-pgpass"));
+    }
+
+    #[test]
+    fn build_spec_healthcheck_test_is_exec_form_cmd() {
+        // Regression: the healthcheck test_cmd must be valid OCI exec-form,
+        // i.e. the first element must be "CMD" and the full array must
+        // exactly match PG_HEALTHCHECK_TEST_CMD. Both the Docker and Podman
+        // backends pass test_cmd verbatim to HealthConfig.test, so a missing
+        // "CMD" discriminator would produce an invalid healthcheck on the
+        // wire (some daemons silently reinterpret bare argv as CMD-SHELL,
+        // creating a shell-injection surface).
+        let provider = PostgresProvider::new();
+        let image = sample_pinned_image();
+        let labels = BTreeMap::new();
+        let mounts = vec![];
+        let spec = provider
+            .build_spec("pg", &image, "slip", labels, mounts)
+            .unwrap();
+
+        let actual = spec.healthcheck().test_cmd.clone();
+        assert_eq!(
+            actual,
+            PG_HEALTHCHECK_TEST_CMD
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "healthcheck test_cmd must exactly match PG_HEALTHCHECK_TEST_CMD"
+        );
+        assert_eq!(
+            actual[0], "CMD",
+            "test_cmd[0] must be the exec-form discriminator \"CMD\""
+        );
+        // No CMD-SHELL anywhere in the array.
+        assert!(
+            !actual.iter().any(|s| s == "CMD-SHELL"),
+            "CMD-SHELL is untrusted and must never appear in test_cmd"
+        );
     }
 
     // ── Canary: no read_superuser in provider code ───────────────────────────

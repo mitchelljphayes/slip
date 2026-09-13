@@ -46,7 +46,16 @@ pub struct ServiceMount {
 /// OCI healthcheck specification for a service container.
 #[derive(Debug, Clone)]
 pub struct ServiceHealthcheck {
-    /// Command argv (e.g. `["pg_isready", "-U", "postgres", "-d", "postgres"]`).
+    /// OCI exec-form `Test` array as sent to the Docker/Podman `HealthConfig.test`
+    /// field. The first element MUST be the discriminator `"CMD"` (direct exec)
+    /// — never `"CMD-SHELL"` (which runs an untrusted shell string) and never a
+    /// bare argv (which the daemon interprets as `CMD-SHELL` in some versions,
+    /// creating a shell-injection surface). Example:
+    /// `["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]`.
+    ///
+    /// Both backends pass this vector verbatim to `bollard::models::HealthConfig.test`;
+    /// no conversion is performed. The provider is responsible for including the
+    /// `"CMD"` prefix.
     pub test_cmd: Vec<String>,
     /// Time between health checks (seconds).
     pub interval_secs: i64,
@@ -183,6 +192,30 @@ impl ServiceContainerSpec {
                     "service env key '{key}' looks secret-bearing -- use _FILE form or mounted secret"
                 )));
             }
+        }
+        // Validate healthcheck exec-form: test_cmd[0] must be "CMD".
+        // Reject "CMD-SHELL" (untrusted shell string) and bare argv
+        // (which some daemon versions silently reinterpret as CMD-SHELL).
+        // This is a construction-time guard: providers build ServiceHealthcheck
+        // directly, so we enforce the invariant here at the schema boundary.
+        let hc = &healthcheck.test_cmd;
+        if hc.is_empty() {
+            return Err(RuntimeError::Unsupported(
+                "service healthcheck test_cmd must not be empty".to_string(),
+            ));
+        }
+        if hc[0] != "CMD" {
+            return Err(RuntimeError::Unsupported(format!(
+                "service healthcheck test_cmd[0] must be \"CMD\" (exec-form), got {:?} — \
+                 CMD-SHELL and bare argv are rejected",
+                hc[0]
+            )));
+        }
+        if hc.len() < 2 {
+            return Err(RuntimeError::Unsupported(
+                "service healthcheck test_cmd must have at least one argument after \"CMD\""
+                    .to_string(),
+            ));
         }
         Ok(Self {
             name,

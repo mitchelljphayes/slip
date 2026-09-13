@@ -39,7 +39,8 @@ pub use controller::{
 pub use image_ref::{ImageDigest, PinnedImageRef};
 pub use name::{ServiceName, ServiceNameError, validate_service_name};
 pub use postgres::{
-    PG18_4_DIGEST, PG18_4_REF, PostgresProvider, resolve_catalog, resolve_image_for_version,
+    PG_HEALTHCHECK_TEST_CMD, PG18_4_DIGEST, PG18_4_REF, PostgresProvider, resolve_catalog,
+    resolve_image_for_version,
 };
 pub use repository::{ServiceRepository, ServiceRepositoryError, ServiceRow, ServiceStateRow};
 #[cfg(target_os = "linux")]

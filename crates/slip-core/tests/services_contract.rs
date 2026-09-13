@@ -27,7 +27,8 @@
 
 use slip_core::runtime::RuntimeBackend;
 use slip_core::services::{
-    ProviderKind, ServiceController, ServiceName, ServiceSpec, ServiceUsageReader, resolve_catalog,
+    PG_HEALTHCHECK_TEST_CMD, ProviderKind, ServiceController, ServiceName, ServiceSpec,
+    ServiceUsageReader, resolve_catalog,
 };
 
 // ---------------------------------------------------------------------------
@@ -41,19 +42,19 @@ const DIAG_MAX_HEALTH_LOG_ENTRIES: usize = 5;
 /// `pg_isready` output is typically < 100 bytes; this is a generous bound.
 const DIAG_MAX_HEALTH_OUTPUT_BYTES: usize = 512;
 
-/// The expected healthcheck command for the Postgres provider, as configured
-/// in `postgres.rs:414`. This is a fixed, known-safe argv with no password
-/// argument: `["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]`.
+/// The expected healthcheck command for the Postgres provider.
 ///
-/// The formatter compares the container's actual `Config.Healthcheck.Test`
-/// against this constant. If they match, the command and healthcheck output
-/// are echoed (both are secret-free). If they do NOT match, the raw command
-/// and healthcheck output are omitted and an `[UNEXPECTED HEALTHCHECK]`
-/// marker is emitted instead. This prevents a malicious or misconfigured
-/// container from injecting secret-bearing command arguments or healthcheck
-/// output into the diagnostic stream.
-const EXPECTED_HEALTHCHECK_CMD: &[&str] =
-    &["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"];
+/// This is the single source of truth: `PG_HEALTHCHECK_TEST_CMD` in
+/// `services/postgres.rs` defines the exact OCI exec-form `Test` array
+/// (`["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]`), and this
+/// constant is a reference to it. The formatter compares the container's
+/// actual `Config.Healthcheck.Test` against this constant. If they match,
+/// the command and healthcheck output are echoed (both are secret-free). If
+/// they do NOT match, the raw command and healthcheck output are omitted and
+/// an `[UNEXPECTED HEALTHCHECK]` marker is emitted instead. This prevents a
+/// malicious or misconfigured container from injecting secret-bearing command
+/// arguments or healthcheck output into the diagnostic stream.
+const EXPECTED_HEALTHCHECK_CMD: &[&str] = PG_HEALTHCHECK_TEST_CMD;
 
 /// Bounded, secret-safe diagnostic snapshot of a failed container's health.
 ///
