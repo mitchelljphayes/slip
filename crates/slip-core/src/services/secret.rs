@@ -751,7 +751,7 @@ mod _linux {
         ///
         /// Reads `active.gen`, then `validate_bind_source_file` on both files
         /// of that generation (revalidate-then-return). On ambiguous pointer
-        /// errors, the caller must reread — never blind-regenerate.
+        /// errors, the caller must reread; never blind-regenerate.
         pub fn active_secret_mounts(
             &self,
         ) -> Result<crate::services::spec::ActiveSecretMounts, SecretBundleError> {

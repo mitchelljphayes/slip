@@ -1191,8 +1191,8 @@ mod tests {
         let ctrl = test_controller(rt, usage);
 
         // On non-Linux, add will fail at provision (no storage). But the
-        // desired row should be persisted. Let's test that the conflict
-        // path works at least.
+        // desired row should be persisted. This test verifies that the
+        // conflict path works at least.
         let spec = sample_spec("pg");
 
         // On non-Linux this will fail at provision; on Linux without storage
@@ -1365,7 +1365,7 @@ mod tests {
             .await;
 
         // On non-Linux this will fail at the provider.remove stage (no secrets).
-        // But the usage check should pass. Let's verify the error is not a Conflict.
+        // But the usage check should pass. This test verifies the error is not a Conflict.
         #[cfg(not(target_os = "linux"))]
         {
             // The error should be about storage, not about usage.

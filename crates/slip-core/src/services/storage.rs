@@ -10,7 +10,7 @@
 //! - **Safe root open**: `/` is opened with `openat2` using empty resolve
 //!   flags (you cannot confine beneath `/` itself). The configured absolute
 //!   root is then opened as relative components beneath the held `/` FD using
-//!   `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` — ancestor mount crossings are
+//!   `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`. Ancestor mount crossings are
 //!   permitted because the configured root is administrator-controlled and
 //!   commonly lives across a mount boundary (e.g. `/var` on FCOS, a separate
 //!   data volume). Kernel support for the stronger descendant flags is probed
@@ -204,7 +204,7 @@ mod _linux {
     ///
     /// The configured absolute path is administrator-controlled. Omitting
     /// `NO_XDEV` here does not let an unprivileged actor create or adopt a
-    /// UID-0, mode-0700 root or mount a filesystem — those require
+    /// UID-0, mode-0700 root or mount a filesystem; those require
     /// privileges. `from_root_fd` independently `fstat`s the opened object
     /// and requires a real directory, UID 0, and exact mode 0700 before
     /// adoption.
@@ -235,7 +235,7 @@ mod _linux {
     /// with empty resolve flags, then the configured absolute root is opened
     /// as relative components beneath the held `/` FD using
     /// `RESOLVE_BENEATH | NO_SYMLINKS` (without `NO_XDEV`, permitting ancestor
-    /// mount crossings — the configured root is administrator-controlled).
+    /// mount crossings; the configured root is administrator-controlled).
     /// All descendant operations are relative to that held root FD and use
     /// the full `RESOLVE_BENEATH | NO_SYMLINKS | NO_XDEV` so any mount below
     /// the acquired root is rejected.
@@ -287,7 +287,7 @@ mod _linux {
         /// with `RESOLVE_BENEATH | NO_SYMLINKS | NO_XDEV`; `ENOSYS` fails
         /// closed. The configured absolute root is then opened as relative
         /// components beneath the held `/` FD using
-        /// `RESOLVE_BENEATH | NO_SYMLINKS` (without `NO_XDEV`) — ancestor
+        /// `RESOLVE_BENEATH | NO_SYMLINKS` (without `NO_XDEV`). Ancestor
         /// mount crossings are permitted because the configured root is
         /// administrator-controlled and commonly lives across a mount
         /// boundary (e.g. `/var` on FCOS, a separate data volume).
@@ -339,7 +339,7 @@ mod _linux {
 
             // The configured root is absolute. Strip the leading '/' and
             // open the relative remainder beneath the held "/" FD using
-            // ROOT_RESOLVE_FLAGS (without NO_XDEV — ancestor mount crossings
+            // ROOT_RESOLVE_FLAGS (without NO_XDEV; ancestor mount crossings
             // are permitted for the administrator-controlled configured root).
             // If the root IS "/", use slash_fd directly.
             let rel = root
@@ -495,7 +495,7 @@ mod _linux {
             ) {
                 Ok(()) => {}
                 Err(Errno::EXIST) => {
-                    // Already exists — validate below.
+                    // Already exists: validate below.
                 }
                 Err(e) => return Err(map_mkdir_err(e, &self.root_path.join(&child_rel))),
             }
@@ -1697,7 +1697,7 @@ mod _linux {
             let root = d.path().to_path_buf();
             let s = ServiceStorage::new(&root).unwrap();
             // Create a service dir with a pre-existing foreign file at
-            // pgdata position but NO marker — this should Block in the
+            // pgdata position but NO marker; this should Block in the
             // provider, but here we test the storage layer: the foreign
             // file must not be modified.
             s.create_descendant_dir("svc").unwrap();

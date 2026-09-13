@@ -9,13 +9,19 @@
 //!
 //! Missing rootful Podman = CI job FAILURE (not skip).
 //!
-//! Tests cover:
-//! 1. Catalog digest pull + create: exact digest, PG18 mount layout, hardening.
-//! 2. Healthy + DNS: `<name>:5432` from a probe container, authenticated SELECT 1.
-//! 3. Restart: stop then ensure → Ready + sentinel row persists.
-//! 4. Controlled recreation + remove/re-add: retained dir reused, no password regen.
-//! 5. Foreign-container protection: ensure Blocked, zero mutations.
-//! 6. Reboot survival: documented manual gate (not automated here).
+//! The test suite covers catalog digest pull, healthy container provisioning
+//! with DNS and privilege verification, data retention across removal,
+//! ensure-heals for missing containers, foreign-container protection, and
+//! reboot survival (documented as a manual gate).
+//!
+//! ## Fail-only health diagnostics (SLIP-106)
+//!
+//! When a lifecycle test's `ctrl.add()` fails with `ReadinessFailed`, we
+//! emit a bounded, secret-safe diagnostic snapshot of the failed container's
+//! health state BEFORE the fixture `TempDir` unwinds and removes the data.
+//! This is observation-only; it never changes the test outcome, never
+//! panics on its own, and never retries or skips the test. See
+//! [`collect_health_diagnostics`] and [`format_health_diagnostics`] below.
 
 #![cfg(target_os = "linux")]
 
@@ -23,6 +29,284 @@ use slip_core::runtime::RuntimeBackend;
 use slip_core::services::{
     ProviderKind, ServiceController, ServiceName, ServiceSpec, ServiceUsageReader, resolve_catalog,
 };
+
+// ---------------------------------------------------------------------------
+// Fail-only health diagnostics (SLIP-106)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of healthcheck log entries to report (Podman keeps up to 5).
+const DIAG_MAX_HEALTH_LOG_ENTRIES: usize = 5;
+
+/// Maximum length of a single healthcheck output string before truncation.
+/// `pg_isready` output is typically < 100 bytes; this is a generous bound.
+const DIAG_MAX_HEALTH_OUTPUT_BYTES: usize = 512;
+
+/// The expected healthcheck command for the Postgres provider, as configured
+/// in `postgres.rs:414`. This is a fixed, known-safe argv with no password
+/// argument: `["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]`.
+///
+/// The formatter compares the container's actual `Config.Healthcheck.Test`
+/// against this constant. If they match, the command and healthcheck output
+/// are echoed (both are secret-free). If they do NOT match, the raw command
+/// and healthcheck output are omitted and an `[UNEXPECTED HEALTHCHECK]`
+/// marker is emitted instead. This prevents a malicious or misconfigured
+/// container from injecting secret-bearing command arguments or healthcheck
+/// output into the diagnostic stream.
+const EXPECTED_HEALTHCHECK_CMD: &[&str] =
+    &["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"];
+
+/// Bounded, secret-safe diagnostic snapshot of a failed container's health.
+///
+/// **Secret safety**: this struct deliberately excludes `Config.Env` (contains
+/// `POSTGRES_PASSWORD_FILE` path), full `inspect_container` JSON (could
+/// contain env, entrypoint args, mount paths), container logs (could contain
+/// connection strings or password material), process environment
+/// (`/proc/1/environ`), and `.pgpass` file contents.
+///
+/// Included fields (all secret-free):
+///
+/// `container_name` is the `slip-service-<name>` identifier.
+/// `container_status` is `"running"`, `"exited"`, etc.
+/// `exit_code` is the container's last exit code.
+/// `health_status` is `"healthy"`, `"unhealthy"`, etc.
+/// `failing_streak` is the consecutive failure count.
+/// `healthcheck_matches_expected` indicates whether the configured
+/// healthcheck matches the known safe `pg_isready` argv.
+/// `health_log` holds recent `HealthcheckResult` entries (exit_code +
+/// output). `pg_isready` output is a status line like
+/// `"/var/run/postgresql:5432 - no response"`. No secrets.
+#[derive(Debug, Clone)]
+struct HealthDiagnostics {
+    container_name: String,
+    container_status: String,
+    exit_code: Option<i64>,
+    health_status: String,
+    failing_streak: Option<i64>,
+    healthcheck_matches_expected: bool,
+    health_log: Vec<(Option<i64>, String)>,
+}
+
+/// Format a [`HealthDiagnostics`] snapshot into a human-readable, secret-safe
+/// string for stderr emission on test failure.
+///
+/// This is a pure function (no I/O, no async) so it can be unit-tested with
+/// fake data without a Podman runtime.
+///
+/// **Healthcheck output gating**: the healthcheck command and health log
+/// output are only echoed when `healthcheck_matches_expected` is true. If
+/// the container's configured healthcheck does not match
+/// [`EXPECTED_HEALTHCHECK_CMD`], an `[UNEXPECTED HEALTHCHECK]` marker is
+/// emitted and the raw command and health log are omitted. This prevents a
+/// misconfigured or malicious container from injecting secret-bearing
+/// command arguments or healthcheck output into the diagnostic stream.
+fn format_health_diagnostics(d: &HealthDiagnostics) -> String {
+    let mut out = String::with_capacity(1024);
+    out.push('\n');
+    out.push_str("═══════════════════════════════════════════════════════════════\n");
+    out.push_str("  HEALTH DIAGNOSTICS (fail-only, secret-safe, observation-only)\n");
+    out.push_str("═══════════════════════════════════════════════════════════════\n");
+    out.push_str(&format!("  container_name: {}\n", d.container_name));
+    out.push_str(&format!(
+        "  container_status: {} (exit_code={})\n",
+        d.container_status,
+        match d.exit_code {
+            Some(c) => c.to_string(),
+            None => "n/a".to_string(),
+        }
+    ));
+    out.push_str(&format!(
+        "  health_status: {} (failing_streak={})\n",
+        d.health_status,
+        match d.failing_streak {
+            Some(s) => s.to_string(),
+            None => "n/a".to_string(),
+        }
+    ));
+
+    if d.healthcheck_matches_expected {
+        out.push_str(&format!(
+            "  configured_healthcheck_cmd: {:?}\n",
+            EXPECTED_HEALTHCHECK_CMD
+        ));
+    } else {
+        out.push_str(
+            "  configured_healthcheck_cmd: [UNEXPECTED HEALTHCHECK - raw command omitted]\n",
+        );
+    }
+
+    if !d.healthcheck_matches_expected {
+        out.push_str("  health_log: [omitted - unexpected healthcheck, output not trusted]\n");
+    } else if d.health_log.is_empty() {
+        out.push_str("  health_log: (no entries)\n");
+    } else {
+        out.push_str("  health_log (last checks, oldest first):\n");
+        for (i, (exit_code, output)) in d.health_log.iter().enumerate() {
+            out.push_str(&format!(
+                "    [{}] exit_code={} output={:?}\n",
+                i,
+                match exit_code {
+                    Some(c) => c.to_string(),
+                    None => "n/a".to_string(),
+                },
+                output
+            ));
+        }
+    }
+    out.push_str("═══════════════════════════════════════════════════════════════\n");
+    out
+}
+
+/// Truncate a string to at most `max_bytes` bytes, appending `...[truncated]`
+/// if truncation occurred. Truncates at a char boundary to avoid splitting
+/// UTF-8.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[truncated]", &s[..end])
+}
+
+/// Collect a bounded, secret-safe diagnostic snapshot of the container
+/// identified by `service_name`'s container name (`slip-service-<name>`).
+///
+/// Connects to the rootful Podman socket (the same socket the test's
+/// `PodmanBackend` uses) via bollard and inspects the container. All
+/// diagnostic operations are fallible; any error returns a diagnostic
+/// string explaining what was unavailable, but this function **never
+/// panics**.
+///
+/// **Must be called BEFORE the fixture `TempDir` unwinds.** After the
+/// container's data directory is removed, the container may be gone and
+/// inspect will fail.
+///
+/// Returns a formatted string suitable for `eprintln!` on test failure.
+async fn collect_health_diagnostics(service_name: &ServiceName) -> String {
+    let container_name = service_name.container_name();
+
+    // Connect to the rootful Podman socket; same path as the digest test
+    // and the production PodmanBackend::find_socket rootful fallback.
+    let docker = match bollard::Docker::connect_with_unix(
+        "unix:///run/podman/podman.sock",
+        10, // 10s timeout; diagnostics must be fast
+        bollard::API_DEFAULT_VERSION,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            return format!(
+                "\n[health-diagnostics] container={container_name}: \
+                 diagnostic unavailable (socket connect failed): {e}"
+            );
+        }
+    };
+
+    // Inspect by container name; we may not have the ID if add() failed
+    // before returning it.
+    let inspect = match docker.inspect_container(&container_name, None).await {
+        Ok(info) => info,
+        Err(e) => {
+            return format!(
+                "\n[health-diagnostics] container={container_name}: \
+                 diagnostic unavailable (inspect failed): {e}"
+            );
+        }
+    };
+
+    // Extract allowlisted fields only. Each field is independently
+    // defensive; missing fields default to "n/a" or empty.
+    let state = inspect.state.as_ref();
+
+    let container_status = state
+        .and_then(|s| s.status.as_ref())
+        .map(|s| format!("{s:?}").to_lowercase())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let exit_code = state.and_then(|s| s.exit_code);
+
+    let (health_status, failing_streak, health_log) = match state.and_then(|s| s.health.as_ref()) {
+        Some(h) => {
+            let status = h
+                .status
+                .as_ref()
+                .map(|s| format!("{s:?}").to_lowercase())
+                .unwrap_or_else(|| "unknown".to_string());
+            let streak = h.failing_streak;
+            let log = h
+                .log
+                .as_ref()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .rev()
+                        .take(DIAG_MAX_HEALTH_LOG_ENTRIES)
+                        .rev()
+                        .map(|r| {
+                            let output = r.output.as_deref().unwrap_or("").trim();
+                            (
+                                r.exit_code,
+                                truncate_at_char_boundary(output, DIAG_MAX_HEALTH_OUTPUT_BYTES),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            (status, streak, log)
+        }
+        None => ("none".to_string(), None, Vec::new()),
+    };
+
+    // Compare the configured healthcheck command against the known safe
+    // pg_isready argv. If it does not match, the formatter will omit the
+    // raw command and healthcheck output to prevent leaking secret-bearing
+    // arguments from a misconfigured or malicious container.
+    let configured_cmd = inspect
+        .config
+        .as_ref()
+        .and_then(|c| c.healthcheck.as_ref())
+        .and_then(|hc| hc.test.as_ref())
+        .cloned()
+        .unwrap_or_default();
+
+    let healthcheck_matches_expected = configured_cmd.len() == EXPECTED_HEALTHCHECK_CMD.len()
+        && configured_cmd
+            .iter()
+            .zip(EXPECTED_HEALTHCHECK_CMD.iter())
+            .all(|(a, b)| a == b);
+
+    let diagnostics = HealthDiagnostics {
+        container_name,
+        container_status,
+        exit_code,
+        health_status,
+        failing_streak,
+        healthcheck_matches_expected,
+        health_log,
+    };
+
+    format_health_diagnostics(&diagnostics)
+}
+
+/// Run `ctrl.add(spec)`, and on failure collect health diagnostics before
+/// the fixture TempDir unwinds, then panic with the original error.
+///
+/// This preserves the original test failure message while adding the
+/// diagnostic snapshot to stderr. The diagnostic collection itself is
+/// fallible; if it fails, the original error is still surfaced.
+macro_rules! add_with_diagnostics {
+    ($ctrl:expr, $spec:expr, $name:expr) => {{
+        match $ctrl.add($spec).await {
+            Ok(()) => (),
+            Err(e) => {
+                let diag = collect_health_diagnostics(&$name).await;
+                eprintln!("{diag}");
+                panic!("add should succeed: {e}");
+            }
+        }
+    }};
+}
 
 /// Helper: check if rootful Podman is available.
 async fn rootful_podman_available() -> Option<slip_core::PodmanBackend> {
@@ -83,14 +367,14 @@ fn unique_name(prefix: &str) -> ServiceName {
 /// ownership check (`EXPECTED_UID == 0`) is satisfied by the environment.
 ///
 /// The returned TempDir cleans up on drop; the caller must hold it for the
-/// duration of the test (scoped cleanup — no process-global state).
+/// duration of the test (scoped cleanup, no process-global state).
 fn make_services_root() -> tempfile::TempDir {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
     let d = tempfile::tempdir().expect("tempdir for services root");
 
-    // Tighten permissions to 0700 — the exact mode ServiceStorage::new
+    // Tighten permissions to 0700; the exact mode ServiceStorage::new
     // requires. This is a fixture-only adjustment, not a production-storage
     // tolerance: the production validation in verify_dir_identity is
     // unchanged and still rejects 0o755.
@@ -193,7 +477,7 @@ async fn contract_service_add_provisions_healthy_container() {
     )
     .unwrap();
 
-    ctrl.add(spec).await.expect("add should succeed");
+    add_with_diagnostics!(ctrl, spec, name);
 
     // Verify the service is in Ready phase.
     let status = ctrl.status(&name).await.expect("status");
@@ -203,19 +487,18 @@ async fn contract_service_add_provisions_healthy_container() {
         "service should be Ready after provision"
     );
 
-    // Process privilege verification: after readiness, the actual
-    // postgres process (PID 1 inside the container, which is the
-    // entrypoint that gosu'd to postgres) must have:
+    // Process privilege verification. After readiness, the actual postgres
+    // process (PID 1, entrypoint that gosu'd to postgres) must have:
     //   - UID 999 (the postgres user, not root)
     //   - CapEff = 0 (zero effective capabilities)
     //   - CapPrm = 0 (zero permitted capabilities)
     //   - CapAmb = 0 (zero ambient capabilities)
     //   - NoNewPrivs = 1 (no-new-privileges enforced)
     //
-    // This distinguishes EffectiveCaps (the container's configured
-    // capability set for the initial root process) from the actual
-    // running postgres process privileges. The pinned entrypoint uses
-    // gosu to drop to UID 999, which clears capabilities.
+    // This distinguishes EffectiveCaps (the container's configured capability
+    // set for the initial root process) from the actual running postgres
+    // process privileges. The pinned entrypoint uses gosu to drop to UID
+    // 999, which clears capabilities.
     {
         let container_name = format!("slip-service-{}", name.as_str());
         let output = std::process::Command::new("podman")
@@ -338,7 +621,7 @@ async fn contract_service_remove_retains_data() {
         slip_core::services::PostgresConfig {},
     )
     .unwrap();
-    ctrl.add(spec).await.expect("add");
+    add_with_diagnostics!(ctrl, spec, name);
 
     // Get the real generation from status.
     let status = ctrl.status(&name).await.expect("status");
@@ -389,7 +672,7 @@ async fn contract_service_ensure_heals_missing_container() {
         slip_core::services::PostgresConfig {},
     )
     .unwrap();
-    ctrl.add(spec).await.expect("add");
+    add_with_diagnostics!(ctrl, spec, name);
 
     // Get the status to confirm it's Ready.
     let status = ctrl.status(&name).await.expect("status");
@@ -433,7 +716,7 @@ async fn contract_service_ensure_heals_missing_container() {
 /// opaque `WrongMode` inside a 30-second provision test.
 ///
 /// Runs on Linux only (the whole file is `#![cfg(target_os = "linux")]`).
-/// Does NOT require rootful Podman — it only exercises the storage layer,
+/// Does NOT require rootful Podman; it only exercises the storage layer,
 /// which requires uid 0 (the CI environment provides this).
 #[tokio::test]
 #[ignore = "requires Linux + root (CI-only)"]
@@ -441,7 +724,7 @@ async fn contract_fixture_services_root_is_accepted_by_storage() {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    // Skip if not root — ServiceStorage::new requires uid 0 ownership.
+    // Skip if not root; ServiceStorage::new requires uid 0 ownership.
     if rustix::process::getuid().as_raw() != 0 {
         eprintln!("skipping (not root)");
         return;
@@ -450,7 +733,7 @@ async fn contract_fixture_services_root_is_accepted_by_storage() {
     let tmp = make_services_root();
     let root = tmp.path();
 
-    // The root must be mode 0700 — the exact requirement of
+    // The root must be mode 0700; the exact requirement of
     // verify_dir_identity (storage.rs:881).
     let meta = fs::symlink_metadata(root).expect("stat");
     assert_eq!(
@@ -459,7 +742,7 @@ async fn contract_fixture_services_root_is_accepted_by_storage() {
         "fixture root must be 0700 before ServiceStorage::new"
     );
 
-    // The root must be a real directory, not a symlink — openat2 uses
+    // The root must be a real directory, not a symlink. openat2 uses
     // NO_SYMLINKS and would reject a symlink, but we assert here for a
     // clear fixture-only failure message.
     assert!(
@@ -467,11 +750,135 @@ async fn contract_fixture_services_root_is_accepted_by_storage() {
         "fixture root must be a real directory"
     );
 
-    // ServiceStorage::new must succeed — this is the exact construction
+    // ServiceStorage::new must succeed; this is the exact construction
     // the three lifecycle fixtures perform. If this fails, the fixture is
     // broken, not the production code.
     let _storage = slip_core::services::ServiceStorage::new(root)
         .expect("ServiceStorage::new must accept the fixture root");
 
-    // TempDir cleans up on drop — scoped cleanup, no process-global state.
+    // TempDir cleans up on drop; scoped cleanup, no process-global state.
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for the diagnostic formatter (no Podman required)
+// ---------------------------------------------------------------------------
+
+/// Verify the diagnostic formatter produces the expected output with
+/// fake data simulating an unhealthy Postgres container. This tests the
+/// formatting logic only; no Podman, no I/O, no secrets.
+///
+/// The fake healthcheck output mimics real `pg_isready` output:
+/// `"/var/run/postgresql:5432 - no response"` (connection refused). This
+/// is a status line with no password material.
+#[test]
+fn test_format_health_diagnostics_unhealthy() {
+    let d = HealthDiagnostics {
+        container_name: "slip-service-pg-test0".to_string(),
+        container_status: "running".to_string(),
+        exit_code: Some(0),
+        health_status: "unhealthy".to_string(),
+        failing_streak: Some(5),
+        healthcheck_matches_expected: true,
+        health_log: vec![
+            (
+                Some(1),
+                "/var/run/postgresql:5432 - no response".to_string(),
+            ),
+            (
+                Some(1),
+                "/var/run/postgresql:5432 - no response".to_string(),
+            ),
+            (
+                Some(1),
+                "/var/run/postgresql:5432 - no response".to_string(),
+            ),
+        ],
+    };
+
+    let out = format_health_diagnostics(&d);
+
+    // Verify all expected fields are present.
+    assert!(out.contains("HEALTH DIAGNOSTICS"));
+    assert!(out.contains("slip-service-pg-test0"));
+    assert!(out.contains("container_status: running"));
+    assert!(out.contains("exit_code=0"));
+    assert!(out.contains("health_status: unhealthy"));
+    assert!(out.contains("failing_streak=5"));
+    assert!(out.contains("pg_isready"));
+    assert!(out.contains("health_log"));
+    assert!(out.contains("exit_code=1"));
+    assert!(out.contains("no response"));
+    // Verify no secret material is present.
+    assert!(!out.contains("POSTGRES_PASSWORD"));
+    assert!(!out.contains("pgpass"));
+    assert!(!out.contains("Config.Env"));
+    assert!(!out.contains("PASSWORD"));
+}
+
+/// Verify the formatter handles missing fields with n/a markers.
+#[test]
+fn test_format_health_diagnostics_minimal() {
+    let d = HealthDiagnostics {
+        container_name: "slip-service-heal-test1".to_string(),
+        container_status: "exited".to_string(),
+        exit_code: None,
+        health_status: "none".to_string(),
+        failing_streak: None,
+        healthcheck_matches_expected: false,
+        health_log: vec![],
+    };
+
+    let out = format_health_diagnostics(&d);
+
+    assert!(out.contains("exit_code=n/a"));
+    assert!(out.contains("failing_streak=n/a"));
+    assert!(out.contains("[UNEXPECTED HEALTHCHECK"));
+    assert!(out.contains("[omitted"));
+}
+
+/// Verify that an unexpected healthcheck command suppresses the raw
+/// command and health log output, preventing secret-bearing arguments
+/// from reaching the diagnostic stream.
+#[test]
+fn test_format_health_diagnostics_unexpected_command() {
+    let d = HealthDiagnostics {
+        container_name: "slip-service-pg-test2".to_string(),
+        container_status: "running".to_string(),
+        exit_code: Some(0),
+        health_status: "unhealthy".to_string(),
+        failing_streak: Some(3),
+        healthcheck_matches_expected: false,
+        health_log: vec![(Some(1), "db password = s3cr3t".to_string())],
+    };
+
+    let out = format_health_diagnostics(&d);
+
+    // The unexpected marker must be present.
+    assert!(out.contains("[UNEXPECTED HEALTHCHECK"));
+    // The health log must be omitted, not echoed.
+    assert!(out.contains("[omitted"));
+    // The secret-bearing output must NOT appear in the diagnostic stream.
+    assert!(!out.contains("s3cr3t"));
+    assert!(!out.contains("password"));
+}
+
+/// Verify the truncation helper respects char boundaries and appends the
+/// truncation marker.
+#[test]
+fn test_truncate_at_char_boundary() {
+    // Short string; no truncation.
+    assert_eq!(truncate_at_char_boundary("hello", 100), "hello");
+
+    // Exact fit.
+    assert_eq!(truncate_at_char_boundary("hello", 5), "hello");
+
+    // Truncation with marker.
+    let result = truncate_at_char_boundary("hello world", 5);
+    assert_eq!(result, "hello...[truncated]");
+
+    // UTF-8 char boundary safety: "héllo" where é is 2 bytes.
+    // "h" = 1 byte, "é" = 2 bytes (total 3 for "hé"), "l" starts at byte 3.
+    // Truncating at 2 bytes would split é, so we back up to byte 1.
+    let result = truncate_at_char_boundary("héllo world", 2);
+    assert_eq!(result, "h...[truncated]");
 }

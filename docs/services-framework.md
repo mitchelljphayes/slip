@@ -197,7 +197,7 @@ while slipd is down. The reconcile loop is the slipd-restart safety net.
 
 - **Runtime storage**: Linux only (rootful Podman with openat2 support).
   The trusted configured root is acquired with `RESOLVE_BENEATH |
-  NO_SYMLINKS` (ancestor mount crossings permitted — the configured root
+  NO_SYMLINKS` (ancestor mount crossings permitted; the configured root
   is administrator-controlled and commonly lives across `/var` on FCOS or
   on a separate data volume). Every descendant operation uses the full
   `RESOLVE_BENEATH | NO_SYMLINKS | NO_XDEV` so any mount introduced below

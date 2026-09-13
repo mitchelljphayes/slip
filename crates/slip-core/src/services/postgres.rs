@@ -163,7 +163,7 @@ pub fn resolve_image_for_version(
 
 /// Build the ownership label set for a PostgreSQL service container.
 ///
-/// These labels are compared exactly during `ensure` — any mismatch blocks.
+/// These labels are compared exactly during `ensure`; any mismatch blocks.
 fn ownership_labels(
     installation_id: &str,
     instance_id: &str,
@@ -306,7 +306,7 @@ fn container_name(service_name: &str) -> String {
     format!("slip-service-{service_name}")
 }
 
-/// Normalize a repo-digest string for robust comparison.
+/// Normalize a repo-digest string for exact comparison.
 ///
 /// Handles Docker Hub official-image aliases:
 /// - `postgres@sha256:...` → `docker.io/library/postgres@sha256:...`
@@ -381,7 +381,7 @@ fn verify_mounts(
 
 /// PostgreSQL managed-service provider.
 ///
-/// Stateless — all state is in the controller's persisted `ServiceState`.
+/// Stateless: all state is in the controller's persisted `ServiceState`.
 /// The provider composes runtime calls, secret mount tokens, and storage
 /// operations. The controller owns transactions, locking, and generation CAS.
 #[derive(Debug, Clone, Default)]
@@ -517,7 +517,7 @@ impl PostgresProvider {
             ));
         }
 
-        // Networks: must be exactly one (the expected network).
+        // Reject unexpected network attachments to prevent cross-network access.
         if inspect.networks.len() != 1 || inspect.network != ctx.network() {
             return Err(ServiceError::Blocked(
                 svc_name.to_string(),
@@ -533,9 +533,9 @@ impl PostgresProvider {
         //
         // Podman: the inspected alias set must be exactly the
         // caller-expected service alias plus two deterministic
-        // infrastructure aliases derived from the verified
+        // infrastructure aliases. They are derived from the verified
         // daemon-returned container ID and the exact managed
-        // container name:
+        // container name. The two aliases are:
         //   - 12-char short container ID (first 12 hex chars of
         //     inspect.container_id)
         //   - full managed container name (slip-service-{name})
@@ -709,7 +709,7 @@ impl PostgresProvider {
     ) -> Vec<crate::runtime::ServiceMount> {
         // Mount the validated pgdata directory (0755, root:root, descriptor-
         // confined, inode-revalidated). The data dir root (0700 root:root)
-        // holds the bootstrap marker and is never mounted — the container
+        // holds the bootstrap marker and is never mounted; the container
         // cannot resolve or modify `.slip-bootstrap` or `active.gen`.
         vec![
             crate::runtime::ServiceMount {
@@ -762,7 +762,7 @@ impl PostgresProvider {
                     ));
                 }
                 _ => {
-                    // starting or none — keep waiting
+                    // starting or none: keep waiting
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             }
@@ -821,7 +821,7 @@ impl ServiceProvider for PostgresProvider {
         state: &'a ServiceState,
     ) -> crate::services::spec::BoxFuture<'a, Result<ProvisionOutcome, ServiceError>> {
         Box::pin(async move {
-            // Rootful check — fail closed.
+            // Rootful check: fail closed.
             if !ctx.runtime().is_rootful().await {
                 return Err(ServiceError::Blocked(
                     spec.name().as_str().to_string(),
@@ -856,7 +856,7 @@ impl ServiceProvider for PostgresProvider {
             // tokens carry the active generation name which must match.)
 
             // Create host data directory via ServiceStorage (0700 root:root).
-            // Track whether the directory pre-existed — this is critical for
+            // Track whether the directory pre-existed; this is critical for
             // the fail-closed unmarked-data decision below.
             // CRITICAL: No pgdata mutation occurs before marker classification.
             // An unmarked pre-existing service root is left byte-for-byte
@@ -925,7 +925,7 @@ impl ServiceProvider for PostgresProvider {
                             ));
                         }
                         // If marker is complete, the data was already initialized.
-                        // Do NOT return a stale container ID — fall through to
+                        // Do NOT return a stale container ID; fall through to
                         // create a new container (the old one is gone, that's
                         // why provision was called). The existing data directory
                         // and secret are reused.
@@ -936,7 +936,7 @@ impl ServiceProvider for PostgresProvider {
                             );
                             // Fall through to pgdata validation + pull + create + readiness.
                         } else if marker.phase == MarkerPhase::Initializing {
-                            // Marker is initializing — a previous provision
+                            // Marker is initializing: a previous provision
                             // crashed. The data directory may be partially
                             // initialized. We cannot safely re-init over it.
                             // Fail closed: the operator must inspect and clean up.
@@ -963,7 +963,7 @@ impl ServiceProvider for PostgresProvider {
                                 "unmarked pre-existing data directory — refusing to adopt or initialize over potentially foreign data; remove the directory manually if you intend to create a fresh service".to_string(),
                             ));
                         }
-                        // Directory was freshly created — safe to initialize.
+                        // Directory was freshly created: safe to initialize.
                         let marker = BootstrapMarker {
                             installation_id: ctx.installation_id().to_string(),
                             instance_id: state.instance_id().as_str().to_string(),
@@ -1056,7 +1056,7 @@ impl ServiceProvider for PostgresProvider {
             );
 
             // Pull image by exact repo@digest (immutable identity).
-            // Never pull by tag — tag movement can pull unrelated content.
+            // Never pull by tag; tag movement can pull unrelated content.
             let repo_digest = image.repo_digest();
             // Split repo_digest into repo and digest for the pull_image API
             // (which takes image + tag). We pass the repo as image and the
@@ -1109,7 +1109,7 @@ impl ServiceProvider for PostgresProvider {
 
             // Finalize bootstrap marker → complete (mandatory, not best-effort).
             // A crash between readiness and marker finalize leaves an
-            // "initializing" marker which blocks re-provision — the operator
+            // "initializing" marker which blocks re-provision; the operator
             // must inspect. This is the fail-closed behavior.
             #[cfg(target_os = "linux")]
             {
@@ -1123,7 +1123,7 @@ impl ServiceProvider for PostgresProvider {
                     phase: MarkerPhase::Complete,
                 };
                 // Atomic rewrite: write temp + rename + parent fsync.
-                // All steps are mandatory — errors propagate.
+                // All steps are mandatory; errors propagate.
                 let tmp_rel = format!("{}.tmp", marker_rel);
                 // Clean up any stale temp from a prior crash (ignore NotFound).
                 let _ = storage.unlink_descendant(&tmp_rel);
@@ -1140,7 +1140,7 @@ impl ServiceProvider for PostgresProvider {
                         reason: "failed to finalize bootstrap marker".to_string(),
                     })?;
                 // Fsync the parent directory so the rename is durable.
-                // This is mandatory — a failed fsync means the complete
+                // This is mandatory: a failed fsync means the complete
                 // marker may not survive a crash, so we must not claim
                 // successful initialization.
                 let parent_rel = spec.name().as_str();
@@ -1148,7 +1148,7 @@ impl ServiceProvider for PostgresProvider {
                     // The rename succeeded but the fsync failed. The visible
                     // marker is Complete, but the durability barrier was not
                     // achieved. We must not leave a Complete marker after a
-                    // reported failure — a subsequent provision would trust
+                    // reported failure; a subsequent provision would trust
                     // the marker and skip the bootstrap, treating incomplete
                     // durability as complete.
                     //
@@ -1156,7 +1156,7 @@ impl ServiceProvider for PostgresProvider {
                     // (atomic temp+rename) so a retry will Block (fail-closed)
                     // rather than adopt potentially-undurable Complete state.
                     // If the compensation itself fails, we still return the
-                    // original durability error — we never claim success. The
+                    // original durability error; we never claim success. The
                     // error message is honest about residual uncertainty.
                     let init_marker = BootstrapMarker {
                         installation_id: ctx.installation_id().to_string(),
@@ -1170,7 +1170,7 @@ impl ServiceProvider for PostgresProvider {
                     // Best-effort compensation: write Initializing temp,
                     // rename over Complete, fsync parent again. Any failure
                     // here is noted in the error reason but does not change
-                    // the outcome — we always return Err(FilesystemCheck).
+                    // the outcome; we always return Err(FilesystemCheck).
                     let comp_tmp = format!("{}.comp.tmp", marker_rel);
                     let _ = storage.unlink_descendant(&comp_tmp);
                     let comp_reason = match storage
@@ -1268,7 +1268,7 @@ impl ServiceProvider for PostgresProvider {
                                 });
                             }
 
-                            // Not healthy yet — wait for readiness.
+                            // Not healthy yet: wait for readiness.
                             match self
                                 .wait_for_readiness(ctx, cid, Duration::from_secs(60))
                                 .await
@@ -1285,7 +1285,7 @@ impl ServiceProvider for PostgresProvider {
                                 }
                             }
                         } else {
-                            // Container stopped — start it.
+                            // Container stopped: start it.
                             ctx.runtime()
                                 .start_container(cid.as_str())
                                 .await
@@ -1306,7 +1306,7 @@ impl ServiceProvider for PostgresProvider {
                         }
                     }
                     Err(e) if e.to_string().contains("not found") => {
-                        // Persisted container is gone — fall through to
+                        // Persisted container is gone; fall through to
                         // re-provision (controlled recreate from retained
                         // data/secret). The marker and secret are reused;
                         // no regeneration.
@@ -1379,7 +1379,7 @@ impl ServiceProvider for PostgresProvider {
                 let inspect = match inspect_result {
                     Ok(i) => i,
                     Err(e) => {
-                        // Container already gone — idempotent success.
+                        // Container already gone: idempotent success.
                         // Match runtime not-found by checking the error text
                         // (the runtime doesn't have a typed not-found variant).
                         if e.to_string().contains("not found") {
@@ -2359,7 +2359,7 @@ mod tests {
         )
         .unwrap();
 
-        // Wrong labels — different installation.
+        // Wrong labels: different installation.
         let mut labels = BTreeMap::new();
         labels.insert("slip.managed".to_string(), "true".to_string());
         labels.insert("slip.installation".to_string(), "wrong-install".to_string());
@@ -2482,7 +2482,7 @@ mod tests {
             .build_spec("pg", &image, "slip", labels, mounts)
             .unwrap();
         // Port bindings are enforced as empty by construction (the spec
-        // doesn't even have a port field — create_and_start_service uses None).
+        // doesn't even have a port field; create_and_start_service uses None).
         assert!(spec.restart_unless_stopped());
     }
 
@@ -2536,7 +2536,7 @@ mod tests {
         );
     }
 
-    // ── H2: Ownership matrix — each security field tampered → Blocked ───────
+    // ── H2: Ownership matrix, each security field tampered → Blocked ───────
 
     #[tokio::test]
     async fn ensure_blocked_on_privileged_container() {
@@ -2751,7 +2751,7 @@ mod tests {
 
     /// Podman automatically adds the 12-char short container ID and the
     /// full managed container name as network aliases. These deterministic
-    /// infrastructure aliases must be allowed — they are derived from the
+    /// infrastructure aliases must be allowed; they are derived from the
     /// verified daemon-returned container ID and the exact managed
     /// container name, not user-specified.
     #[tokio::test]
@@ -2994,7 +2994,7 @@ mod tests {
             expected_mount_tuples(),
         );
         inspect.backend_name = "podman".to_string();
-        // Missing "pg" — only infra aliases present.
+        // Missing "pg": only infra aliases present.
         let short_cid = &cid.as_str()[..12];
         inspect.network_aliases = vec![
             short_cid.to_string(),
@@ -3045,7 +3045,7 @@ mod tests {
         );
         inspect.backend_name = "podman".to_string();
         let short_cid = &cid.as_str()[..12];
-        // Duplicate "pg" — the alias list has "pg" twice.
+        // Duplicate "pg": the alias list has "pg" twice.
         inspect.network_aliases = vec![
             "pg".to_string(),
             "pg".to_string(), // duplicate
@@ -3295,7 +3295,7 @@ mod tests {
         // cannot construct a PodmanBackend without a socket, we test
         // the validation function directly via the error message.
         // The actual validation is in PodmanBackend::create_and_start_service.
-        // Here we verify the string check logic.
+        // This test verifies the string check logic.
         let source = "/var/tmp:evil";
         assert!(source.contains(':'));
         let dest = "/run/secrets/test";
@@ -3405,7 +3405,7 @@ mod tests {
     async fn remove_idempotent_on_not_found() {
         let rt = RecordingRuntime::new(true);
         let provider = PostgresProvider::new();
-        // Use a state with no container_id — remove should be idempotent.
+        // Use a state with no container_id; remove should be idempotent.
         let state = sample_state("pg");
         let mounts = sample_mounts();
         let secrets = FakeInstanceSecrets::with_mounts(state.instance_id().clone(), mounts.clone());
@@ -3612,7 +3612,7 @@ mod tests {
 
         #[tokio::test]
         async fn fresh_directory_initialization_compiles() {
-            // Placeholder — full provision path is tested via CI contract.
+            // Placeholder: full provision path is tested via CI contract.
         }
 
         #[tokio::test]
@@ -3653,7 +3653,7 @@ mod tests {
                 }
                 ServiceError::FilesystemCheck { .. } => {
                     // On non-root, storage ops fail with FilesystemCheck.
-                    // This is acceptable — the test environment doesn't support
+                    // This is acceptable: the test environment doesn't support
                     // the required UID checks.
                 }
                 other => panic!("expected Blocked, got {other:?}"),
@@ -3665,7 +3665,7 @@ mod tests {
             // Regression test: parent-directory fsync failure during marker
             // finalization must propagate as an error (not Ok/Ready), the
             // error must be closed/redacted (no host paths), and the marker
-            // state must remain safe (initializing, not complete — so a
+            // state must remain safe (initializing, not complete; so a
             // retry will Block, not adopt foreign data).
             //
             // This test requires root + Linux. It uses the test-only
@@ -3740,7 +3740,7 @@ mod tests {
             let ctx = make_provider_ctx(&rt, &storage, &state, &secrets);
             let result = provider.provision(&ctx, &spec, &state).await;
 
-            // The provision must fail — fsync failure must not be swallowed.
+            // The provision must fail: fsync failure must not be swallowed.
             assert!(
                 result.is_err(),
                 "provision must not succeed when marker fsync fails"
@@ -3750,7 +3750,7 @@ mod tests {
             // The error must be FilesystemCheck (not ProvisionFailed or Ok).
             match &err {
                 ServiceError::FilesystemCheck { reason, .. } => {
-                    // The error message must be closed — no absolute host paths,
+                    // The error message must be closed: no absolute host paths,
                     // no generation directories, no daemon internals.
                     assert!(
                         !reason.contains("/"),
@@ -3770,7 +3770,7 @@ mod tests {
                 }
             }
 
-            // Verify the marker is NOT complete — the compensating restore
+            // Verify the marker is NOT complete; the compensating restore
             // should have replaced the Complete marker with Initializing.
             // A complete marker would mean we claimed successful
             // initialization despite fsync failure.
@@ -3952,15 +3952,15 @@ mod tests {
             let ctx = make_provider_ctx(&rt, &storage, &state, &secrets);
             let result = provider.provision(&ctx, &spec, &state).await;
 
-            // Should NOT be Blocked with "unmarked pre-existing" — the
+            // Should NOT be Blocked with "unmarked pre-existing"; the
             // Complete marker should allow re-provision.
             match &result {
                 Ok(_) => {
-                    // Provision succeeded — data was reused.
+                    // Provision succeeded: data was reused.
                 }
                 Err(ServiceError::Blocked(_, reason)) => {
                     // If blocked, it must NOT be the "unmarked pre-existing"
-                    // reason — the Complete marker was found and validated.
+                    // reason; the Complete marker was found and validated.
                     assert!(
                         !reason.contains("unmarked pre-existing"),
                         "should not block on unmarked pre-existing when Complete marker exists: {reason}"
@@ -4004,7 +4004,7 @@ mod tests {
             let state = sample_state("pg");
             let mounts = sample_mounts();
 
-            // Inject fsync failure on every call to the service dir —
+            // Inject fsync failure on every call to the service dir;
             // both the original finalize and the compensating restore.
             let svc_name = spec.name().as_str().to_string();
             storage.set_fsync_fault_hook(move |rel: &str| {
@@ -4051,7 +4051,7 @@ mod tests {
             let ctx = make_provider_ctx(&rt, &storage, &state, &secrets);
             let result = provider.provision(&ctx, &spec, &state).await;
 
-            // Must fail — never claim success after fsync failure.
+            // Must fail: never claim success after fsync failure.
             assert!(
                 result.is_err(),
                 "provision must not succeed when fsync fails (even if compensation also fails)"

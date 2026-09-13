@@ -952,7 +952,7 @@ impl RuntimeBackend for PodmanBackend {
             // structured Mounts array. On SELinux-enforcing hosts (e.g.
             // Fedora CoreOS), bind-mounted files without ":Z" get the
             // host's SELinux label and are inaccessible to the container
-            // process — causing "Permission denied" on secret/data reads.
+            // process, causing "Permission denied" on secret/data reads.
             // ":Z" tells Podman to relabel the mount source with
             // container_file_t (private to this container). This is
             // Podman-specific; the Docker backend uses the structured
@@ -1211,7 +1211,7 @@ impl RuntimeBackend for PodmanBackend {
             let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
 
             // Use the daemon-returned full container ID. Require it to
-            // be present and valid — do NOT fall back to the caller-supplied
+            // be present and valid; do NOT fall back to the caller-supplied
             // argument. A missing daemon ID is a hard error.
             let daemon_id = info.id.clone().ok_or_else(|| {
                 RuntimeError::ContainerError(

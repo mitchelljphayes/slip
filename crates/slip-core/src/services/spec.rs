@@ -866,7 +866,7 @@ fn canonicalize_value(value: serde_json::Value) -> serde_json::Value {
 /// receives validated bind-source file tokens (canonical host paths) for the
 /// active `raw_password` and `pgpass` files, plus the non-secret generation
 /// name for ownership-label comparison. The provider never sees plaintext
-/// secret material — it mounts these files into the container.
+/// secret material; it mounts these files into the container.
 ///
 /// On non-Linux (or when the bundle has no active generation), the capability
 /// returns `Unsupported`.
