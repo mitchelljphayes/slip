@@ -46,14 +46,15 @@ const DIAG_MAX_HEALTH_OUTPUT_BYTES: usize = 512;
 ///
 /// This is the single source of truth: `PG_HEALTHCHECK_TEST_CMD` in
 /// `services/postgres.rs` defines the exact OCI exec-form `Test` array
-/// (`["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]`), and this
-/// constant is a reference to it. The formatter compares the container's
-/// actual `Config.Healthcheck.Test` against this constant. If they match,
-/// the command and healthcheck output are echoed (both are secret-free). If
-/// they do NOT match, the raw command and healthcheck output are omitted and
-/// an `[UNEXPECTED HEALTHCHECK]` marker is emitted instead. This prevents a
-/// malicious or misconfigured container from injecting secret-bearing command
-/// arguments or healthcheck output into the diagnostic stream.
+/// (`["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d",
+/// "postgres"]`), and this constant is a reference to it. The formatter
+/// compares the container's actual `Config.Healthcheck.Test` against this
+/// constant. If they match, the command and healthcheck output are echoed
+/// (both are secret-free). If they do NOT match, the raw command and
+/// healthcheck output are omitted and an `[UNEXPECTED HEALTHCHECK]` marker
+/// is emitted instead. This prevents a malicious or misconfigured container
+/// from injecting secret-bearing command arguments or healthcheck output
+/// into the diagnostic stream.
 const EXPECTED_HEALTHCHECK_CMD: &[&str] = PG_HEALTHCHECK_TEST_CMD;
 
 /// Bounded, secret-safe diagnostic snapshot of a failed container's health.
@@ -74,8 +75,8 @@ const EXPECTED_HEALTHCHECK_CMD: &[&str] = PG_HEALTHCHECK_TEST_CMD;
 /// `healthcheck_matches_expected` indicates whether the configured
 /// healthcheck matches the known safe `pg_isready` argv.
 /// `health_log` holds recent `HealthcheckResult` entries (exit_code +
-/// output). `pg_isready` output is a status line like
-/// `"/var/run/postgresql:5432 - no response"`. No secrets.
+/// output). `pg_isready` output with `-h 127.0.0.1` is a status line like
+/// `"127.0.0.1:5432 - no response"` (TCP probe, not socket). No secrets.
 #[derive(Debug, Clone)]
 struct HealthDiagnostics {
     container_name: String,
@@ -768,8 +769,8 @@ async fn contract_fixture_services_root_is_accepted_by_storage() {
 /// fake data simulating an unhealthy Postgres container. This tests the
 /// formatting logic only; no Podman, no I/O, no secrets.
 ///
-/// The fake healthcheck output mimics real `pg_isready` output:
-/// `"/var/run/postgresql:5432 - no response"` (connection refused). This
+/// The fake healthcheck output mimics real `pg_isready -h 127.0.0.1` output:
+/// `"127.0.0.1:5432 - no response"` (TCP connection refused). This
 /// is a status line with no password material.
 #[test]
 fn test_format_health_diagnostics_unhealthy() {
@@ -781,18 +782,9 @@ fn test_format_health_diagnostics_unhealthy() {
         failing_streak: Some(5),
         healthcheck_matches_expected: true,
         health_log: vec![
-            (
-                Some(1),
-                "/var/run/postgresql:5432 - no response".to_string(),
-            ),
-            (
-                Some(1),
-                "/var/run/postgresql:5432 - no response".to_string(),
-            ),
-            (
-                Some(1),
-                "/var/run/postgresql:5432 - no response".to_string(),
-            ),
+            (Some(1), "127.0.0.1:5432 - no response".to_string()),
+            (Some(1), "127.0.0.1:5432 - no response".to_string()),
+            (Some(1), "127.0.0.1:5432 - no response".to_string()),
         ],
     };
 

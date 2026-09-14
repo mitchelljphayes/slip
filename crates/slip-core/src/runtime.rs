@@ -47,11 +47,11 @@ pub struct ServiceMount {
 #[derive(Debug, Clone)]
 pub struct ServiceHealthcheck {
     /// OCI exec-form `Test` array as sent to the Docker/Podman `HealthConfig.test`
-    /// field. The first element MUST be the discriminator `"CMD"` (direct exec)
-    /// — never `"CMD-SHELL"` (which runs an untrusted shell string) and never a
+    /// field. The first element MUST be the discriminator `"CMD"` (direct exec),
+    /// never `"CMD-SHELL"` (which runs an untrusted shell string) and never a
     /// bare argv (which the daemon interprets as `CMD-SHELL` in some versions,
     /// creating a shell-injection surface). Example:
-    /// `["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]`.
+    /// `["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "postgres"]`.
     ///
     /// Both backends pass this vector verbatim to `bollard::models::HealthConfig.test`;
     /// no conversion is performed. The provider is responsible for including the
@@ -206,7 +206,7 @@ impl ServiceContainerSpec {
         }
         if hc[0] != "CMD" {
             return Err(RuntimeError::Unsupported(format!(
-                "service healthcheck test_cmd[0] must be \"CMD\" (exec-form), got {:?} — \
+                "service healthcheck test_cmd[0] must be \"CMD\" (exec-form), got {:?}; \
                  CMD-SHELL and bare argv are rejected",
                 hc[0]
             )));

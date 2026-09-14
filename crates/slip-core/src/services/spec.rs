@@ -2056,7 +2056,7 @@ mod tests {
 
     #[test]
     fn spec_rejects_cmd_shell_healthcheck() {
-        // CMD-SHELL runs an untrusted shell string — must never be used
+        // CMD-SHELL runs an untrusted shell string; must never be used
         // in a managed service healthcheck.
         let hc = crate::runtime::ServiceHealthcheck {
             test_cmd: vec!["CMD-SHELL".into(), "pg_isready".into()],

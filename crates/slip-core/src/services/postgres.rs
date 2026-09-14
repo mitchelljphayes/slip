@@ -80,15 +80,36 @@ const PG_CAP_ADD: &[&str] = &["CHOWN", "DAC_OVERRIDE", "SETUID", "SETGID"];
 ///
 /// This is the exact argv that lands in `HealthConfig.Test` on the wire.
 /// The first element is the Docker/Podman exec-form discriminator `"CMD"`,
-/// followed by the bare `pg_isready` command with no password argument.
+/// followed by `pg_isready` with explicit `-h 127.0.0.1` to probe the TCP
+/// application port (default 5432), matching the authenticated readiness
+/// probe (`psql -h 127.0.0.1 -U postgres -d postgres`). No password argument.
+///
+/// **Why `-h 127.0.0.1` matters**: without `-h`, `pg_isready` defaults to the
+/// Unix domain socket at `/var/run/postgresql/.s.PGSQL.5432`. The postgres
+/// entrypoint starts a temporary socket-only initdb server before the
+/// real TCP application server is ready. A socket-only healthcheck reports
+/// "accepting connections" while the TCP endpoint is not yet listening,
+/// causing the container to be marked healthy prematurely. By explicitly
+/// probing `127.0.0.1:5432` over TCP, the healthcheck only passes when the
+/// application server is actually accepting network connections, aligning
+/// it with the authenticated `psql` readiness probe.
+///
 /// Both the Docker and Podman backends pass `ServiceHealthcheck.test_cmd`
 /// verbatim to `HealthConfig.test`, so this constant is the single source
 /// of truth for what the daemon receives.
 ///
 /// The contract test (`services_contract.rs`) references this constant to
 /// verify the configured healthcheck matches the known-safe argv.
-pub const PG_HEALTHCHECK_TEST_CMD: &[&str] =
-    &["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"];
+pub const PG_HEALTHCHECK_TEST_CMD: &[&str] = &[
+    "CMD",
+    "pg_isready",
+    "-h",
+    "127.0.0.1",
+    "-U",
+    "postgres",
+    "-d",
+    "postgres",
+];
 
 /// Subdirectory inside the service data directory that is bind-mounted into
 /// the container at `/var/lib/postgresql`. The data dir root stays 0700
@@ -2559,6 +2580,46 @@ mod tests {
         assert!(
             !actual.iter().any(|s| s == "CMD-SHELL"),
             "CMD-SHELL is untrusted and must never appear in test_cmd"
+        );
+    }
+
+    #[test]
+    fn build_spec_healthcheck_probes_tcp_not_socket() {
+        // The healthcheck must probe TCP (127.0.0.1:5432), not the Unix
+        // socket. Without -h, pg_isready defaults to the socket, which is
+        // accepting connections during the temporary initdb phase before
+        // the real TCP application server is ready. This would mark the
+        // container healthy prematurely, diverging from the authenticated
+        // readiness probe (psql -h 127.0.0.1).
+        let provider = PostgresProvider::new();
+        let image = sample_pinned_image();
+        let labels = BTreeMap::new();
+        let mounts = vec![];
+        let spec = provider
+            .build_spec("pg", &image, "slip", labels, mounts)
+            .unwrap();
+
+        let test_cmd = &spec.healthcheck().test_cmd;
+
+        // Must contain "-h" followed by "127.0.0.1".
+        let has_tcp = test_cmd
+            .windows(2)
+            .any(|w| w[0] == "-h" && w[1] == "127.0.0.1");
+        assert!(
+            has_tcp,
+            "healthcheck must include `-h 127.0.0.1` to probe TCP, not the socket"
+        );
+
+        // Must still preserve "CMD" as the first element.
+        assert_eq!(
+            test_cmd[0], "CMD",
+            "CMD discriminator must be preserved when adding -h"
+        );
+
+        // The pg_isready command itself must be present.
+        assert!(
+            test_cmd.contains(&"pg_isready".to_string()),
+            "pg_isready must be in the healthcheck command"
         );
     }
 
