@@ -252,6 +252,7 @@ fn test_context(client: CaddyClient, app: &str, domain: &str, port: u16) -> Reco
         listen_addr: "127.0.0.1:7890".to_string(),
         acme_email: None,
         acme_ca: None,
+        services: None,
     }
 }
 
@@ -514,6 +515,7 @@ async fn tls_policies_foreign_survive_reconcile_cycles_on_real_caddy() {
         listen_addr: "127.0.0.1:7890".to_string(),
         acme_email: None,
         acme_ca: None,
+        services: None,
     };
     let backoff = default_backoff();
 
@@ -634,6 +636,7 @@ async fn tls_deploy_tailscale_policy_remains_present_on_real_caddy() {
         listen_addr: "127.0.0.1:7890".to_string(),
         acme_email: None,
         acme_ca: None,
+        services: None,
     };
     let backoff = default_backoff();
     for cycle in 1..=2 {

@@ -87,5 +87,8 @@ rustls-pki-types = "1"
 # default-features=false to avoid pulling in aws-lc-sys
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 
+# Linux syscall bindings (descriptor-confined service storage, SLIP-106 Part 2)
+rustix = { version = "1.1", features = ["fs", "process"] }
+
 # Shared crate
 slip-core = { path = "crates/slip-core" }

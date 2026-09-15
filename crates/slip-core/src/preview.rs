@@ -3561,6 +3561,7 @@ enabled = true
             preview_locks: DashMap::new(),
             renew_locks: DashMap::new(),
             secrets_store: crate::secrets::SecretsStore::new(secrets_path).unwrap(),
+            services: None,
         })
     }
 

@@ -224,8 +224,32 @@ enum ServerCommands {
 
 #[derive(Subcommand)]
 enum ServicesCommands {
+    /// Add a managed service.
+    Add {
+        /// Service provider (e.g. "postgres").
+        provider: String,
+        /// Major version (e.g. "18").
+        #[arg(long, default_value = "18")]
+        version: String,
+        /// Service name (defaults to the provider name).
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// List registered services.
     List,
+    /// Show service status.
+    Status {
+        /// Service name (omit for all services).
+        name: Option<String>,
+    },
+    /// Remove a managed service.
+    Rm {
+        /// Service name.
+        name: String,
+        /// Bypass active-binding refusal (data and secrets are still retained).
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1930,6 +1954,397 @@ struct TlsRenewResultJson {
     elapsed_ms: u64,
 }
 
+// ─── Service command handlers (SLIP-106 Part 3) ──────────────────────────────
+
+/// Response structs for service API calls.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct ServiceResponseDto {
+    schema: String,
+    name: String,
+    provider: String,
+    version: String,
+    phase: String,
+    #[serde(default)]
+    health: Option<String>,
+    /// Generation from the server (non-secret operational integer).
+    #[serde(default)]
+    generation: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct ServiceListResponseDto {
+    #[allow(dead_code)]
+    schema: String,
+    services: Vec<ServiceResponseDto>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct ServiceDeleteResponseDto {
+    schema: String,
+    removed: bool,
+    retained: ServiceRetainedDto,
+    affected_apps: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct ServiceRetainedDto {
+    data: bool,
+    secrets: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+struct ServiceErrorDto {
+    error: ServiceErrorBodyDto,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+struct ServiceErrorBodyDto {
+    code: String,
+    message: String,
+    #[serde(default)]
+    remedy: Option<String>,
+}
+
+/// `slip services add <provider> [--version <v>] [--name <n>]`
+async fn services_add(
+    server: &str,
+    token: &str,
+    provider: &str,
+    version: &str,
+    name: &str,
+    json: bool,
+) {
+    let client = create_client();
+    let endpoint = format!("{server}/v1/services");
+    let body = serde_json::json!({
+        "name": name,
+        "provider": provider,
+        "version": version,
+    });
+
+    let resp = match api_request(
+        &client,
+        reqwest::Method::POST,
+        &endpoint,
+        token,
+        Some(&serde_json::to_value(&body).unwrap()),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("{e}");
+            if msg.contains("401") || msg.contains("403") {
+                output::fail(
+                    output::AUTH,
+                    "auth failed",
+                    "check your admin token (--token or SLIP_TOKEN)",
+                );
+            }
+            if msg.contains("409") {
+                output::fail(
+                    output::GENERIC,
+                    &format!("service '{name}' already exists with a different spec"),
+                    "remove it first: `slip services rm {name}`",
+                );
+            }
+            if msg.contains("400") {
+                output::fail(
+                    output::USAGE,
+                    &format!("invalid service request for '{name}'"),
+                    "check provider and version (e.g. `slip services add postgres --version 18`)",
+                );
+            }
+            if msg.contains("HTTP request failed") {
+                output::fail(
+                    output::GENERIC,
+                    &format!("can't reach slipd at {server} — is it running?"),
+                    "run `slip link` to confirm the server address",
+                );
+            }
+            output::fail(output::GENERIC, &msg, "check slipd logs for details");
+        }
+    };
+
+    if json {
+        let body: ServiceResponseDto = resp.json().await.unwrap_or_else(|_| {
+            output::fail(
+                output::GENERIC,
+                "failed to parse service response",
+                "the server may be running an older version",
+            );
+        });
+        println!("{}", serde_json::to_string_pretty(&body).unwrap());
+    } else {
+        let body: ServiceResponseDto = resp.json().await.unwrap_or_else(|_| {
+            output::fail(
+                output::GENERIC,
+                "failed to parse service response",
+                "the server may be running an older version",
+            );
+        });
+        println!("✓ service '{}' added", body.name);
+        println!("  provider: {}", body.provider);
+        println!("  version:  {}", body.version);
+        println!("  phase:    {}", body.phase);
+        if let Some(h) = &body.health {
+            println!("  health:   {h}");
+        }
+    }
+}
+
+/// `slip services list`
+async fn services_list(server: &str, token: &str, json: bool) {
+    let client = create_client();
+    let endpoint = format!("{server}/v1/services");
+
+    let resp = match api_request(&client, reqwest::Method::GET, &endpoint, token, None).await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("{e}");
+            if msg.contains("401") || msg.contains("403") {
+                output::fail(
+                    output::AUTH,
+                    "auth failed",
+                    "check your admin token (--token or SLIP_TOKEN)",
+                );
+            }
+            if msg.contains("HTTP request failed") {
+                output::fail(
+                    output::GENERIC,
+                    &format!("can't reach slipd at {server} — is it running?"),
+                    "run `slip link` to confirm the server address",
+                );
+            }
+            output::fail(output::GENERIC, &msg, "check slipd logs for details");
+        }
+    };
+
+    let body: ServiceListResponseDto = resp.json().await.unwrap_or_else(|_| {
+        output::fail(
+            output::GENERIC,
+            "failed to parse service list response",
+            "the server may be running an older version",
+        );
+    });
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body).unwrap());
+    } else if body.services.is_empty() {
+        println!("no services registered");
+    } else {
+        println!(
+            "{:<20} {:<10} {:<10} {:<12} HEALTH",
+            "NAME", "PROVIDER", "VERSION", "PHASE"
+        );
+        for svc in &body.services {
+            println!(
+                "{:<20} {:<10} {:<10} {:<12} {}",
+                svc.name,
+                svc.provider,
+                svc.version,
+                svc.phase,
+                svc.health.as_deref().unwrap_or("-")
+            );
+        }
+    }
+}
+
+/// `slip services status [name]`
+async fn services_status(server: &str, token: &str, name: Option<&str>, json: bool) {
+    let client = create_client();
+    let endpoint = match name {
+        Some(n) => format!("{server}/v1/services/{n}"),
+        None => format!("{server}/v1/services"),
+    };
+
+    let resp = match api_request(&client, reqwest::Method::GET, &endpoint, token, None).await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("{e}");
+            if msg.contains("401") || msg.contains("403") {
+                output::fail(
+                    output::AUTH,
+                    "auth failed",
+                    "check your admin token (--token or SLIP_TOKEN)",
+                );
+            }
+            if msg.contains("404") {
+                output::fail(
+                    output::NOT_FOUND,
+                    &format!("service '{}' not found", name.unwrap_or("")),
+                    "run `slip services list` to see registered services",
+                );
+            }
+            if msg.contains("HTTP request failed") {
+                output::fail(
+                    output::GENERIC,
+                    &format!("can't reach slipd at {server} — is it running?"),
+                    "run `slip link` to confirm the server address",
+                );
+            }
+            output::fail(output::GENERIC, &msg, "check slipd logs for details");
+        }
+    };
+
+    if name.is_some() {
+        let body: ServiceResponseDto = resp.json().await.unwrap_or_else(|_| {
+            output::fail(
+                output::GENERIC,
+                "failed to parse service response",
+                "the server may be running an older version",
+            );
+        });
+        if json {
+            println!("{}", serde_json::to_string_pretty(&body).unwrap());
+        } else {
+            println!("name:     {}", body.name);
+            println!("provider: {}", body.provider);
+            println!("version:  {}", body.version);
+            println!("phase:    {}", body.phase);
+            if let Some(h) = &body.health {
+                println!("health:   {h}");
+            }
+        }
+    } else {
+        // List all.
+        let body: ServiceListResponseDto = resp.json().await.unwrap_or_else(|_| {
+            output::fail(
+                output::GENERIC,
+                "failed to parse service list response",
+                "the server may be running an older version",
+            );
+        });
+        if json {
+            println!("{}", serde_json::to_string_pretty(&body).unwrap());
+        } else if body.services.is_empty() {
+            println!("no services registered");
+        } else {
+            println!(
+                "{:<20} {:<10} {:<10} {:<12} HEALTH",
+                "NAME", "PROVIDER", "VERSION", "PHASE"
+            );
+            for svc in &body.services {
+                println!(
+                    "{:<20} {:<10} {:<10} {:<12} {}",
+                    svc.name,
+                    svc.provider,
+                    svc.version,
+                    svc.phase,
+                    svc.health.as_deref().unwrap_or("-")
+                );
+            }
+        }
+    }
+}
+
+/// `slip services rm <name> [--force]`
+async fn services_rm(server: &str, token: &str, name: &str, force: bool, json: bool) {
+    let client = create_client();
+
+    // Step 1: GET the service to obtain the current generation (CAS guard).
+    let get_endpoint = format!("{server}/v1/services/{name}");
+    let get_resp =
+        match api_request(&client, reqwest::Method::GET, &get_endpoint, token, None).await {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("{e}");
+                if msg.contains("401") || msg.contains("403") {
+                    output::fail(
+                        output::AUTH,
+                        "auth failed",
+                        "check your admin token (--token or SLIP_TOKEN)",
+                    );
+                }
+                if msg.contains("404") {
+                    output::fail(
+                        output::NOT_FOUND,
+                        &format!("service '{name}' not found"),
+                        "run `slip services list` to see registered services",
+                    );
+                }
+                output::fail(output::GENERIC, &msg, "check slipd logs for details");
+            }
+        };
+
+    let svc: ServiceResponseDto = get_resp.json().await.unwrap_or_else(|_| {
+        output::fail(
+            output::GENERIC,
+            "failed to parse service response",
+            "the server may be running an older version",
+        );
+    });
+
+    // Extract the generation from the server response.
+    let generation = svc.generation.unwrap_or_else(|| {
+        output::fail(
+            output::GENERIC,
+            &format!("server did not return generation for service '{name}'"),
+            "the server may be running an older version that doesn't support generation",
+        );
+    });
+
+    // Step 2: DELETE with the real generation.
+    let endpoint = format!("{server}/v1/services/{name}?generation={generation}&force={force}");
+
+    let resp = match api_request(&client, reqwest::Method::DELETE, &endpoint, token, None).await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("{e}");
+            if msg.contains("401") || msg.contains("403") {
+                output::fail(
+                    output::AUTH,
+                    "auth failed",
+                    "check your admin token (--token or SLIP_TOKEN)",
+                );
+            }
+            if msg.contains("404") {
+                output::fail(
+                    output::NOT_FOUND,
+                    &format!("service '{name}' not found"),
+                    "run `slip services list` to see registered services",
+                );
+            }
+            if msg.contains("409") {
+                output::fail(
+                    output::GENERIC,
+                    &format!(
+                        "cannot remove service '{name}': conflict (generation may be stale or active bindings exist)"
+                    ),
+                    "re-run `slip services status {name}` to get the current generation, or use --force to override active bindings",
+                );
+            }
+            output::fail(output::GENERIC, &msg, "check slipd logs for details");
+        }
+    };
+
+    let body: ServiceDeleteResponseDto = resp.json().await.unwrap_or_else(|_| {
+        output::fail(
+            output::GENERIC,
+            "failed to parse service delete response",
+            "the server may be running an older version",
+        );
+    });
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&body).unwrap());
+    } else {
+        println!("✓ service '{}' removed", name);
+        println!("  container removed; data and bootstrap secret retained at the server");
+        if !body.affected_apps.is_empty() {
+            println!("  affected apps: {}", body.affected_apps.join(", "));
+        }
+        if body.retained.data {
+            println!("  data retained: yes");
+        }
+        if body.retained.secrets {
+            println!("  secrets retained: yes");
+        }
+    }
+}
+
 /// `slip status [app]` — show daemon or per-app status.
 ///
 /// - With an app name: calls `GET /v1/apps/{name}/status` and renders a
@@ -3059,8 +3474,30 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Services(command) => match command {
+            ServicesCommands::Add {
+                provider,
+                version,
+                name,
+            } => {
+                let token = resolve_token(cli.token.clone());
+                let server = resolve_server(&cli.server);
+                let svc_name = name.unwrap_or_else(|| provider.clone());
+                services_add(&server, &token, &provider, &version, &svc_name, cli.json).await;
+            }
             ServicesCommands::List => {
-                output::not_implemented("services list", cli.json);
+                let token = resolve_token(cli.token.clone());
+                let server = resolve_server(&cli.server);
+                services_list(&server, &token, cli.json).await;
+            }
+            ServicesCommands::Status { name } => {
+                let token = resolve_token(cli.token.clone());
+                let server = resolve_server(&cli.server);
+                services_status(&server, &token, name.as_deref(), cli.json).await;
+            }
+            ServicesCommands::Rm { name, force } => {
+                let token = resolve_token(cli.token.clone());
+                let server = resolve_server(&cli.server);
+                services_rm(&server, &token, &name, force, cli.json).await;
             }
         },
         Commands::Registry(command) => match command {
