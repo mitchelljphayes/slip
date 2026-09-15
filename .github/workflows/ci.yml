@@ -280,6 +280,28 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y podman
           fi
+      - name: Install distro runc and select it as the OCI runtime
+        run: |
+          # In the local Ubuntu 26.04 arm64 VM, Podman 5.7.0 with crun
+          # stalled during Postgres startup and emitted stacked-label
+          # signal denials. Switching to official runc 1.4.0 passed all 5
+          # contracts with stock AppArmor enforcing. Behavior is consistent
+          # with container-libs#805; hosted CI validation pending.
+          # https://github.com/podman-container-tools/container-libs/issues/805
+          # Evidence: .opencode/sessions/podman-health-cmd-fix/runc-apparmor-experiment.md
+          sudo apt-get install -y --no-install-recommends runc
+          runc --version
+          # Select runc as the rootful engine runtime via a job-owned
+          # containers.conf.d drop-in. The [engine] table is the correct
+          # section for the runtime setting (not [containers]); see
+          # containers.conf(5). The drop-in is installed before the rootful
+          # socket/service starts so the first podman system service picks
+          # it up. No stock /usr/share or /etc/containers/containers.conf
+          # file is edited.
+          sudo mkdir -p /etc/containers/containers.conf.d
+          printf '[engine]\nruntime = "runc"\n' \
+            | sudo tee /etc/containers/containers.conf.d/99-slip-ci-runc.conf >/dev/null
+          sudo chmod 0644 /etc/containers/containers.conf.d/99-slip-ci-runc.conf
       - name: Verify Podman engine version (pin 5.7.0)
         run: |
           # Log the resolved versions for traceability.
@@ -326,6 +348,25 @@ jobs:
             exit 1
           fi
           echo "rootful Podman socket OK (Docker-compat /_ping)"
+      - name: Verify OCI runtime is runc (guard against runtime drift)
+        run: |
+          # Assert the rootful engine actually resolved to runc so a
+          # silent drop-in miss or distro default change fails the job
+          # instead of producing a false green from crun's stacked-label
+          # stall. The Bollard client in slip-core connects to this same
+          # rootful socket, so the native engine config it sees matches.
+          runtime_name=$(sudo podman info --format '{{.Host.OCIRuntime.Name}}')
+          echo "Resolved OCI runtime: ${runtime_name}"
+          if [ "$runtime_name" != "runc" ]; then
+            echo "::error::OCI runtime is '${runtime_name}', expected 'runc'."
+            echo "::error::The containers.conf.d drop-in may not have applied,"
+            echo "::error::or the distro default runtime drifted. The service-contract"
+            echo "::error::tests require runc to avoid the container-libs#805"
+            echo "::error::AppArmor stacked-label signal denial with crun."
+            exit 1
+          fi
+          echo "OCI runtime is runc:"
+          sudo runc --version | head -1
       - name: Run services contract tests
         run: |
           set -o pipefail

@@ -204,6 +204,19 @@ while slipd is down. The reconcile loop is the slipd-restart safety net.
   the acquired root is rejected with `EXDEV` by the kernel. Root
   owner/mode/type validation and `ValidatedBindSource` token revalidation
   are unchanged.
+- **Supported OCI runtime**: In the local Ubuntu 26.04 arm64 VM, Podman 5.7.0
+  with crun stalled during Postgres startup and emitted stacked-label
+  signal denials. Switching to official runc 1.4.0 passed all 5 contracts
+  with stock AppArmor enforcing. Behavior is consistent with
+  [container-libs#805](https://github.com/podman-container-tools/container-libs/issues/805);
+  hosted CI validation pending. The CI `services-contract` job installs
+  distro `runc` and selects it via a `containers.conf.d` drop-in
+  (`[engine] runtime = "runc"`). The tested run retained enforcing
+  AppArmor, NNP, seccomp, mount isolation, and zero final-process
+  capabilities. Tested matrix: macOS dev VM (Fedora CoreOS, Podman 6.1.1,
+  crun, SELinux) and local Lima `slip-ci` (Ubuntu 26.04, Podman 5.7.0,
+  runc, AppArmor enforcing). Revisit when container-libs merges the
+  `//&*` peer-rule fix.
 - **macOS dev**: portable tests compile and pass; Linux-gated tests are CI-only
 - **Service operations**: fail closed on non-rootful or non-Linux runtimes
 
