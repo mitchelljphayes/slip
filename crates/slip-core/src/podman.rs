@@ -12,12 +12,12 @@ use bollard::Docker;
 use bollard::auth::DockerCredentials;
 use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, LogOutput, LogsOptions,
-    RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+    NetworkingConfig, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::image::CreateImageOptions;
 use bollard::models::{
-    HostConfig, Mount, MountBindOptions, MountBindOptionsPropagationEnum, MountTypeEnum,
-    PortBinding,
+    EndpointSettings, HostConfig, Mount, MountBindOptions, MountBindOptionsPropagationEnum,
+    MountTypeEnum, PortBinding,
 };
 use bollard::network::CreateNetworkOptions;
 use futures_util::StreamExt;
@@ -41,6 +41,8 @@ pub struct PodmanBackend {
     client: Docker,
     /// Path to the `podman` CLI binary (default: `"podman"`).
     podman_path: String,
+    /// The connected socket path (for rootful verification).
+    socket_path: String,
 }
 
 impl PodmanBackend {
@@ -64,6 +66,7 @@ impl PodmanBackend {
         Ok(Self {
             client,
             podman_path,
+            socket_path,
         })
     }
 
@@ -84,6 +87,170 @@ impl PodmanBackend {
         }
 
         None
+    }
+
+    /// Query the container ID and EffectiveCaps from the Podman native
+    /// CLI, bound to the same socket as the Bollard client. Fail-closed:
+    /// any error returns `Err`, never an empty or fabricated result.
+    ///
+    /// The `--url` flag binds the CLI to the exact socket path that
+    /// `PodmanBackend::new` selected and that the Bollard client uses.
+    /// This prevents the CLI from connecting to a different engine.
+    ///
+    /// The Go template emits both the container ID and EffectiveCaps in
+    /// a parseable format. The native ID must match the requested ID
+    /// before the caps are accepted.
+    ///
+    /// Bounded: `kill_on_drop(true)`, 10s timeout, stdout capped at
+    /// 4096 bytes, stderr discarded via `Stdio::null()`.
+    async fn native_inspect_id_and_caps(
+        &self,
+        container_id: &str,
+    ) -> Result<(String, Vec<String>), RuntimeError> {
+        // Static argv, no shell. --url binds to the same socket as Bollard.
+        // Go format emits: ID<newline>[CAP_CHOWN CAP_DAC_OVERRIDE ...]
+        let url = format!("unix://{}", self.socket_path);
+        let mut cmd = tokio::process::Command::new(&self.podman_path);
+        cmd.arg("--url").arg(&url);
+        cmd.args([
+            "inspect",
+            "--type",
+            "container",
+            "--format",
+            "{{.Id}}\n{{.EffectiveCaps}}",
+        ]);
+        cmd.arg(container_id);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::null());
+        cmd.kill_on_drop(true);
+
+        let mut child = cmd.spawn().map_err(|e| {
+            RuntimeError::ContainerError(format!("native inspect: failed to spawn podman: {e}"))
+        })?;
+
+        let stdout = child.stdout.take().ok_or_else(|| {
+            RuntimeError::ContainerError("native inspect: no stdout pipe".to_string())
+        })?;
+
+        const MAX_OUTPUT: usize = 4096;
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+        let read_fut = async {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::with_capacity(256);
+            let mut reader = stdout;
+            let mut chunk = [0u8; 256];
+            loop {
+                let n = reader.read(&mut chunk).await.map_err(|e| {
+                    RuntimeError::ContainerError(format!("native inspect: read error: {e}"))
+                })?;
+                if n == 0 {
+                    break;
+                }
+                if buf.len() + n > MAX_OUTPUT {
+                    return Err(RuntimeError::ContainerError(format!(
+                        "native inspect: stdout exceeded {MAX_OUTPUT} bytes (truncated)"
+                    )));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Ok(buf)
+        };
+
+        let (read_result, wait_result) = tokio::join!(
+            tokio::time::timeout(TIMEOUT, read_fut),
+            tokio::time::timeout(TIMEOUT, child.wait()),
+        );
+
+        let buf = read_result.map_err(|_| {
+            RuntimeError::ContainerError("native inspect: timed out reading stdout".to_string())
+        })??;
+
+        let status = wait_result
+            .map_err(|_| {
+                RuntimeError::ContainerError(
+                    "native inspect: timed out waiting for exit".to_string(),
+                )
+            })?
+            .map_err(|e| {
+                RuntimeError::ContainerError(format!("native inspect: wait error: {e}"))
+            })?;
+
+        if !status.success() {
+            return Err(RuntimeError::ContainerError(format!(
+                "native inspect: podman exited with code {}",
+                status.code().unwrap_or(-1)
+            )));
+        }
+
+        if buf.is_empty() {
+            return Err(RuntimeError::ContainerError(
+                "native inspect: empty output".to_string(),
+            ));
+        }
+
+        let output = String::from_utf8(buf).map_err(|e| {
+            RuntimeError::ContainerError(format!("native inspect: non-UTF8 output: {e}"))
+        })?;
+
+        // Parse: first line is the container ID, second line is the caps.
+        let mut lines = output.lines();
+        let native_id = lines
+            .next()
+            .ok_or_else(|| {
+                RuntimeError::ContainerError("native inspect: missing ID line".to_string())
+            })?
+            .trim()
+            .to_string();
+
+        if native_id.len() != 64
+            || !native_id
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        {
+            return Err(RuntimeError::ContainerError(format!(
+                "native inspect: malformed container ID (len={})",
+                native_id.len()
+            )));
+        }
+
+        if native_id != container_id {
+            return Err(RuntimeError::ContainerError(format!(
+                "native inspect: container ID mismatch (got {native_id}, expected {container_id})"
+            )));
+        }
+
+        let caps_line = lines.next().ok_or_else(|| {
+            RuntimeError::ContainerError("native inspect: missing caps line".to_string())
+        })?;
+
+        let caps: Vec<String> = caps_line
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+
+        if caps.is_empty() {
+            return Err(RuntimeError::ContainerError(
+                "native inspect: no capabilities parsed from output".to_string(),
+            ));
+        }
+
+        for c in &caps {
+            if !c.starts_with("CAP_")
+                || !c[4..]
+                    .chars()
+                    .all(|ch| ch.is_ascii_uppercase() || ch == '_')
+            {
+                return Err(RuntimeError::ContainerError(format!(
+                    "native inspect: malformed capability name: '{c}'"
+                )));
+            }
+        }
+
+        Ok((native_id, caps))
     }
 }
 
@@ -760,6 +927,458 @@ impl RuntimeBackend for PodmanBackend {
             });
 
         Box::pin(stream)
+    }
+
+    // ── Service-safe operations (SLIP-106 Part 3) ───────────────────────────
+
+    fn is_rootful(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        // Rootful = /run/podman/podman.sock or /var/run/podman/podman.sock.
+        // XDG_RUNTIME_DIR-derived = rootless.
+        let is_root = self.socket_path == "/run/podman/podman.sock"
+            || self.socket_path == "/var/run/podman/podman.sock";
+        Box::pin(async move { is_root })
+    }
+
+    fn create_and_start_service<'a>(
+        &'a self,
+        spec: &'a crate::runtime::ServiceContainerSpec,
+    ) -> Pin<Box<dyn Future<Output = Result<String, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            let image_ref = spec.image().repo_digest();
+
+            // Use HostConfig.binds (not Mounts) for bind mounts. Podman's
+            // Docker-compatible API processes the ":Z" SELinux relabel
+            // suffix only from the binds string format, not from the
+            // structured Mounts array. On SELinux-enforcing hosts (e.g.
+            // Fedora CoreOS), bind-mounted files without ":Z" get the
+            // host's SELinux label and are inaccessible to the container
+            // process, causing "Permission denied" on secret/data reads.
+            // ":Z" tells Podman to relabel the mount source with
+            // container_file_t (private to this container). This is
+            // Podman-specific; the Docker backend uses the structured
+            // Mounts API which handles labels differently.
+            // Validate bind string components before serialization.
+            // The bind string format "source:dest:opts" uses ':' as a
+            // delimiter. A colon, NUL, or newline in the source or dest
+            // would corrupt the bind grammar. Reject before the daemon
+            // request. Do not relax ro/Z options.
+            for m in spec.mounts() {
+                if m.host_source.contains(':')
+                    || m.host_source.contains('\0')
+                    || m.host_source.contains('\n')
+                {
+                    return Err(RuntimeError::ContainerError(
+                        "bind source contains illegal character (colon, NUL, or newline)"
+                            .to_string(),
+                    ));
+                }
+                if m.dest.contains(':') || m.dest.contains('\0') || m.dest.contains('\n') {
+                    return Err(RuntimeError::ContainerError(
+                        "bind destination contains illegal character (colon, NUL, or newline)"
+                            .to_string(),
+                    ));
+                }
+            }
+
+            let binds: Vec<String> = spec
+                .mounts()
+                .iter()
+                .map(|m| {
+                    // Format: "source:dest[:opts]" where opts is a
+                    // comma-separated list. Always include "Z" for SELinux
+                    // relabel (idempotent on non-SELinux hosts).
+                    let mut opts = vec!["Z".to_string()];
+                    if m.read_only {
+                        opts.insert(0, "ro".to_string());
+                    }
+                    format!("{}:{}:{}", m.host_source, m.dest, opts.join(","))
+                })
+                .collect();
+
+            let healthcheck = bollard::models::HealthConfig {
+                test: Some(spec.healthcheck().test_cmd.clone()),
+                interval: Some(spec.healthcheck().interval_secs * 1_000_000_000),
+                timeout: Some(spec.healthcheck().timeout_secs * 1_000_000_000),
+                retries: Some(spec.healthcheck().retries),
+                start_period: Some(spec.healthcheck().start_period_secs * 1_000_000_000),
+                ..Default::default()
+            };
+
+            let security_opt = vec!["no-new-privileges:true".to_string()];
+            let cap_drop = vec!["ALL".to_string()];
+            let cap_add: Vec<String> = spec.security().cap_add.clone();
+
+            let tmpfs: Option<HashMap<String, String>> = if spec.security().tmpfs_mounts.is_empty()
+            {
+                None
+            } else {
+                Some(spec.security().tmpfs_mounts.iter().cloned().collect())
+            };
+
+            let host_config = HostConfig {
+                restart_policy: Some(bollard::models::RestartPolicy {
+                    name: Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED),
+                    ..Default::default()
+                }),
+                port_bindings: None,
+                network_mode: Some(spec.network().to_string()),
+                binds: Some(binds),
+                mounts: None,
+                memory: spec.resources().memory_bytes,
+                nano_cpus: spec.resources().nano_cpus,
+                pids_limit: spec.resources().pids_limit,
+                security_opt: Some(security_opt),
+                cap_drop: Some(cap_drop),
+                cap_add: if cap_add.is_empty() {
+                    None
+                } else {
+                    Some(cap_add)
+                },
+                readonly_rootfs: Some(spec.security().read_only_rootfs),
+                tmpfs,
+                ..Default::default()
+            };
+
+            let env_vec: Vec<String> = spec.env().iter().map(|(k, v)| format!("{k}={v}")).collect();
+
+            // Set network aliases via NetworkingConfig. The Docker/Podman API
+            // requires network aliases to be set in the NetworkingConfig at
+            // create time, not just in HostConfig.network_mode. Without this,
+            // the container has no DNS aliases on the network and
+            // verify_ownership fails (inspected aliases don't match expected).
+            let mut endpoints = HashMap::new();
+            endpoints.insert(
+                spec.network().to_string(),
+                EndpointSettings {
+                    aliases: if spec.network_aliases().is_empty() {
+                        None
+                    } else {
+                        Some(spec.network_aliases().to_vec())
+                    },
+                    ..Default::default()
+                },
+            );
+
+            let config: Config<String> = Config {
+                image: Some(image_ref),
+                env: Some(env_vec),
+                labels: Some(spec.labels().clone().into_iter().collect()),
+                host_config: Some(host_config),
+                hostname: Some(spec.hostname().to_string()),
+                healthcheck: Some(healthcheck),
+                networking_config: Some(NetworkingConfig {
+                    endpoints_config: endpoints,
+                }),
+                ..Default::default()
+            };
+
+            let create_opts = CreateContainerOptions {
+                name: spec.name().to_string(),
+                platform: None::<String>,
+            };
+
+            debug!(name = %spec.name(), "creating service container (podman)");
+            let response = self
+                .client
+                .create_container(Some(create_opts), config)
+                .await
+                .map_err(|e| RuntimeError::ContainerError(e.to_string()))?;
+
+            let container_id = response.id;
+            debug!(container_id = %container_id, "service container created, starting (podman)");
+            self.client
+                .start_container(&container_id, None::<StartContainerOptions<String>>)
+                .await
+                .map_err(|e| RuntimeError::ContainerError(e.to_string()))?;
+
+            info!(container_id = %container_id, "service container started (podman)");
+            Ok(container_id)
+        })
+    }
+
+    fn inspect_service<'a>(
+        &'a self,
+        container_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<crate::runtime::ServiceContainerInspect, RuntimeError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let info = self
+                .client
+                .inspect_container(container_id, None)
+                .await
+                .map_err(|e| {
+                    if let bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    } = e
+                    {
+                        RuntimeError::ContainerError("container not found".to_string())
+                    } else {
+                        RuntimeError::ContainerError(e.to_string())
+                    }
+                })?;
+
+            let labels = info
+                .config
+                .as_ref()
+                .and_then(|c| c.labels.as_ref())
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect::<std::collections::BTreeMap<String, String>>()
+                })
+                .unwrap_or_default();
+
+            let repo_digests = if let Some(image_id) = info.image.as_ref() {
+                match self.client.inspect_image(image_id).await {
+                    Ok(img_info) => img_info.repo_digests.unwrap_or_default(),
+                    Err(_) => vec![],
+                }
+            } else {
+                vec![]
+            };
+
+            let mounts = info
+                .mounts
+                .as_ref()
+                .map(|ms| {
+                    ms.iter()
+                        .map(|m| {
+                            (
+                                m.source.clone().unwrap_or_default(),
+                                m.destination.clone().unwrap_or_default(),
+                                !m.rw.unwrap_or(true),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            let (network, network_aliases) = info
+                .network_settings
+                .as_ref()
+                .and_then(|ns| ns.networks.as_ref())
+                .and_then(|nets| nets.iter().next())
+                .map(|(net_name, ep)| (net_name.clone(), ep.aliases.clone().unwrap_or_default()))
+                .unwrap_or_default();
+
+            let restart_policy = info
+                .host_config
+                .as_ref()
+                .and_then(|hc| hc.restart_policy.as_ref())
+                .and_then(|rp| rp.name.as_ref())
+                .map(|n| format!("{n:?}").to_lowercase().replace('_', "-"))
+                .unwrap_or_else(|| "no".to_string());
+
+            let health_status = info
+                .state
+                .as_ref()
+                .and_then(|s| s.health.as_ref())
+                .and_then(|h| h.status.as_ref())
+                .map(|s| format!("{s:?}").to_lowercase().replace('_', "-"))
+                .unwrap_or_else(|| "none".to_string());
+
+            let port_bindings: Vec<(u16, Option<String>)> = info
+                .host_config
+                .as_ref()
+                .and_then(|hc| hc.port_bindings.as_ref())
+                .map(|pb| {
+                    pb.iter()
+                        .flat_map(|(key, bindings)| {
+                            let port: u16 = key
+                                .split('/')
+                                .next()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            if let Some(binds) = bindings {
+                                binds
+                                    .iter()
+                                    .map(|b| (port, b.host_port.clone()))
+                                    .collect::<Vec<_>>()
+                            } else {
+                                vec![]
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
+
+            // Use the daemon-returned full container ID. Require it to
+            // be present and valid; do NOT fall back to the caller-supplied
+            // argument. A missing daemon ID is a hard error.
+            let daemon_id = info.id.clone().ok_or_else(|| {
+                RuntimeError::ContainerError(
+                    "daemon-returned container ID is missing from inspect response".to_string(),
+                )
+            })?;
+            if daemon_id.len() != 64
+                || !daemon_id
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            {
+                return Err(RuntimeError::ContainerError(format!(
+                    "daemon-returned container ID is not a valid 64-char lowercase hex ID (got len={})",
+                    daemon_id.len()
+                )));
+            }
+
+            // Require the daemon-returned ID to exactly match the
+            // requested (persisted) container ID. This prevents a
+            // different container from being inspected by name
+            // collision or lookup ambiguity.
+            if daemon_id != container_id {
+                return Err(RuntimeError::ContainerError(format!(
+                    "daemon-returned container ID does not match requested ID: got {daemon_id}, expected {container_id}"
+                )));
+            }
+
+            // Security-relevant fields from HostConfig.
+            let host_config = info.host_config.as_ref();
+            let privileged = host_config.and_then(|hc| hc.privileged).unwrap_or(false);
+            let read_only_rootfs = host_config
+                .and_then(|hc| hc.readonly_rootfs)
+                .unwrap_or(false);
+            let memory_limit = host_config.and_then(|hc| hc.memory).unwrap_or(0);
+            let nano_cpus = host_config.and_then(|hc| hc.nano_cpus).unwrap_or(0);
+            let pids_limit = host_config.and_then(|hc| hc.pids_limit).unwrap_or(0);
+
+            // Podman's Docker-compatible inspect does not faithfully
+            // represent cap_drop/cap_add: it returns the resolved default
+            // dropped caps (not "ALL") and an empty cap_add (not the caps
+            // we added). Use the Podman native CLI bound to the SAME socket
+            // as the Bollard client to get the container ID and
+            // EffectiveCaps, which is the actual set of capabilities the
+            // container process has.
+            //
+            // The native inspect returns BOTH the native container ID
+            // and EffectiveCaps. The native ID must match the compat
+            // (Docker API) ID and the requested ID. This triple equality
+            // proves the same container was inspected by both engines.
+            //
+            // This is fail-closed: any spawn failure, timeout, non-zero
+            // exit, malformed output, ID mismatch, or truncation returns
+            // an error. We do NOT fabricate cap_drop and do NOT fall back
+            // to Docker-compat cap_add.
+            let (native_id, effective_caps) = self.native_inspect_id_and_caps(&daemon_id).await?;
+
+            // Triple ID equality: native ID == compat ID == requested ID.
+            // daemon_id already validated == container_id above.
+            // native_id already validated == container_id inside
+            // native_inspect_id_and_caps. Assert native_id == daemon_id
+            // as a defense-in-depth check.
+            if native_id != daemon_id {
+                return Err(RuntimeError::ContainerError(format!(
+                    "native inspect ID does not match compat inspect ID: native={native_id}, compat={daemon_id}"
+                )));
+            }
+
+            let cap_drop: Vec<String> = Vec::new();
+            let cap_add = effective_caps;
+            let security_options = host_config
+                .and_then(|hc| hc.security_opt.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            let no_new_privileges = security_options
+                .iter()
+                .any(|s| s.contains("no-new-privileges"));
+
+            // Collect all network names (must be exactly one for services).
+            let networks: Vec<String> = info
+                .network_settings
+                .as_ref()
+                .and_then(|ns| ns.networks.as_ref())
+                .map(|nets| nets.keys().cloned().collect())
+                .unwrap_or_default();
+
+            let hostname = info.config.as_ref().and_then(|c| c.hostname.clone());
+            let name = info.name.clone();
+
+            Ok(crate::runtime::ServiceContainerInspect {
+                backend_name: "podman".to_string(),
+                container_id: daemon_id,
+                name,
+                hostname,
+                labels,
+                repo_digests,
+                mounts,
+                networks,
+                network,
+                network_aliases,
+                restart_policy,
+                health_status,
+                port_bindings,
+                running,
+                privileged,
+                no_new_privileges,
+                read_only_rootfs,
+                cap_drop,
+                cap_add,
+                security_options,
+                memory_limit,
+                nano_cpus,
+                pids_limit,
+            })
+        })
+    }
+
+    fn exec_service_probe<'a>(
+        &'a self,
+        container_id: &'a str,
+        argv: &'a [&'a str],
+        env: &'a [(&'a str, &'a str)],
+        timeout: std::time::Duration,
+        max_output_bytes: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        let podman_path = self.podman_path.clone();
+        let url = format!("unix://{}", self.socket_path);
+        Box::pin(async move {
+            // Build a static argv with no shell. --url binds the CLI to
+            // the same socket as the Bollard client, preventing ambient
+            // connection to a different engine. Podman exec syntax:
+            //   podman --url <socket> exec [OPTIONS] CONTAINER COMMAND [ARG...]
+            // --env must come BEFORE the container ID, not after.
+            let mut cmd = tokio::process::Command::new(&podman_path);
+            cmd.arg("--url").arg(&url);
+            cmd.arg("exec");
+            for (k, v) in env {
+                cmd.arg("--env").arg(format!("{k}={v}"));
+            }
+            cmd.arg(container_id);
+            cmd.args(argv);
+            // Discard stdout/stderr entirely: output is never returned to
+            // callers and may contain secret-adjacent text. Using null()
+            // prevents unbounded buffering (OOM protection).
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+            cmd.kill_on_drop(true);
+
+            let mut child = cmd
+                .spawn()
+                .map_err(|_| RuntimeError::ExecFailed("failed to spawn podman exec".to_string()))?;
+
+            // Wait with timeout. Output is discarded (null stdio).
+            let _ = max_output_bytes; // accepted for API symmetry; output is null
+            let status = tokio::time::timeout(timeout, child.wait())
+                .await
+                .map_err(|_| RuntimeError::ExecFailed("exec timed out".to_string()))?
+                .map_err(|_| RuntimeError::ExecFailed("exec failed".to_string()))?;
+
+            if status.success() {
+                Ok(())
+            } else {
+                let code = status.code().unwrap_or(-1);
+                Err(RuntimeError::ExecFailed(format!(
+                    "exec exited with code {code}"
+                )))
+            }
+        })
     }
 }
 

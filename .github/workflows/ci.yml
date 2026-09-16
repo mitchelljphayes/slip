@@ -139,3 +139,265 @@ jobs:
         run: SLIP_BIN=./target/release/slipd ./scripts/smoke-test.sh
         env:
           SLIP_SECRET: test-secret
+
+  service-security:
+    name: Service Security Tests (Linux root)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: cargo --version && rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Build slip-core lib test binary (as non-root runner)
+        run: |
+          # Compile the test binary as the non-root runner (uid 1000).
+          # cargo is never run as root. Capture the exact binary path
+          # from Cargo's JSON output for deterministic discovery.
+          cargo test -p slip-core --lib --no-run --message-format json \
+            > /tmp/cargo-test-json.txt 2>&1 || {
+              cat /tmp/cargo-test-json.txt
+              exit 1
+            }
+          # Extract the test binary path from the JSON output. The
+          # "test-binary" artifact has the executable path.
+          TEST_BIN=$(grep -o '"executable":"[^"]*"' /tmp/cargo-test-json.txt \
+            | head -1 | sed 's/"executable":"//;s/"//')
+          if [ -z "$TEST_BIN" ]; then
+            echo "ERROR: could not extract test binary from cargo JSON"
+            cat /tmp/cargo-test-json.txt | head -20
+            exit 1
+          fi
+          echo "Test binary: $TEST_BIN"
+          echo "TEST_BIN=$TEST_BIN" >> "$GITHUB_ENV"
+      - name: Run Linux storage and secret security tests as root
+        run: |
+          # The GitHub Actions runner is non-root (uid 1000) on
+          # ubuntu-latest. We execute the test binary via sudo so the
+          # root-gated tests (openat2, UID 0 checks) can run.
+          # The root assertion is inside each test (skip_if_nonroot).
+          #
+          # We run two separate filter groups:
+          # 1. Linux-specific storage+secret tests (require root + openat2).
+          # 2. Portable tests (image_ref, secret portable).
+          #
+          # The Linux-specific group must have a non-zero passed count
+          # to prevent a false green from portables alone.
+
+          # Group 1: Linux-specific tests (nested in _linux module).
+          # Use conditional capture so bash -e does not abort before we
+          # can print output and assert the passed-test count.
+          LINUX_EXIT=0
+          sudo env -i \
+            PATH="$PATH" \
+            HOME="$HOME" \
+            RUST_BACKTRACE=1 \
+            "$TEST_BIN" --test-threads=1 \
+            'services::storage::_linux::tests::' \
+            'services::secret::_linux::tests::' \
+            > /tmp/linux-tests.txt 2>&1 || LINUX_EXIT=$?
+          cat /tmp/linux-tests.txt
+          # Preserve the original cargo/test-binary exit code: if nonzero,
+          # exit immediately with that status rather than falling through
+          # to the zero-tests guard (which would overwrite 101 with 1).
+          if [ "$LINUX_EXIT" -ne 0 ]; then
+            echo "ERROR: Linux-specific test binary exited $LINUX_EXIT - see output above"
+            exit "$LINUX_EXIT"
+          fi
+          LINUX_PASSED=$(grep -oP 'test result: ok\. \K\d+' /tmp/linux-tests.txt | tail -1 || true)
+          if [ -z "$LINUX_PASSED" ] || [ "$LINUX_PASSED" -eq 0 ]; then
+            echo "ERROR: 0 Linux-specific tests passed."
+            echo "The _linux::tests:: filters may not match any tests."
+            echo "This means the security-critical tests did not run."
+            exit 1
+          fi
+          echo "Linux-specific tests passed: $LINUX_PASSED"
+          # Assert a minimum expected count. The exact count may grow
+          # but must be at least 20 (storage 20 + secret 30+).
+          if [ "$LINUX_PASSED" -lt 20 ]; then
+            echo "ERROR: only $LINUX_PASSED Linux tests passed (expected >= 20)."
+            exit 1
+          fi
+
+          # Group 2: Portable tests (image_ref + secret portable).
+          PORTABLE_EXIT=0
+          sudo env -i \
+            PATH="$PATH" \
+            HOME="$HOME" \
+            RUST_BACKTRACE=1 \
+            "$TEST_BIN" --test-threads=1 \
+            'services::image_ref::tests::' \
+            'services::secret::portable_tests::' \
+            > /tmp/portable-tests.txt 2>&1 || PORTABLE_EXIT=$?
+          cat /tmp/portable-tests.txt
+          if [ "$PORTABLE_EXIT" -ne 0 ]; then
+            echo "ERROR: portable test binary exited $PORTABLE_EXIT - see output above"
+            exit "$PORTABLE_EXIT"
+          fi
+          PORTABLE_PASSED=$(grep -oP 'test result: ok\. \K\d+' /tmp/portable-tests.txt | tail -1 || true)
+          if [ -z "$PORTABLE_PASSED" ] || [ "$PORTABLE_PASSED" -eq 0 ]; then
+            echo "ERROR: 0 portable tests passed."
+            exit 1
+          fi
+          echo "Portable tests passed: $PORTABLE_PASSED"
+      - name: Cleanup
+        if: always()
+        run: rm -rf /tmp/slip-test /tmp/slip-service-test /tmp/cargo-test-json.txt /tmp/test-output.txt /tmp/linux-tests.txt /tmp/portable-tests.txt
+
+  services-contract:
+    name: Services Contract Tests (rootful Podman)
+    # ubuntu-26.04 is in public preview (no SLA) as of Sep 2026; it is the
+    # only GA-track runner shipping Podman 5.x from the official distro
+    # universe repo. ubuntu-24.04 (current ubuntu-latest) ships Podman 4.9.3,
+    # two major versions behind the macOS dev VM (6.1.1). We accept the
+    # preview caveat because the 4->5 API jump is the critical one and 5.7.0
+    # is close enough to 6.1.1 for Docker-compat contract tests.
+    #
+    # Compatibility matrix (intentional, not exact parity):
+    #   macOS dev VM : Podman 6.1.1, Fedora CoreOS 44, rootful applehv
+    #   CI (here)    : Podman 5.7.0, Ubuntu 26.04,   rootful systemd socket
+    # Both are modern Podman (cgroups v2, SQLite backend, Netavark/Pasta).
+    # The app talks to the Docker-compatible API, not the versioned libpod
+    # REST path, so the /v5.0.0 vs /v6.0.0 path split does not affect tests.
+    # When ubuntu-26.04 reaches GA or Fedora 45 releases, revisit for a
+    # closer match.
+    #
+    # Runner support reference:
+    #   https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2604-Readme.md
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: cargo --version && rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Podman from distro apt
+        run: |
+          # Install from the official Ubuntu 26.04 universe repo only.
+          # No PPAs, no static bundles, no source builds, no cross-release
+          # apt mixing (see podman-ci-version-choice.md for rationale).
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y podman
+          fi
+      - name: Install distro runc and select it as the OCI runtime
+        run: |
+          # In the local Ubuntu 26.04 arm64 VM, Podman 5.7.0 with crun
+          # stalled during Postgres startup and emitted stacked-label
+          # signal denials. Switching to official runc 1.4.0 passed all 5
+          # contracts with stock AppArmor enforcing. Behavior is consistent
+          # with container-libs#805; hosted CI validation pending.
+          # https://github.com/podman-container-tools/container-libs/issues/805
+          # Evidence: .opencode/sessions/podman-health-cmd-fix/runc-apparmor-experiment.md
+          sudo apt-get install -y --no-install-recommends runc
+          runc --version
+          # Select runc as the rootful engine runtime via a job-owned
+          # containers.conf.d drop-in. The [engine] table is the correct
+          # section for the runtime setting (not [containers]); see
+          # containers.conf(5). The drop-in is installed before the rootful
+          # socket/service starts so the first podman system service picks
+          # it up. No stock /usr/share or /etc/containers/containers.conf
+          # file is edited.
+          sudo mkdir -p /etc/containers/containers.conf.d
+          printf '[engine]\nruntime = "runc"\n' \
+            | sudo tee /etc/containers/containers.conf.d/99-slip-ci-runc.conf >/dev/null
+          sudo chmod 0644 /etc/containers/containers.conf.d/99-slip-ci-runc.conf
+      - name: Verify Podman engine version (pin 5.7.0)
+        run: |
+          # Log the resolved versions for traceability.
+          echo "=== Podman versions ==="
+          podman --version
+          sudo podman --version
+          echo "=== systemd ==="
+          systemctl --version | head -1
+          echo "=== rootful socket unit ==="
+          systemctl cat podman.socket 2>/dev/null | head -5 || true
+
+          # Pin the engine version so a silent distro upgrade cannot drift
+          # the contract test surface. The expected version is the Ubuntu
+          # 26.04 universe package: podman 5.7.0+ds2-3build1.
+          # We assert the engine major.minor.patch is exactly 5.7.0.
+          # The Debian package revision suffix (+ds2-3build1) is not pinned
+          # because it can change without an engine change; the engine
+          # version is the stable contract surface.
+          ver=$(podman --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          if [ -z "$ver" ]; then
+            echo "::error::Could not parse Podman version from: $(podman --version)"
+            exit 1
+          fi
+          if [ "$ver" != "5.7.0" ]; then
+            echo "::error::Podman engine version mismatch: expected 5.7.0, got $ver"
+            echo "::error::A silent upgrade may have drifted the CI Podman. Update the"
+            echo "::error::pin in .github/workflows/ci.yml and the compatibility-matrix"
+            echo "::error::comment after verifying the new version against the macOS dev VM."
+            exit 1
+          fi
+          echo "Podman engine version $ver matches expected 5.7.0"
+      - name: Start rootful Podman socket
+        run: |
+          sudo systemctl enable --now podman.socket
+          sudo podman info --format '{{.Host.Security.Rootless}}' || true
+          # Verify the rootful socket is reachable via the Docker-compatible
+          # /_ping endpoint. Do NOT hardcode the versioned libpod API path
+          # (/v5.0.0/libpod/...) because that path changes between Podman
+          # major versions (5.x vs 6.x) and the app uses the Docker compat
+          # API, not the libpod REST surface.
+          if ! sudo curl -sf --unix-socket /run/podman/podman.sock \
+              http://localhost/_ping >/dev/null; then
+            echo "::error::rootful Podman socket did not respond to /_ping"
+            exit 1
+          fi
+          echo "rootful Podman socket OK (Docker-compat /_ping)"
+      - name: Verify OCI runtime is runc (guard against runtime drift)
+        run: |
+          # Assert the rootful engine actually resolved to runc so a
+          # silent drop-in miss or distro default change fails the job
+          # instead of producing a false green from crun's stacked-label
+          # stall. The Bollard client in slip-core connects to this same
+          # rootful socket, so the native engine config it sees matches.
+          runtime_name=$(sudo podman info --format '{{.Host.OCIRuntime.Name}}')
+          echo "Resolved OCI runtime: ${runtime_name}"
+          if [ "$runtime_name" != "runc" ]; then
+            echo "::error::OCI runtime is '${runtime_name}', expected 'runc'."
+            echo "::error::The containers.conf.d drop-in may not have applied,"
+            echo "::error::or the distro default runtime drifted. The service-contract"
+            echo "::error::tests require runc to avoid the container-libs#805"
+            echo "::error::AppArmor stacked-label signal denial with crun."
+            exit 1
+          fi
+          echo "OCI runtime is runc:"
+          sudo runc --version | head -1
+      - name: Run services contract tests
+        run: |
+          set -o pipefail
+          # Run the ignored contract tests. Fail if any test fails or if
+          # zero tests run (guards against cfg/ignore mistakes).
+          # Use conditional capture with pipefail so bash -e does not abort
+          # before we can print output and assert the passed-test count.
+          EXIT_CODE=0
+          sudo -E env -i \
+            PATH="$PATH" \
+            HOME="$HOME" \
+            RUST_BACKTRACE=1 \
+            cargo test -p slip-core --test services_contract -- --ignored --test-threads=1 \
+            2>&1 | tee /tmp/svc-contract.log || EXIT_CODE=$?
+          # Preserve the original cargo exit code: if nonzero, exit
+          # immediately with that status rather than falling through to
+          # the zero-tests guard (which would overwrite 101 with 1).
+          if [ "$EXIT_CODE" -ne 0 ]; then
+            echo "ERROR: contract tests exited $EXIT_CODE - see output above"
+            exit "$EXIT_CODE"
+          fi
+          # Assert non-zero test count to prevent false-green from no tests.
+          PASSED=$(grep -oP 'test result: ok\. \K\d+' /tmp/svc-contract.log | tail -1 || true)
+          if [ -z "$PASSED" ] || [ "$PASSED" -eq 0 ]; then
+            echo "ERROR: 0 contract tests passed - the test filter or cfg may be broken"
+            exit 1
+          fi
+          echo "Contract tests passed: $PASSED"
+          exit "$EXIT_CODE"
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo podman rm -f $(sudo podman ps -a --filter "label=slip.managed=true" -q) 2>/dev/null || true
+          sudo rm -rf /tmp/slip-services-test-*

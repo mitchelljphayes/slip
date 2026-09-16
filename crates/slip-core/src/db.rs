@@ -47,6 +47,16 @@ impl Db {
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
 
+    /// Run a closure with a lock on the underlying connection.
+    /// Used by modules that need direct access (e.g. services repository).
+    pub fn with_conn<F, T, E>(&self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(&Connection) -> Result<T, E>,
+    {
+        let conn = self.0.lock().unwrap();
+        f(&conn)
+    }
+
     // ── Connection setup ──────────────────────────────────────────────────────
 
     /// Set per-connection pragmas and run migrations.

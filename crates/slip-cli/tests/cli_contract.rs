@@ -1856,14 +1856,193 @@ fn server_init_idempotent_stdout_no_secret() {
 }
 
 #[test]
-fn services_list_stub_exits_nonzero() {
+fn services_help_exits_zero() {
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd.args(["services", "--help"]).assert();
+
+    assert
+        .success()
+        .stdout(predicate::str::contains("services"))
+        .stdout(predicate::str::contains("add"))
+        .stdout(predicate::str::contains("list"))
+        .stdout(predicate::str::contains("status"))
+        .stdout(predicate::str::contains("rm"));
+}
+
+#[test]
+fn services_list_without_token_fails_auth() {
     let mut cmd = Command::cargo_bin("slip").unwrap();
     let assert = cmd.args(["services", "list"]).assert();
 
+    // Without a token, it should fail with an auth error (exit 3).
     assert
         .failure()
-        .code(output::GENERIC)
-        .stderr(predicate::str::contains("not yet implemented"));
+        .code(output::AUTH)
+        .stderr(predicate::str::contains("token"));
+}
+
+// ─── Services CLI exit-code mapping tests (SLIP-86 contract) ──────────────────
+
+/// Start a mock server that returns canned service responses with specific
+/// HTTP status codes for testing CLI exit-code mapping.
+fn start_mock_services_server() -> String {
+    use axum::routing::get;
+
+    // The mock server returns:
+    // - GET /v1/services/{name} → 404 for "nonexistent", 200 for "pg"
+    // - GET /v1/services → 200 with an empty list
+    // - DELETE /v1/services/{name} → 409 for "bound", 200 for "pg"
+    let app = Router::new()
+        .route(
+            "/v1/services",
+            get(|| async {
+                (
+                    axum::http::StatusCode::OK,
+                    [("cache-control", "no-store")],
+                    axum::Json(serde_json::json!({
+                        "schema": "slip.services/v1",
+                        "services": []
+                    })),
+                )
+            }),
+        )
+        .route(
+            "/v1/services/{name}",
+            get(
+                |axum::extract::Path(name): axum::extract::Path<String>| async move {
+                    if name == "nonexistent" {
+                        return (
+                            axum::http::StatusCode::NOT_FOUND,
+                            [("cache-control", "no-store")],
+                            axum::Json(serde_json::json!({
+                                "error": {
+                                    "code": "not_found",
+                                    "message": "service not found"
+                                }
+                            })),
+                        );
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        [("cache-control", "no-store")],
+                        axum::Json(serde_json::json!({
+                            "schema": "slip.service/v1",
+                            "name": name,
+                            "provider": "postgres",
+                            "version": "18.4",
+                            "phase": "ready",
+                            "health": "healthy",
+                            "generation": 1
+                        })),
+                    )
+                },
+            ),
+        );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener =
+        rt.block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() });
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{}", addr);
+    std::thread::spawn(move || {
+        rt.block_on(async {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    url
+}
+
+#[test]
+fn services_status_404_maps_to_exit_4() {
+    let url = start_mock_services_server();
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "--server",
+            &url,
+            "--token",
+            "test-token",
+            "services",
+            "status",
+            "nonexistent",
+        ])
+        .assert();
+
+    // 404 from the server should map to exit code 4 (NOT_FOUND).
+    assert
+        .failure()
+        .code(output::NOT_FOUND)
+        .stderr(predicate::str::contains("not found"));
+}
+
+#[test]
+fn services_rm_404_maps_to_exit_4() {
+    let url = start_mock_services_server();
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "--server",
+            &url,
+            "--token",
+            "test-token",
+            "services",
+            "rm",
+            "nonexistent",
+        ])
+        .assert();
+
+    // GET returns 404 → CLI should exit with code 4 (NOT_FOUND).
+    assert
+        .failure()
+        .code(output::NOT_FOUND)
+        .stderr(predicate::str::contains("not found"));
+}
+
+#[test]
+fn services_list_succeeds_with_mock_server() {
+    let url = start_mock_services_server();
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "--server",
+            &url,
+            "--token",
+            "test-token",
+            "services",
+            "list",
+        ])
+        .assert();
+
+    // 200 with empty list → exit 0, "no services registered" on stdout.
+    assert
+        .success()
+        .stdout(predicate::str::contains("no services registered"));
+}
+
+#[test]
+fn services_status_succeeds_for_existing_service() {
+    let url = start_mock_services_server();
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args([
+            "--server",
+            &url,
+            "--token",
+            "test-token",
+            "services",
+            "status",
+            "pg",
+        ])
+        .assert();
+
+    // 200 → exit 0, service details on stdout.
+    assert
+        .success()
+        .stdout(predicate::str::contains("pg"))
+        .stdout(predicate::str::contains("postgres"));
 }
 
 // ─── Deprecated `apps` subcommand ───────────────────────────────────────────────
