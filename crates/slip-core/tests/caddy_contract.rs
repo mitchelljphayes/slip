@@ -226,6 +226,7 @@ fn test_app_config(name: &str, domain: &str) -> AppConfig {
         network: NetworkConfig::default(),
         preview: None,
         volumes: vec![],
+        needs: Default::default(),
     }
 }
 

@@ -1380,6 +1380,75 @@ impl RuntimeBackend for PodmanBackend {
             }
         })
     }
+
+    fn exec_service_stdin<'a>(
+        &'a self,
+        container_id: &'a str,
+        argv: &'a [&'a str],
+        env: &'a [(&'a str, &'a str)],
+        stdin_input: &'a [u8],
+        timeout: std::time::Duration,
+        max_output_bytes: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        let podman_path = self.podman_path.clone();
+        let url = format!("unix://{}", self.socket_path);
+        Box::pin(async move {
+            use tokio::io::AsyncWriteExt;
+
+            // Build a static argv with no shell. --url binds the CLI to
+            // the same socket as the Bollard client. --interactive pipes
+            // our stdin payload to the command. Podman exec syntax:
+            //   podman --url <socket> exec --interactive [OPTIONS] CT CMD...
+            let mut cmd = tokio::process::Command::new(&podman_path);
+            cmd.arg("--url").arg(&url);
+            cmd.arg("exec");
+            cmd.arg("--interactive");
+            for (k, v) in env {
+                cmd.arg("--env").arg(format!("{k}={v}"));
+            }
+            cmd.arg(container_id);
+            cmd.args(argv);
+            // Discard stdout/stderr entirely: output is never returned to
+            // callers and may contain secret-adjacent text. Using null()
+            // prevents unbounded buffering (OOM protection).
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+            // stdin is piped from our payload.
+            cmd.stdin(std::process::Stdio::piped());
+            cmd.kill_on_drop(true);
+
+            let mut child = cmd
+                .spawn()
+                .map_err(|_| RuntimeError::ExecFailed("failed to spawn podman exec".to_string()))?;
+
+            // Bound both the secret-bearing stdin write and process exit.
+            let _ = max_output_bytes; // output goes directly to null
+            let status = tokio::time::timeout(timeout, async {
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin
+                        .write_all(stdin_input)
+                        .await
+                        .map_err(|_| RuntimeError::ExecFailed("stdin write failed".into()))?;
+                    drop(stdin);
+                }
+                child
+                    .wait()
+                    .await
+                    .map_err(|_| RuntimeError::ExecFailed("exec failed".into()))
+            })
+            .await
+            .map_err(|_| RuntimeError::ExecFailed("exec timed out".to_string()))??;
+
+            if status.success() {
+                Ok(())
+            } else {
+                let code = status.code().unwrap_or(-1);
+                Err(RuntimeError::ExecFailed(format!(
+                    "exec exited with code {code}"
+                )))
+            }
+        })
+    }
 }
 
 // ─── Pod CLI output parsers ──────────────────────────────────────────────────

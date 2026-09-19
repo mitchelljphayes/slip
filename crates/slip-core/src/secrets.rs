@@ -5,7 +5,8 @@
 //! Secret values are never logged — only key names and counts.
 
 use std::collections::HashMap;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -127,6 +128,14 @@ impl SecretsStore {
                     source: e,
                 },
             )?;
+            // Persist the namespace before its credentials are used by an
+            // external service; syncing only files inside it is insufficient.
+            std::fs::File::open(&self.base_path)
+                .and_then(|file| file.sync_all())
+                .map_err(|source| ConfigError::WriteFile {
+                    path: self.base_path.clone(),
+                    source,
+                })?;
         }
         Ok(dir)
     }
@@ -137,25 +146,28 @@ impl SecretsStore {
     pub fn set(&self, app_name: &str, key: &str, value: &str) -> Result<(), ConfigError> {
         let dir = self.ensure_app_dir(app_name)?;
         let target_path = dir.join(key);
-        let temp_path = dir.join(format!(".{key}.tmp"));
-
-        std::fs::write(&temp_path, value.as_bytes()).map_err(|e| ConfigError::WriteFile {
-            path: temp_path.clone(),
-            source: e,
-        })?;
-
-        // Set 0o600 permissions on the temp file before rename.
-        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600)).map_err(
-            |e| ConfigError::WriteFile {
-                path: temp_path.clone(),
-                source: e,
-            },
-        )?;
-
-        std::fs::rename(&temp_path, &target_path).map_err(|e| ConfigError::WriteFile {
-            path: target_path.clone(),
-            source: e,
-        })?;
+        let temp_path = dir.join(format!(".{key}.{}.tmp", ulid::Ulid::new()));
+        // Private from creation, exclusive and symlink-safe. Durable before
+        // provisioning a resource: losing a password after SQL commits would
+        // strand the database. Random temp names also isolate concurrent writes.
+        let write = || -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp_path)?;
+            file.write_all(value.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temp_path, &target_path)?;
+            std::fs::File::open(&dir)?.sync_all()
+        };
+        if let Err(source) = write() {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(ConfigError::WriteFile {
+                path: target_path,
+                source,
+            });
+        }
 
         Ok(())
     }

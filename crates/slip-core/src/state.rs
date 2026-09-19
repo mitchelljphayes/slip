@@ -723,6 +723,7 @@ mod tests {
     fn sample_app_response() -> crate::api::AppResponse {
         use std::collections::HashMap as HM;
         crate::api::AppResponse {
+            needs: Default::default(),
             name: "myapp".to_string(),
             image: "ghcr.io/org/myapp".to_string(),
             domain: "myapp.example.com".to_string(),
@@ -927,6 +928,7 @@ mod tests {
                 env_file: None,
                 preview: None,
                 volumes: Vec::new(),
+                needs: Default::default(),
             },
         );
 
@@ -1009,6 +1011,7 @@ mod tests {
                 env_file: None,
                 preview: None,
                 volumes: Vec::new(),
+                needs: Default::default(),
             },
         );
 

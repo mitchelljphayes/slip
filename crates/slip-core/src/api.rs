@@ -298,6 +298,8 @@ pub struct PreviewStatusResponse {
 /// Request body for `POST /v1/apps`.
 #[derive(Debug, Deserialize)]
 pub struct CreateAppRequest {
+    #[serde(default)]
+    pub needs: std::collections::BTreeMap<String, crate::needs::Need>,
     pub name: String,
     pub image: String,
     pub domain: String,
@@ -329,6 +331,7 @@ fn default_app_port() -> u16 {
 /// Request body for `PATCH /v1/apps/{name}`.
 #[derive(Debug, Deserialize)]
 pub struct UpdateAppRequest {
+    pub needs: Option<std::collections::BTreeMap<String, crate::needs::Need>>,
     pub image: Option<String>,
     pub domain: Option<String>,
     pub port: Option<u16>,
@@ -403,6 +406,8 @@ fn validate_tag(tag: &str) -> Result<(), AppError> {
 /// Response for `GET /v1/apps` and `GET /v1/apps/{name}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppResponse {
+    #[serde(default)]
+    pub needs: std::collections::BTreeMap<String, crate::needs::Need>,
     pub name: String,
     pub image: String,
     pub domain: String,
@@ -428,6 +433,7 @@ pub struct AppResponse {
 impl From<&AppConfig> for AppResponse {
     fn from(cfg: &AppConfig) -> Self {
         Self {
+            needs: cfg.needs.clone(),
             name: cfg.app.name.clone(),
             image: cfg.app.image.clone(),
             domain: cfg.routing.domain.clone().unwrap_or_default(),
@@ -722,6 +728,19 @@ impl IntoResponse for AppError {
     }
 }
 
+impl From<crate::services::bindings::BindingError> for AppError {
+    fn from(error: crate::services::bindings::BindingError) -> Self {
+        use crate::services::bindings::BindingError;
+        let message = error.to_string();
+        match error {
+            BindingError::MissingService(_) => Self::NotFound(message),
+            BindingError::Invalid(_) => Self::BadRequest(message),
+            BindingError::Conflict(_) => Self::Conflict(message),
+            BindingError::Provision | BindingError::Store => Self::Internal(message),
+        }
+    }
+}
+
 // ─── Shared application state ─────────────────────────────────────────────────
 
 /// Shared state injected into every request handler via `axum::extract::State`.
@@ -729,7 +748,7 @@ pub struct AppState {
     /// Daemon-level configuration (auth secret, Caddy URL, etc.).
     pub config: SlipConfig,
     /// Per-application configurations keyed by app name.
-    pub apps: RwLock<HashMap<String, AppConfig>>,
+    pub apps: Arc<RwLock<HashMap<String, AppConfig>>>,
     /// Path to the configuration directory (for writing app configs).
     pub config_dir: PathBuf,
     /// Per-app deploy locks; prevents concurrent deploys for the same app.
@@ -1003,12 +1022,66 @@ fn validate_app_name(name: &str) -> Result<(), AppError> {
 }
 
 /// `POST /v1/apps`, Create a new app.
+fn lock_app(state: &AppState, name: &str) -> Result<tokio::sync::OwnedMutexGuard<()>, AppError> {
+    let lock = state
+        .deploy_locks
+        .entry(name.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    lock.try_lock_owned().map_err(|_| {
+        AppError::Conflict(format!(
+            "app '{name}' is being deployed or updated — wait for it to finish and retry"
+        ))
+    })
+}
+
+async fn prepare_bindings<'a>(
+    state: &'a AppState,
+    app: &AppConfig,
+) -> Result<Option<tokio::sync::MutexGuard<'a, ()>>, AppError> {
+    crate::needs::validate_needs(&app.needs, &app.env)
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    if let Some(services) = &state.services {
+        return Ok(Some(services.bind(app, &state.secrets_store).await?));
+    }
+    if let Some(need) = app.needs.values().next() {
+        return Err(crate::services::bindings::BindingError::MissingService(
+            need.r#type.to_string(),
+        )
+        .into());
+    }
+    Ok(None)
+}
+
+/// Persist before publishing. Awaiting writes under the app lock prevents an
+/// earlier apply's background write from restoring a detached binding on disk.
+async fn persist_app(state: &AppState, app: &AppConfig) -> Result<(), AppError> {
+    let config_dir = state.config_dir.clone();
+    let app = app.clone();
+    let state_dir = state.config.storage.path.join("state");
+    tokio::task::spawn_blocking(move || {
+        crate::config::write_app_config(&config_dir, &app)
+            .map_err(|_| AppError::Internal("failed to persist app config — check server config directory permissions and retry `slip apply`".into()))?;
+        if let Err(e) = crate::state::save_last_applied(&state_dir, &app.app.name, &AppResponse::from(&app)) {
+            warn!(error = %e, "failed to save last_applied state");
+        }
+        Ok(())
+    }).await.map_err(|_| AppError::Internal("app config writer failed — retry `slip apply`".into()))?
+}
+
 async fn handle_create_app(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateAppRequest>,
 ) -> Result<(StatusCode, Json<AppResponse>), AppError> {
     // Validate name format
     validate_app_name(&req.name)?;
+    let _app_guard = lock_app(&state, &req.name)?;
+    if state.apps.read().await.contains_key(&req.name) {
+        return Err(AppError::Conflict(format!(
+            "app '{}' already exists",
+            req.name
+        )));
+    }
 
     // Build AppConfig from request
     let app_config = AppConfig {
@@ -1031,38 +1104,17 @@ async fn handle_create_app(
         network: req.network.unwrap_or_default(),
         preview: req.preview,
         volumes: req.volumes.unwrap_or_default(),
+        needs: req.needs,
     };
 
-    // Check for conflicts and insert atomically (TOCTOU fix)
-    {
-        let mut apps = state.apps.write().await;
-        if apps.contains_key(&req.name) {
-            return Err(AppError::Conflict(format!(
-                "app '{}' already exists",
-                req.name
-            )));
-        }
-        apps.insert(req.name.clone(), app_config.clone());
-    }
-
-    // Write config to disk (non-blocking)
-    let config_dir = state.config_dir.clone();
-    let app_config_clone = app_config.clone();
-    let state_dir = state.config.storage.path.join("state");
+    let _bindings_lease = prepare_bindings(&state, &app_config).await?;
+    persist_app(&state, &app_config).await?;
+    state
+        .apps
+        .write()
+        .await
+        .insert(req.name.clone(), app_config.clone());
     let app_response = AppResponse::from(&app_config);
-    let app_name_clone = req.name.clone();
-    let app_response_clone = app_response.clone();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = crate::config::write_app_config(&config_dir, &app_config_clone) {
-            warn!(error = %e, "failed to write app config");
-        }
-        // Save last_applied for drift detection.
-        if let Err(e) =
-            crate::state::save_last_applied(&state_dir, &app_name_clone, &app_response_clone)
-        {
-            warn!(error = %e, "failed to save last_applied state");
-        }
-    });
 
     info!(app = %req.name, "app created");
 
@@ -1100,8 +1152,9 @@ async fn handle_update_app(
     Json(req): Json<UpdateAppRequest>,
 ) -> Result<(StatusCode, Json<AppResponse>), AppError> {
     // Get existing config and merge updates
+    let _app_guard = lock_app(&state, &name)?;
     let updated_config = {
-        let mut apps = state.apps.write().await;
+        let apps = state.apps.read().await;
         let existing = apps
             .get(&name)
             .ok_or_else(|| {
@@ -1130,6 +1183,9 @@ async fn handle_update_app(
         if let Some(env) = req.env {
             updated.env = env;
         }
+        if let Some(needs) = req.needs {
+            updated.needs = needs;
+        }
         if let Some(resources) = req.resources {
             updated.resources = resources;
         }
@@ -1155,28 +1211,17 @@ async fn handle_update_app(
             updated.routing.tls = Some(tls);
         }
 
-        apps.insert(name.clone(), updated.clone());
         updated
     };
 
-    // Write config to disk
-    let config_dir = state.config_dir.clone();
-    let app_config_clone = updated_config.clone();
-    let state_dir = state.config.storage.path.join("state");
+    let _bindings_lease = prepare_bindings(&state, &updated_config).await?;
+    persist_app(&state, &updated_config).await?;
+    state
+        .apps
+        .write()
+        .await
+        .insert(name.clone(), updated_config.clone());
     let app_response = AppResponse::from(&updated_config);
-    let app_name_clone = name.clone();
-    let app_response_clone = app_response.clone();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = crate::config::write_app_config(&config_dir, &app_config_clone) {
-            warn!(error = %e, "failed to write app config");
-        }
-        // Save last_applied for drift detection.
-        if let Err(e) =
-            crate::state::save_last_applied(&state_dir, &app_name_clone, &app_response_clone)
-        {
-            warn!(error = %e, "failed to save last_applied state");
-        }
-    });
 
     info!(app = %name, "app updated");
 
@@ -1188,6 +1233,7 @@ async fn handle_delete_app(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let _app_guard = lock_app(&state, &name)?;
     // Remove from apps map
     {
         let mut apps = state.apps.write().await;
@@ -1217,7 +1263,8 @@ async fn handle_delete_app(
         }
     }
 
-    // Remove Caddy routes
+    // Route removal needs the count that the reconcile loop would re-add;
+    // the map is already gone, so fall back to one for a single-route app.
     let route_count = state
         .app_states
         .read()
@@ -1229,8 +1276,8 @@ async fn handle_delete_app(
         warn!(app = %name, error = %e, "failed to remove Caddy routes during app deletion");
     }
 
-    // Remove deploy lock
-    state.deploy_locks.remove(&name);
+    // Keep the lock entry: removing it while held permits a second lock for
+    // the same app to race retained credential writes during re-registration.
 
     // Remove app state
     state.app_states.write().await.remove(&name);
@@ -1247,7 +1294,13 @@ async fn handle_delete_app(
         if let Err(e) = crate::config::delete_app_config(&config_dir, &name_clone) {
             warn!(app = %name_clone, error = %e, "failed to delete app config file");
         }
-    });
+    })
+    .await
+    .map_err(|_| {
+        AppError::Internal(
+            "app config cleanup failed — check server config before re-registering the app".into(),
+        )
+    })?;
 
     info!(app = %name, "app deleted");
 
@@ -1384,10 +1437,11 @@ async fn handle_list_secrets(
         }
     }
 
-    let keys = state
-        .secrets_store
-        .list(&name)
-        .map_err(|e| AppError::Internal(format!("failed to list secrets: {e}")))?;
+    let apps = state.apps.read().await;
+    let app = apps
+        .get(&name)
+        .ok_or_else(|| AppError::NotFound(format!("app '{name}' not found — run `slip apply`")))?;
+    let keys = crate::services::bindings::secret_keys(&state.secrets_store, app)?;
 
     Ok((StatusCode::OK, Json(SecretsListResponse { secrets: keys })))
 }
@@ -1401,6 +1455,7 @@ async fn handle_set_secrets(
     Path(name): Path<String>,
     Json(req): Json<SetSecretsRequest>,
 ) -> Result<(StatusCode, Json<SetSecretsResponse>), AppError> {
+    let _app_guard = lock_app(&state, &name)?;
     // Verify app exists
     {
         let apps = state.apps.read().await;
@@ -1413,7 +1468,15 @@ async fn handle_set_secrets(
     }
 
     // Validate all key names before writing any
+    let app = state
+        .apps
+        .read()
+        .await
+        .get(&name)
+        .cloned()
+        .expect("app exists under app lock");
     for key in req.secrets.keys() {
+        reject_binding_secret(&app, key)?;
         if let Err(msg) = validate_secret_key(key) {
             return Err(AppError::BadRequest(format!(
                 "invalid secret key '{}': {msg}",
@@ -1448,6 +1511,7 @@ async fn handle_remove_secret(
     State(state): State<Arc<AppState>>,
     Path((name, key)): Path<(String, String)>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let _app_guard = lock_app(&state, &name)?;
     // Verify app exists
     {
         let apps = state.apps.read().await;
@@ -1459,6 +1523,14 @@ async fn handle_remove_secret(
         }
     }
 
+    let app = state
+        .apps
+        .read()
+        .await
+        .get(&name)
+        .cloned()
+        .expect("app exists under app lock");
+    reject_binding_secret(&app, &key)?;
     let existed = state
         .secrets_store
         .remove(&name, &key)
@@ -1477,6 +1549,18 @@ async fn handle_remove_secret(
 }
 
 // ─── Deploy key handler ────────────────────────────────────────────────────────
+fn reject_binding_secret(app: &AppConfig, key: &str) -> Result<(), AppError> {
+    if app
+        .needs
+        .iter()
+        .any(|(alias, need)| need.env_keys(alias).iter().any(|k| k == key))
+    {
+        return Err(AppError::Conflict(format!(
+            "secret '{key}' is managed by a service binding — remove the need from slip.toml and run `slip apply` to detach it"
+        )));
+    }
+    Ok(())
+}
 
 /// Request body for `PUT /v1/apps/{name}/key`.
 #[derive(Debug, Deserialize)]
@@ -1794,6 +1878,27 @@ async fn handle_deploy(
     if !verify_signature(sig_header, &body, &secret) {
         warn!(app = %request.app, "deploy rejected: invalid signature");
         return Err(AppError::Unauthorized("invalid signature".to_string()));
+    }
+
+    if !app_cfg.needs.is_empty() {
+        if request.preview.is_some() {
+            return Err(AppError::BadRequest("preview service bindings are not yet implemented — deploy a separately registered app with its own needs instead".into()));
+        }
+        match &state.services {
+            Some(services) => services.check_needs(&app_cfg, &state.secrets_store).await?,
+            None => {
+                return Err(crate::services::bindings::BindingError::MissingService(
+                    app_cfg
+                        .needs
+                        .values()
+                        .next()
+                        .expect("nonempty needs")
+                        .r#type
+                        .to_string(),
+                )
+                .into());
+            }
+        }
     }
 
     // 7. Resolve image (optional in request, fall back to app config).
@@ -2513,7 +2618,7 @@ async fn handle_app_status(
     };
 
     // ── Secret key names (never values) ────────────────────────────────────
-    let secrets = state.secrets_store.list(&name).unwrap_or_default();
+    let secrets = crate::services::bindings::secret_keys(&state.secrets_store, &app_cfg)?;
 
     // ── Deploy metadata from cache ─────────────────────────────────────────
     let mut last_deploy: Option<DeploySummary> = None;
@@ -3553,13 +3658,20 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use axum::{
+        Json,
+        extract::{Path, State},
+    };
     use dashmap::DashMap;
     use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     use chrono::Utc;
 
-    use super::{LogEntry, parse_since_duration};
+    use super::{
+        AppError, LogEntry, SetSecretsRequest, UpdateAppRequest, handle_list_secrets,
+        handle_remove_secret, handle_set_secrets, handle_update_app, parse_since_duration,
+    };
     use crate::api::{
         AppListResponse, AppResponse, AppState, DeployResponse, ErrorResponse, build_router,
     };
@@ -3619,6 +3731,7 @@ mod tests {
             network: NetworkConfig::default(),
             preview: None,
             volumes: Vec::new(),
+            needs: Default::default(),
         }
     }
     ///
@@ -3642,8 +3755,8 @@ mod tests {
 
         Arc::new(AppState {
             config,
-            apps: RwLock::new(apps),
-            config_dir: PathBuf::from("/tmp/slip-test"),
+            apps: Arc::new(RwLock::new(apps)),
+            config_dir: secrets_path.join("config"),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(
                 DockerClient::new_with_url("http://127.0.0.1:19998").expect("DockerClient::new"),
@@ -3660,6 +3773,115 @@ mod tests {
             secrets_store: SecretsStore::new(secrets_path).unwrap(),
             services: None,
         })
+    }
+
+    #[tokio::test]
+    async fn binding_missing_service_is_404_without_publishing_app() {
+        let state = create_test_state();
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/apps")
+                    .header("Authorization", auth_header(GLOBAL_SECRET))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "new-app", "image": "example/app", "domain": "app.example.com",
+                            "needs": {"db": {"type": "postgres"}}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("slip services add postgres"));
+        assert!(!state.apps.read().await.contains_key("new-app"));
+        assert!(!state.config_dir.join("apps/new-app.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn binding_failed_update_preserves_existing_config() {
+        let state = create_test_state();
+        let req: UpdateAppRequest = serde_json::from_value(serde_json::json!({
+            "env": {"NEW": "not-committed"}, "needs": {"db": {"type": "postgres"}}
+        }))
+        .unwrap();
+        let result =
+            handle_update_app(State(state.clone()), Path(APP_NAME.into()), Json(req)).await;
+        assert!(matches!(result, Err(AppError::NotFound(_))));
+        let apps = state.apps.read().await;
+        assert!(apps[APP_NAME].needs.is_empty());
+        assert!(!apps[APP_NAME].env.contains_key("NEW"));
+    }
+
+    #[tokio::test]
+    async fn binding_validation_happens_before_service_operations() {
+        let state = create_test_state();
+        let req: UpdateAppRequest = serde_json::from_value(serde_json::json!({
+            "needs": {"../bad": {"type": "postgres"}}
+        }))
+        .unwrap();
+        let result =
+            handle_update_app(State(state.clone()), Path(APP_NAME.into()), Json(req)).await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+        let req: UpdateAppRequest = serde_json::from_value(serde_json::json!({
+            "env": {"DATABASE_URL": "canary-not-for-errors"}, "needs": {"db": {"type": "postgres"}}
+        }))
+        .unwrap();
+        let result =
+            handle_update_app(State(state.clone()), Path(APP_NAME.into()), Json(req)).await;
+        let error = result.unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert!(!format!("{error:?}").contains("canary-not-for-errors"));
+    }
+
+    #[tokio::test]
+    async fn binding_keys_are_visible_but_cannot_be_manually_changed() {
+        let state = create_test_state();
+        state
+            .apps
+            .write()
+            .await
+            .get_mut(APP_NAME)
+            .unwrap()
+            .needs
+            .insert(
+                "db".into(),
+                crate::needs::Need::new(crate::needs::NeedType::Postgres),
+            );
+        let (_, Json(response)) = handle_list_secrets(State(state.clone()), Path(APP_NAME.into()))
+            .await
+            .unwrap();
+        assert_eq!(response.secrets, ["DATABASE_URL"]);
+        let result = handle_set_secrets(
+            State(state.clone()),
+            Path(APP_NAME.into()),
+            Json(SetSecretsRequest {
+                secrets: HashMap::from([("DATABASE_URL".into(), "canary".into())]),
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::Conflict(_))));
+        let result = handle_remove_secret(
+            State(state.clone()),
+            Path((APP_NAME.into(), "DATABASE_URL".into())),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::Conflict(_))));
+        let req = serde_json::from_value(serde_json::json!({"needs": {}})).unwrap();
+        let _ = handle_update_app(State(state.clone()), Path(APP_NAME.into()), Json(req))
+            .await
+            .unwrap();
+        let (_, Json(response)) = handle_list_secrets(State(state.clone()), Path(APP_NAME.into()))
+            .await
+            .unwrap();
+        assert!(response.secrets.is_empty());
     }
 
     /// Observation-only bounded poll of the **handler-written** app config on
@@ -4022,7 +4244,7 @@ mod tests {
 
         let state_inner = Arc::new(AppState {
             config: test_slip_config(),
-            apps: RwLock::new(apps),
+            apps: Arc::new(RwLock::new(apps)),
             config_dir: PathBuf::from("/tmp/slip-test"),
             deploy_locks,
             runtime: Arc::new(
@@ -4080,7 +4302,7 @@ mod tests {
 
         let state = Arc::new(AppState {
             config: test_slip_config(),
-            apps: RwLock::new(apps),
+            apps: Arc::new(RwLock::new(apps)),
             config_dir: PathBuf::from("/tmp/slip-test"),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(
@@ -4365,7 +4587,7 @@ mod tests {
 
         let state = Arc::new(AppState {
             config,
-            apps: RwLock::new(apps),
+            apps: Arc::new(RwLock::new(apps)),
             config_dir: PathBuf::from("/tmp/slip-test"),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(
@@ -4756,7 +4978,7 @@ mod tests {
 
         let state = Arc::new(AppState {
             config,
-            apps: RwLock::new(apps),
+            apps: Arc::new(RwLock::new(apps)),
             config_dir: PathBuf::from("/tmp/slip-test"),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(
@@ -4928,7 +5150,7 @@ mod tests {
         let config = test_slip_config();
         let state = Arc::new(AppState {
             config,
-            apps: RwLock::new(HashMap::new()),
+            apps: Arc::new(RwLock::new(HashMap::new())),
             config_dir: PathBuf::from("/tmp/slip-test"),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(
@@ -5038,7 +5260,7 @@ mod tests {
         let config = test_slip_config();
         let state = Arc::new(AppState {
             config,
-            apps: RwLock::new(HashMap::new()),
+            apps: Arc::new(RwLock::new(HashMap::new())),
             config_dir: PathBuf::from("/tmp/slip-test"),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(
@@ -5412,7 +5634,7 @@ mod tests {
 
         let state = Arc::new(AppState {
             config: test_slip_config(),
-            apps: RwLock::new(apps),
+            apps: Arc::new(RwLock::new(apps)),
             config_dir: PathBuf::from("/tmp/slip-test"),
             deploy_locks,
             runtime: Arc::new(
@@ -5716,7 +5938,7 @@ mod tests {
 
         let state = Arc::new(AppState {
             config: test_slip_config(),
-            apps: RwLock::new(apps),
+            apps: Arc::new(RwLock::new(apps)),
             config_dir: PathBuf::from("/tmp/slip-test"),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(
@@ -6404,7 +6626,7 @@ path = {storage_path:?}
 
         let state = Arc::new(AppState {
             config: parsed_cfg,
-            apps: RwLock::new(HashMap::new()),
+            apps: Arc::new(RwLock::new(HashMap::new())),
             config_dir: config_dir.clone(),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(
@@ -6570,7 +6792,7 @@ path = {storage_path:?}
 
         let state = Arc::new(AppState {
             config: parsed_cfg,
-            apps: RwLock::new(HashMap::new()),
+            apps: Arc::new(RwLock::new(HashMap::new())),
             config_dir: config_dir.clone(),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(
@@ -6742,7 +6964,7 @@ path = {storage_path:?}
 
         let state = Arc::new(AppState {
             config: parsed_cfg,
-            apps: RwLock::new(HashMap::new()),
+            apps: Arc::new(RwLock::new(HashMap::new())),
             config_dir: config_dir.clone(),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(
@@ -7722,7 +7944,7 @@ path = {storage_path:?}
 
         Arc::new(AppState {
             config: test_slip_config(),
-            apps: RwLock::new(apps),
+            apps: Arc::new(RwLock::new(apps)),
             config_dir: PathBuf::from("/tmp/slip-test"),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(

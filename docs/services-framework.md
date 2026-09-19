@@ -5,6 +5,116 @@ server state backed by a Slip-owned rootful Podman container on the shared `slip
 network, with stable DNS, persistent data, no host ports, and startup plus
 periodic reconciliation.
 
+## App bindings (`[needs.*]`)
+
+Provision PostgreSQL once on the server, then declare a database in the app's
+repo `slip.toml`:
+
+```bash
+slip services add postgres
+```
+
+```toml
+[needs.db]
+type = "postgres"
+
+# Optional second, isolated database for the same app:
+[needs.analytics]
+type = "postgres"
+```
+
+Run `slip validate`, then `slip apply`. Apply creates an owner role, a database,
+and a generated password for each need. The next deployment injects the connection
+variables. `slip deploy` applies repo config by default; `--no-apply` and raw
+webhooks use the server's already-applied needs. Declarations in an older image
+cannot restore a need that was removed by apply.
+
+PostgreSQL is the currently implemented provider. `s3` and `kv` declarations are
+validated with the contracts below, but provisioning needs their future service
+providers. Missing services fail with exit **4**, for example:
+
+```text
+no postgres service: run `slip services add postgres` on the server
+```
+
+### Exact environment contract
+
+Aliases must match `[a-z][a-z0-9_]*` and be at most 32 ASCII characters. Only
+`db`, `storage`, and `cache` are canonical; each is reserved for its matching type.
+Every other alias gets its uppercase spelling plus `_` prepended to each canonical
+variable. This rule does not depend on declaration order or the number of needs.
+
+| Type | Canonical alias | Injected variables | Example additional alias |
+|---|---|---|---|
+| `postgres` | `db` | `DATABASE_URL` | `analytics` → `ANALYTICS_DATABASE_URL` |
+| `s3` | `storage` | `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | `uploads` → `UPLOADS_S3_ENDPOINT`, `UPLOADS_S3_REGION`, `UPLOADS_S3_BUCKET`, `UPLOADS_S3_ACCESS_KEY_ID`, `UPLOADS_S3_SECRET_ACCESS_KEY` |
+| `kv` | `cache` | `REDIS_URL` | `sessions` → `SESSIONS_REDIS_URL` |
+
+For example, `needs.postgres` is non-canonical and injects
+`POSTGRES_DATABASE_URL`, not `DATABASE_URL`. Unknown types, unknown fields, invalid
+aliases, and collisions with `[env]` are errors. Existing manually managed secrets
+with a generated key also block binding: remove that secret or rename the alias.
+While bound, the secrets API refuses to set or remove those keys. In pods, explicit
+`env` entries with binding keys (including `valueFrom` and init-container entries)
+are rejected; remove them so Slip can inject the binding. Binding values take
+precedence over env-file defaults.
+
+`DATABASE_URL` has the form
+`postgresql://<role>:<password>@<service-name>:5432/<database>`. Database and role
+names are opaque identifiers derived from installation, service instance, app,
+and alias. Passwords are generated independently for each resource. Roles have
+no superuser, role-creation, replication, bypass-RLS, or database-creation
+privileges. PUBLIC cannot connect to another app's database.
+
+### Selection, retries, and retention
+
+- On first binding, exactly one provisioned service of the requested type must
+  exist. Multiple candidates fail rather than choosing one arbitrarily. The
+  selected service instance is then pinned in the secrets store; adding another
+  service cannot migrate an existing binding.
+- Apply validates all needs before provisioning. Partial provisioning can retain
+  resources, but failed apply does not publish a changed app config. Retry apply
+  to complete the operation; it reuses the persisted credentials and data.
+- Deploy checks resources again before starting or stopping app containers.
+  Credential or provider errors fail closed, never deploy without required env.
+- Remove a need from `slip.toml` and apply to **detach** it. Its variable is absent
+  from subsequent deployments and secret-key listings; its database, role, and
+  credentials remain. A running container keeps its current environment until
+  redeployed. Restoring the same app/alias/type reattaches the same resource.
+- Renaming the app or alias creates a different resource; it does not migrate
+  data. Deleting an app also retains its database and binding credentials.
+- Normal service removal refuses active bindings. `--force` removes the service
+  container despite those bindings, but still retains data and credentials.
+  Re-add the same service name, version, and config to restore the retained
+  instance. Remove/add is **not** a PostgreSQL upgrade mechanism.
+- Preview bindings are not yet implemented. Use a separately registered app
+  with its own needs; previews never silently receive production credentials.
+
+Credentials and injected values live under
+`<storage>/secrets/__bindings/<sha256(app-name)>`, in private, atomically replaced
+files. This namespace survives app deletion. Back up it, `slip.db`, and service
+data/secrets together. API app config responses contain declarations only;
+`slip status <app>` and secret listings expose key names, not values. Rendered
+pod manifests also contain credentials and are written with mode `0600`.
+
+### Explicit data destruction (server only)
+
+Neither apply nor `slip services rm`, even with `--force`, drops databases.
+There is no Slip resource-destruction CLI yet. After backing up and detaching the
+need, stop or redeploy every old app container using it. On the server, identify
+the resource's `resource_id` and service from its retained binding record without
+printing the password or connection URL. Open an administrative session:
+
+```bash
+sudo podman exec -it --env PGPASSFILE=/run/secrets/slip-pgpass \
+  slip-service-postgres psql -h 127.0.0.1 -U postgres -d postgres
+```
+
+Replace the container name if the service has a custom name. Confirm the resource
+identifier and backup, then explicitly run `DROP DATABASE <resource_id>;` followed
+by `DROP ROLE <resource_id>;`. These SQL commands are destructive. Reapplying the
+old need later recreates an **empty** resource; detachment alone never does this.
+
 ## Architecture
 
 The framework has four layers:
@@ -35,7 +145,9 @@ To add a new service provider:
        fn provision<'a>(...) -> BoxFuture<'a, Result<ProvisionOutcome, ServiceError>> { ... }
        fn ensure<'a>(...) -> BoxFuture<'a, Result<EnsureOutcome, ServiceError>> { ... }
        fn health<'a>(...) -> BoxFuture<'a, Result<ServiceHealth, ServiceError>> { ... }
-       fn remove<'a>(...) -> BoxFuture<'a, Result<(), ServiceError>> { ... }
+        fn remove<'a>(...) -> BoxFuture<'a, Result<(), ServiceError>> { ... }
+        fn create_resource<'a>(...) -> BoxFuture<'a, Result<(), ServiceError>> { ... }
+        fn resource_env(...) -> Result<BTreeMap<String, String>, ServiceError> { ... }
    }
    ```
 
@@ -50,6 +162,12 @@ To add a new service provider:
    ```
 
 5. **Export the module** from `services/mod.rs`.
+
+For bindings, `create_resource` must be retry-safe and refuse foreign objects.
+The controller persists resource credentials before invoking it, serializes with
+service reconciliation/removal, and maps the canonical keys from `resource_env`
+to alias-prefixed keys. Never log credentials or place them in service exec argv;
+the PostgreSQL provider uses bounded stdin exec and mounted admin authentication.
 
 ## Ownership labels
 

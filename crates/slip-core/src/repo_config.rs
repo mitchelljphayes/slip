@@ -4,6 +4,7 @@
 //! health check settings, routing port, resource defaults, and preview configuration.
 //! The server config describes **where it runs**: domain, secrets, resource overrides.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -58,6 +59,11 @@ pub struct RepoConfig {
     /// Laptop-side remote binding (written by `slip link`).
     #[serde(default)]
     pub remote: RemoteConfig,
+    /// Service-need bindings (`[needs.<alias>]`), pushed from the repo. The
+    /// server config is authoritative per alias (see `merge.rs`); this is the
+    /// repo-side declaration of what the app needs.
+    #[serde(default)]
+    pub needs: BTreeMap<String, crate::needs::Need>,
 }
 
 /// Basic application identity from the repo config.

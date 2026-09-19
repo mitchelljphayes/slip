@@ -598,6 +598,45 @@ pub trait RuntimeBackend: Send + Sync {
             ))
         })
     }
+
+    /// Execute a bounded command inside a running service container, feeding
+    /// `stdin_input` to the command's stdin and discarding all output.
+    ///
+    /// This is the secure runtime exec used by [`ServiceProvider::create_resource`]
+    /// (SLIP-107) to run provider-specific SQL inside the service container
+    /// without placing any secret material in argv or env. For PostgreSQL,
+    /// the argv is `["psql", "--no-psqlrc", "-v", "ON_ERROR_STOP=1", ...]`
+    /// and the SQL is piped via stdin; the password is conveyed only through
+    /// a mounted `PGPASSFILE` (the same readiness-check pattern).
+    ///
+    /// Contract:
+    /// - `argv` is a static `&[&str]` (no shell, no interpolation).
+    /// - `env` pairs are allowlisted non-secret settings (e.g.
+    ///   `PGPASSFILE=/run/secrets/slip-pgpass`).
+    /// - `stdin_input` is written to the command's stdin in full before
+    ///   stdin is closed. It MUST NOT contain the password; it carries
+    ///   only SQL referencing the validated resource id.
+    /// - Output is capped at `max_output_bytes` and discarded on success.
+    /// - On non-zero exit, returns `Err(RuntimeError::ExecFailed(...))`
+    ///   with sanitized text (no raw stdout/stderr, no secret material).
+    ///
+    /// Default returns `Unsupported` so existing fakes are unaffected until
+    /// a runtime explicitly implements it.
+    fn exec_service_stdin<'a>(
+        &'a self,
+        _container_id: &'a str,
+        _argv: &'a [&'a str],
+        _env: &'a [(&'a str, &'a str)],
+        _stdin_input: &'a [u8],
+        _timeout: Duration,
+        _max_output_bytes: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async {
+            Err(RuntimeError::Unsupported(
+                "service exec stdin not implemented for this runtime".to_string(),
+            ))
+        })
+    }
 }
 
 /// Registry credentials for image pulls.

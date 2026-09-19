@@ -182,6 +182,16 @@ pub fn merge_config(server: &AppConfig, repo: &RepoConfig) -> Result<MergedConfi
             .collect()
     };
 
+    // ── Needs: server config is the authoritative whole map ──────────────────
+    // Like `env` under `slip apply` (full-replace), the server config's needs
+    // map is authoritative in full. The repo's image-carried `[needs]` is a
+    // *declaration* that the deploy path rejects if it mismatches the server's
+    // bound services (remedy: `slip apply`). It must NOT silently resurrect
+    // needs that were removed from the server config, because doing so would
+    // revive stale bindings from an old image. So the merged needs are exactly
+    // the server's needs, period.
+    merged.needs = server.needs.clone();
+
     Ok(MergedConfig {
         app: merged,
         kind: repo.app.kind.clone(),
@@ -223,6 +233,7 @@ pub struct MergedConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::time::Duration;
 
@@ -268,6 +279,7 @@ mod tests {
             network: NetworkConfig::default(),
             preview: None,
             volumes: Vec::new(),
+            needs: BTreeMap::new(),
         }
     }
 
@@ -287,6 +299,7 @@ mod tests {
             env: HashMap::new(),
             deploy: None,
             remote: RemoteConfig::default(),
+            needs: BTreeMap::new(),
         }
     }
 
@@ -828,5 +841,97 @@ mod tests {
             merged.app.health.expect_status.is_none(),
             "absent on both sides → None (default 200-399 applied at probe time)"
         );
+    }
+
+    // ── Needs merge (server config is authoritative whole map) ────────────────
+
+    fn need(kind: crate::needs::NeedType) -> crate::needs::Need {
+        crate::needs::Need::new(kind)
+    }
+
+    #[test]
+    fn merge_needs_server_only_kept() {
+        let mut server = base_server_config();
+        server
+            .needs
+            .insert("db".to_string(), need(crate::needs::NeedType::Postgres));
+        let repo = minimal_repo_config("testapp");
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        assert_eq!(merged.app.needs.len(), 1);
+        assert!(merged.app.needs.contains_key("db"));
+    }
+
+    #[test]
+    fn merge_needs_server_empty_drops_repo_needs() {
+        // Server has no needs; repo declares `db`. The repo's image-carried
+        // needs are a declaration, not authority: the merged config must be
+        // empty so a stale image cannot resurrect a removed binding.
+        let server = base_server_config();
+        let mut repo = minimal_repo_config("testapp");
+        repo.needs
+            .insert("db".to_string(), need(crate::needs::NeedType::Postgres));
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        assert!(
+            merged.app.needs.is_empty(),
+            "server.needs is authoritative whole map; repo needs must not leak in"
+        );
+    }
+
+    #[test]
+    fn merge_needs_server_wins_over_repo() {
+        // Both declare `db`; merged result is exactly server's, ignoring repo.
+        let mut server = base_server_config();
+        server
+            .needs
+            .insert("db".to_string(), need(crate::needs::NeedType::Postgres));
+        let mut repo = minimal_repo_config("testapp");
+        repo.needs
+            .insert("db".to_string(), need(crate::needs::NeedType::S3));
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        assert_eq!(
+            merged.app.needs.get("db").unwrap().r#type,
+            crate::needs::NeedType::Postgres,
+            "server.needs replaces repo.needs wholesale"
+        );
+    }
+
+    #[test]
+    fn merge_needs_server_full_replace_drops_repo_only_alias() {
+        // Server has `cache`; repo has `db` and `cache`. Merged = server only
+        // (`cache`). The repo-only `db` must NOT survive.
+        let mut server = base_server_config();
+        server
+            .needs
+            .insert("cache".to_string(), need(crate::needs::NeedType::Kv));
+        let mut repo = minimal_repo_config("testapp");
+        repo.needs
+            .insert("db".to_string(), need(crate::needs::NeedType::Postgres));
+        repo.needs
+            .insert("cache".to_string(), need(crate::needs::NeedType::Kv));
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        assert_eq!(merged.app.needs.len(), 1);
+        assert!(merged.app.needs.contains_key("cache"));
+        assert!(
+            !merged.app.needs.contains_key("db"),
+            "repo-only alias must not survive server full-replace"
+        );
+    }
+
+    #[test]
+    fn merge_needs_empty_both_yields_empty() {
+        let server = base_server_config();
+        let repo = minimal_repo_config("testapp");
+
+        let merged = merge_config(&server, &repo).unwrap();
+
+        assert!(merged.app.needs.is_empty());
     }
 }

@@ -30,6 +30,7 @@ GitHub Actions → signed webhook → slipd → pull → health check → swap r
 - **`slip logs`** — remote container log tail/follow via the management API
 - **`slip doctor`** — host diagnostics (DNS, UFW, runtime, registry, Caddy, TLS) with prescriptive remedies
 - **`slip apply`** — the repo's `slip.toml` becomes the source of truth (validate → diff → push)
+- **Service bindings**: `[needs.db]` provisions an isolated PostgreSQL database and injects `DATABASE_URL`; see the [env and retention contract](docs/services-framework.md#app-bindings-needs)
 
 ## Install
 

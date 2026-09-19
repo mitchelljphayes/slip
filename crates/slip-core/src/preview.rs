@@ -1976,6 +1976,7 @@ mod tests {
             network: crate::config::NetworkConfig::default(),
             preview: None,
             volumes: Vec::new(),
+            needs: Default::default(),
         }
     }
 
@@ -3547,7 +3548,7 @@ enabled = true
 
         Arc::new(crate::api::AppState {
             config,
-            apps: RwLock::new(apps),
+            apps: Arc::new(RwLock::new(apps)),
             config_dir: std::path::PathBuf::from("/tmp/slip-test"),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(docker),

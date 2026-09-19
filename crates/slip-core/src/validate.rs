@@ -72,6 +72,11 @@ pub enum ValidationError {
     /// Unknown app kind.
     #[error("unknown app kind '{kind}'; expected 'container', 'pod', or 'worker'")]
     InvalidKind { kind: String },
+
+    /// A `[needs.<alias>]` binding is invalid (bad alias, env conflict, collision,
+    /// or canonical/type mismatch). See `needs::NeedError` for the precise rule.
+    #[error("needs binding error: {message}")]
+    NeedsValidationError { message: String },
 }
 
 // ─── Validation Result ────────────────────────────────────────────────────────
@@ -178,6 +183,18 @@ pub fn validate_repo_config(config: &RepoConfig, base_dir: &Path) -> ValidationR
     // Validate volumes
     if !config.volumes.is_empty() {
         result.merge(validate_volumes(&config.volumes));
+    }
+
+    // Validate needs bindings (alias format, env conflicts, collisions,
+    // canonical/type consistency). The repo env map is the relevant one here
+    // because needs-env conflicts are about the env the app itself declares.
+    if !config.needs.is_empty() {
+        match crate::needs::validate_needs(&config.needs, &config.env) {
+            Ok(()) => {}
+            Err(e) => result.add_error(ValidationError::NeedsValidationError {
+                message: e.to_string(),
+            }),
+        }
     }
 
     // ── Health: warn on root-path readiness anti-pattern ──────────────────────
@@ -1428,5 +1445,161 @@ name = "myapp"
                 .all(|w| !w.contains("does not prove readiness")),
             "no health path → no root-path warning"
         );
+    }
+
+    // ── Needs validation ───────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_needs_valid_binding_passes() {
+        let temp = TempDir::new().unwrap();
+        let toml = r#"
+[app]
+name = "myapp"
+
+[needs.db]
+type = "postgres"
+"#;
+        let (config, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(result.is_valid(), "errors: {:?}", result.errors);
+        let cfg = config.expect("config parsed");
+        assert!(cfg.needs.contains_key("db"));
+    }
+
+    #[test]
+    fn validate_needs_unknown_type_errors() {
+        let temp = TempDir::new().unwrap();
+        let toml = r#"
+[app]
+name = "myapp"
+
+[needs.db]
+type = "mysql"
+"#;
+        let (_, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(!result.is_valid());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::TomlParse { .. })
+                    | matches!(e, ValidationError::NeedsValidationError { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_needs_env_conflict_errors() {
+        let temp = TempDir::new().unwrap();
+        // `db` need injects DATABASE_URL; [env] also sets it → conflict.
+        let toml = r#"
+[app]
+name = "myapp"
+
+[env]
+DATABASE_URL = "manual"
+
+[needs.db]
+type = "postgres"
+"#;
+        let (_, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(!result.is_valid());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::NeedsValidationError { .. })),
+            "env conflict should be a NeedsValidationError"
+        );
+    }
+
+    #[test]
+    fn validate_needs_canonical_type_mismatch_errors() {
+        let temp = TempDir::new().unwrap();
+        // `db` is canonical for postgres; using s3 is wrong.
+        let toml = r#"
+[app]
+name = "myapp"
+
+[needs.db]
+type = "s3"
+"#;
+        let (_, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(!result.is_valid());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::NeedsValidationError { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_needs_unknown_field_rejected_by_serde() {
+        let temp = TempDir::new().unwrap();
+        // Need struct has deny_unknown_fields; `provider` is not a field.
+        let toml = r#"
+[app]
+name = "myapp"
+
+[needs.db]
+type = "postgres"
+provider = "neon"
+"#;
+        let (_, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(!result.is_valid(), "unknown field must be rejected");
+    }
+
+    #[test]
+    fn validate_needs_multiple_distinct_ok() {
+        let temp = TempDir::new().unwrap();
+        let toml = r#"
+[app]
+name = "myapp"
+
+[needs.db]
+type = "postgres"
+
+[needs.cache]
+type = "kv"
+
+[needs.storage]
+type = "s3"
+
+[needs.analytics]
+type = "postgres"
+"#;
+        let (config, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(result.is_valid(), "errors: {:?}", result.errors);
+        let cfg = config.expect("config parsed");
+        assert_eq!(cfg.needs.len(), 4);
+    }
+
+    #[test]
+    fn validate_needs_invalid_alias_errors() {
+        let temp = TempDir::new().unwrap();
+        // Uppercase alias is invalid.
+        let toml = r#"
+[app]
+name = "myapp"
+
+[needs."My DB"]
+type = "postgres"
+"#;
+        let (_, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn validate_needs_empty_table_passes() {
+        let temp = TempDir::new().unwrap();
+        let toml = r#"
+[app]
+name = "myapp"
+
+[needs]
+"#;
+        let (config, result) = parse_and_validate(toml, temp.path(), false);
+        assert!(result.is_valid(), "errors: {:?}", result.errors);
+        let cfg = config.expect("config parsed");
+        assert!(cfg.needs.is_empty());
     }
 }

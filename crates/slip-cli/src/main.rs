@@ -830,6 +830,13 @@ async fn deploy(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            output::fail(
+                output::NOT_FOUND,
+                &api_error_text(&text),
+                "resolve the missing app or service, then retry the deployment",
+            );
+        }
         anyhow::bail!("API error ({}): {}", status, text);
     }
 
@@ -3025,6 +3032,13 @@ async fn apply_command(
             if status_code == reqwest::StatusCode::UNAUTHORIZED {
                 output::fail(output::AUTH, "authentication failed", "check your token");
             }
+            if status_code == reqwest::StatusCode::NOT_FOUND {
+                output::fail(
+                    output::NOT_FOUND,
+                    &api_error_text(&text),
+                    "provision the missing service on the server, then retry `slip apply`",
+                );
+            }
             anyhow::bail!("API error ({}): {}", status_code, text);
         } else {
             let out = slip_core::diff::ApplyDiff {
@@ -3120,8 +3134,8 @@ async fn apply_diff(
             reqwest::StatusCode::NOT_FOUND => {
                 output::fail(
                     output::NOT_FOUND,
-                    &format!("app '{app}' not found"),
-                    "it may have been deleted; run `slip apply` again to recreate it",
+                    &api_error_text(&text),
+                    "resolve the missing app or service, then retry `slip apply`",
                 );
             }
             _ => {
@@ -3149,6 +3163,17 @@ async fn apply_diff(
 }
 
 // ─── Init command implementation ──────────────────────────────────────────────
+fn api_error_text(text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| text.to_string())
+}
 
 /// Infer the app name from: --name flag > git remote origin org/repo > dir name.
 fn infer_name(explicit: Option<String>) -> String {

@@ -20,6 +20,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use tokio::sync::{Mutex, Semaphore};
 
+use super::bindings::{self, BindingError, BindingRecord};
 use crate::db::Db;
 use crate::runtime::RuntimeBackend;
 use crate::services::name::ServiceName;
@@ -29,6 +30,7 @@ use crate::services::spec::{
     FailureCode, HealthKind, InstanceSecretCapability, LifecyclePhase, ProviderContext,
     ProviderKind, ServiceError, ServiceProvider, ServiceSpec, ServiceState,
 };
+use crate::{config::AppConfig, secrets::SecretsStore};
 
 #[cfg(target_os = "linux")]
 use crate::services::secret::InstanceSecretBundle;
@@ -46,8 +48,7 @@ const PER_SERVICE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Trait for reading which apps use a service (usage boundary).
 ///
-/// Production impl returns empty until SLIP-107 adds `[needs.*]` to app
-/// configs. Fakes prove refusal + force override.
+/// Production reads live `[needs.*]` declarations and retained service pins.
 pub trait ServiceUsageReader: Send + Sync {
     /// Return app names that bind to this service. Empty = no bindings.
     fn bindings_for_service<'a>(
@@ -56,25 +57,72 @@ pub trait ServiceUsageReader: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send + 'a>>;
 }
 
-/// Production usage reader: returns empty (no `needs` field in AppConfig yet).
+/// Reads active declarations and retained service pins. Unresolved declarations
+/// conservatively protect services of the requested type.
 pub struct AppConfigUsageReader {
-    #[allow(dead_code)]
     apps: Arc<tokio::sync::RwLock<HashMap<String, crate::config::AppConfig>>>,
+    store: SecretsStore,
+    db: Db,
 }
 
 impl AppConfigUsageReader {
-    pub fn new(apps: Arc<tokio::sync::RwLock<HashMap<String, crate::config::AppConfig>>>) -> Self {
-        Self { apps }
+    pub fn new(
+        apps: Arc<tokio::sync::RwLock<HashMap<String, crate::config::AppConfig>>>,
+        store: SecretsStore,
+        db: Db,
+    ) -> Self {
+        Self { apps, store, db }
     }
 }
 
 impl ServiceUsageReader for AppConfigUsageReader {
     fn bindings_for_service<'a>(
         &'a self,
-        _name: &'a ServiceName,
+        name: &'a ServiceName,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send + 'a>> {
-        // No `needs` field in AppConfig yet; SLIP-107 will add it.
-        Box::pin(async { vec![] })
+        Box::pin(async move {
+            let snapshot: Vec<_> = self
+                .apps
+                .read()
+                .await
+                .iter()
+                .filter(|(_, app)| !app.needs.is_empty())
+                .map(|(name, app)| (name.clone(), app.needs.clone()))
+                .collect();
+            let fallback: Vec<_> = snapshot.iter().map(|(name, _)| name.clone()).collect();
+            let db = self.db.clone();
+            let store = self.store.clone();
+            let name = name.clone();
+            // Do not hold the live-map lock across filesystem I/O. Fail closed
+            // if the blocking task fails: protect every app with declarations.
+            tokio::task::spawn_blocking(move || {
+                let provider = db
+                    .with_conn(|conn| ServiceRepository::get_service(conn, &name))
+                    .ok()
+                    .flatten()
+                    .map(|row| row.provider());
+                let mut users = Vec::new();
+                for (app_name, needs) in snapshot {
+                    let records = bindings::load(&store, &app_name);
+                    if needs.iter().any(|(alias, need)| {
+                        match records
+                            .as_ref()
+                            .ok()
+                            .and_then(|r| r.get(&bindings::record_key(alias, need)))
+                        {
+                            Some(record) => record.service == name,
+                            None => provider.is_none_or(|p| p.as_str() == need.r#type.as_str()),
+                        }
+                    }) {
+                        users.push(app_name);
+                    }
+                }
+                users.sort();
+                users
+            })
+            .await
+            .unwrap_or(fallback)
+        })
     }
 }
 
@@ -152,6 +200,9 @@ pub struct ServiceController {
     locks: DashMap<ServiceName, Arc<Mutex<()>>>,
     ensure_sem: Semaphore,
     usage: Arc<dyn ServiceUsageReader>,
+    /// Serializes binding resolution/commit against service removal. Always
+    /// acquired before service locks; callers must not hold the apps map lock.
+    bindings_lock: Mutex<()>,
 }
 
 impl ServiceController {
@@ -184,6 +235,7 @@ impl ServiceController {
             locks: DashMap::new(),
             ensure_sem: Semaphore::new(MAX_CONCURRENT_SERVICES),
             usage,
+            bindings_lock: Mutex::new(()),
         }
     }
 
@@ -204,6 +256,187 @@ impl ServiceController {
             .get(&kind)
             .cloned()
             .ok_or_else(|| ServiceError::UnknownProvider(kind.as_str().to_string()))
+    }
+
+    /// Validate availability without provisioning (deploy preflight). An existing
+    /// pin never silently migrates to a different service, even after detach.
+    pub async fn check_needs(
+        &self,
+        app: &AppConfig,
+        store: &SecretsStore,
+    ) -> Result<(), BindingError> {
+        self.binding_plan(app, store).await.map(|_| ())
+    }
+
+    async fn binding_plan(
+        &self,
+        app: &AppConfig,
+        store: &SecretsStore,
+    ) -> Result<Vec<(String, ServiceName)>, BindingError> {
+        crate::needs::validate_needs(&app.needs, &app.env)
+            .map_err(|e| BindingError::Invalid(e.to_string()))?;
+        if app.needs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let records = bindings::load(store, &app.app.name)?;
+        let services = self.list().await.map_err(|_| BindingError::Provision)?;
+        let mut plan = Vec::new();
+        for (alias, need) in &app.needs {
+            let candidates: Vec<_> = services
+                .iter()
+                .filter(|s| s.provider.as_str() == need.r#type.as_str())
+                .collect();
+            let selected = if let Some(record) = records.get(&bindings::record_key(alias, need)) {
+                candidates.iter().find(|s| s.name == record.service).copied().ok_or_else(|| {
+                    BindingError::Conflict(format!("need '{alias}' is pinned to unavailable service '{}' — restore that service on the server; slip will not migrate retained data", record.service))
+                })?
+            } else {
+                match candidates.as_slice() {
+                    [] => return Err(BindingError::MissingService(need.r#type.to_string())),
+                    [service] => service,
+                    _ => {
+                        return Err(BindingError::Conflict(format!(
+                            "multiple {} services — keep a single service of this type before first binding; existing bindings remain pinned",
+                            need.r#type
+                        )));
+                    }
+                }
+            };
+            for key in need.env_keys(alias) {
+                if store
+                    .get(&app.app.name, &key)
+                    .map_err(|_| BindingError::Store)?
+                    .is_some()
+                {
+                    return Err(BindingError::Conflict(format!(
+                        "secret '{key}' conflicts with need '{alias}' — remove the manually managed secret or rename the need"
+                    )));
+                }
+            }
+            plan.push((alias.clone(), selected.name.clone()));
+        }
+        Ok(plan)
+    }
+
+    /// Provision every declared resource, retaining credentials before external
+    /// effects. Keep the returned lease until the new app config is committed;
+    /// this closes the bind-vs-service-removal race. Never hold an apps map lock
+    /// while awaiting this operation. Partial failure retains retryable resources.
+    pub async fn bind<'a>(
+        &'a self,
+        app: &AppConfig,
+        store: &SecretsStore,
+    ) -> Result<tokio::sync::MutexGuard<'a, ()>, BindingError> {
+        let lease = self.bindings_lock.lock().await;
+        let plan = self.binding_plan(app, store).await?;
+        if plan.is_empty() {
+            return Ok(lease);
+        }
+        let mut records = bindings::load(store, &app.app.name)?;
+        for (alias, name) in plan {
+            let lock = self.get_lock(&name);
+            let _guard = lock.lock().await;
+            let (spec, state) = self
+                .db
+                .with_conn(|conn| {
+                    let spec = ServiceRepository::get_service(conn, &name)?
+                        .ok_or_else(|| ServiceRepositoryError::NotFound(name.to_string()))?
+                        .to_spec()?;
+                    let state = ServiceRepository::get_state(conn, &name)?
+                        .ok_or_else(|| ServiceRepositoryError::NotFound(name.to_string()))?
+                        .to_state()?;
+                    Ok::<_, ServiceRepositoryError>((spec, state))
+                })
+                .map_err(|_| BindingError::Provision)?;
+            if state.phase() != LifecyclePhase::Ready {
+                return Err(BindingError::Conflict(format!(
+                    "service '{name}' is not ready — run `slip services status {name}` on the server and retry `slip apply`"
+                )));
+            }
+            let key = bindings::record_key(&alias, &app.needs[&alias]);
+            let id = super::resource::compute_resource_id(
+                &self.installation_id,
+                state.instance_id().as_str(),
+                &app.app.name,
+                &alias,
+            );
+            if let Some(record) = records.get(&key) {
+                if record.instance != state.instance_id().as_str() || record.resource_id != id {
+                    return Err(BindingError::Conflict(format!(
+                        "service instance for need '{alias}' changed — restore the original service and secrets backup; refusing to replace retained data"
+                    )));
+                }
+            } else {
+                let mut password = [0u8; 32];
+                getrandom::getrandom(&mut password).map_err(|_| BindingError::Store)?;
+                records.insert(
+                    key.clone(),
+                    BindingRecord {
+                        service: name.clone(),
+                        instance: state.instance_id().as_str().to_string(),
+                        resource_id: id,
+                        password: hex::encode(password),
+                        env: None,
+                    },
+                );
+                bindings::save(store, &app.app.name, &records)?;
+            }
+            let resource = records[&key].credentials()?;
+            let provider = self
+                .provider_for(spec.provider())
+                .map_err(|_| BindingError::Provision)?;
+            let secrets = self
+                .make_secret_capability(&state)
+                .map_err(|_| BindingError::Provision)?;
+            let ctx = ProviderContext::new(
+                self.runtime.as_ref(),
+                secrets.as_ref(),
+                &self.services_root,
+                &self.network,
+                &self.installation_id,
+                &state,
+            )
+            .map_err(|_| BindingError::Provision)?
+            .with_storage(
+                #[cfg(target_os = "linux")]
+                self.storage.as_ref(),
+                #[cfg(not(target_os = "linux"))]
+                None,
+            );
+            tokio::time::timeout(
+                PER_SERVICE_DEADLINE,
+                provider.create_resource(&ctx, &spec, &state, &resource),
+            )
+            .await
+            .map_err(|_| BindingError::Provision)?
+            .map_err(|_| BindingError::Provision)?;
+            let canonical = provider
+                .resource_env(&spec, &resource)
+                .map_err(|_| BindingError::Provision)?;
+            let need = &app.needs[&alias];
+            let base_alias = match need.r#type {
+                crate::needs::NeedType::Postgres => "db",
+                crate::needs::NeedType::S3 => "storage",
+                crate::needs::NeedType::Kv => "cache",
+            };
+            let mut env = std::collections::BTreeMap::new();
+            for (base, target) in need
+                .env_keys(base_alias)
+                .into_iter()
+                .zip(need.env_keys(&alias))
+            {
+                env.insert(
+                    target,
+                    canonical.get(&base).ok_or(BindingError::Provision)?.clone(),
+                );
+            }
+            records
+                .get_mut(&key)
+                .expect("record persisted before provisioning")
+                .env = Some(env);
+            bindings::save(store, &app.app.name, &records)?;
+        }
+        Ok(lease)
     }
 
     /// Add a service: validate, persist desired+state, provision, CAS commit.
@@ -259,30 +492,36 @@ impl ServiceController {
         let image = resolve_image_for_version(spec.version())?;
         let resolved_image = crate::services::spec::ResolvedImage::parse(image.as_str())?;
 
-        // Create initial state.
-        let state = ServiceState::for_provisioning(
-            name.clone(),
-            spec.provider(),
-            spec.version().clone(),
-            resolved_image,
-            Utc::now(),
-        )?;
-
-        // Persist desired + state.
+        // Re-adding a removed service must preserve its instance identity and
+        // secrets, otherwise retained app bindings would point at a new cluster.
         let db = self.db.clone();
         let spec_clone = spec.clone();
-        let state_clone = state.clone();
-        tokio::task::spawn_blocking(move || {
+        let (state, reattached) = tokio::task::spawn_blocking(move || {
             let mut conn = db.0.lock().unwrap();
-            ServiceRepository::insert_service_and_state(
-                &mut conn,
-                &spec_clone,
-                &state_clone,
-                Utc::now(),
-            )
+            if let Some(retained) = ServiceRepository::get_state(&conn, spec_clone.name())? {
+                if retained.phase() != LifecyclePhase::Retained
+                    || retained.resolved_image() != &resolved_image
+                    || retained.applied_spec_hash().is_some_and(|hash| spec_clone.effective_hash().ok().as_ref() != Some(hash)) {
+                    return Err(ServiceError::Conflict("retained service identity differs — restore the original service version/config; remove/add is not a data upgrade".into()));
+                }
+                ServiceRepository::reattach_retained(&mut conn, &spec_clone,
+                    retained.instance_id(), retained.secret_ref(), &resolved_image,
+                    retained.applied_spec_hash(), retained.generation(), Utc::now())?;
+                let state = ServiceRepository::get_state(&conn, spec_clone.name())?
+                    .ok_or_else(|| ServiceError::Internal("reattached service state missing".into()))?.to_state()?;
+                Ok((state, true))
+            } else {
+                let state = ServiceState::for_provisioning(spec_clone.name().clone(), spec_clone.provider(),
+                    spec_clone.version().clone(), resolved_image, Utc::now())?;
+                ServiceRepository::insert_service_and_state(&mut conn, &spec_clone, &state, Utc::now())?;
+                Ok::<_, ServiceError>((state, false))
+            }
         })
         .await
         .map_err(|e| ServiceError::Internal(e.to_string()))??;
+
+        #[cfg(not(target_os = "linux"))]
+        let _ = reattached;
 
         // Generate secret (Linux only; on non-Linux, provision will fail).
         #[cfg(target_os = "linux")]
@@ -313,6 +552,9 @@ impl ServiceController {
                     Err(crate::services::secret::SecretBundleError::ActivePointerNotFound {
                         ..
                     }) => {
+                        if reattached {
+                            return Err(ServiceError::Blocked(name.to_string(), "retained service secrets are missing — restore the server secrets backup before retrying".into()));
+                        }
                         // No active generation: generate.
                         bundle.generate().map_err(|_| {
                             ServiceError::Internal("secret generation failed".to_string())
@@ -477,6 +719,7 @@ impl ServiceController {
         expected_generation: i64,
         force: bool,
     ) -> Result<ServiceRemovalResult, ServiceError> {
+        let _bindings_guard = self.bindings_lock.lock().await;
         let lock = self.get_lock(name);
         let _guard = lock.lock().await;
 
@@ -1182,6 +1425,77 @@ mod tests {
 
         let list = ctrl.list().await.unwrap();
         assert!(list.is_empty());
+    }
+
+    fn binding_app() -> AppConfig {
+        toml::from_str(
+            "[app]\nname='app'\nimage='app'\n[health]\n[deploy]\n[needs.db]\ntype='postgres'\n",
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bindings_resolve_single_service_and_refuse_ambiguous_resolution() {
+        let ctrl = test_controller(
+            Arc::new(CtrlRuntime::new(true)),
+            Arc::new(FakeUsageReader::new(HashMap::new())),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SecretsStore::new(tmp.path().join("secrets")).unwrap();
+        let app = binding_app();
+        assert!(matches!(
+            ctrl.check_needs(&app, &store).await,
+            Err(BindingError::MissingService(_))
+        ));
+        // add persists desired state, then fails on absent Linux storage.
+        let _ = ctrl.add(sample_spec("custom-pg")).await;
+        let plan = ctrl.binding_plan(&app, &store).await.unwrap();
+        assert_eq!(plan[0].1.as_str(), "custom-pg");
+        let _ = ctrl.add(sample_spec("another-pg")).await;
+        assert!(matches!(
+            ctrl.check_needs(&app, &store).await,
+            Err(BindingError::Conflict(_))
+        ));
+        let record = BindingRecord {
+            service: ServiceName::parse("custom-pg").unwrap(),
+            instance: "instance".into(),
+            resource_id: format!("slip_{}", "a".repeat(48)),
+            password: "b".repeat(64),
+            env: None,
+        };
+        bindings::save(
+            &store,
+            "app",
+            &std::collections::BTreeMap::from([("postgres:db".into(), record)]),
+        )
+        .unwrap();
+        assert_eq!(
+            ctrl.binding_plan(&app, &store).await.unwrap()[0].1.as_str(),
+            "custom-pg"
+        );
+        store.set("app", "DATABASE_URL", "private-canary").unwrap();
+        let error = ctrl.check_needs(&app, &store).await.unwrap_err();
+        assert!(matches!(error, BindingError::Conflict(_)));
+        assert!(!error.to_string().contains("private-canary"));
+    }
+
+    #[tokio::test]
+    async fn usage_reader_observes_live_app_changes_and_detachment() {
+        let ctrl = test_controller(
+            Arc::new(CtrlRuntime::new(true)),
+            Arc::new(FakeUsageReader::new(HashMap::new())),
+        );
+        let _ = ctrl.add(sample_spec("custom-pg")).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SecretsStore::new(tmp.path().join("secrets")).unwrap();
+        let apps = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let reader = AppConfigUsageReader::new(apps.clone(), store, ctrl.db.clone());
+        let name = ServiceName::parse("custom-pg").unwrap();
+        assert!(reader.bindings_for_service(&name).await.is_empty());
+        apps.write().await.insert("app".into(), binding_app());
+        assert_eq!(reader.bindings_for_service(&name).await, ["app"]);
+        apps.write().await.get_mut("app").unwrap().needs.clear();
+        assert!(reader.bindings_for_service(&name).await.is_empty());
     }
 
     #[tokio::test]

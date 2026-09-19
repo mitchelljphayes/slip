@@ -2278,6 +2278,7 @@ mod tests {
                 network: Default::default(),
                 preview: None,
                 volumes: Vec::new(),
+                needs: Default::default(),
             },
         );
         apps.insert(
@@ -2297,6 +2298,7 @@ mod tests {
                 network: Default::default(),
                 preview: None,
                 volumes: Vec::new(),
+                needs: Default::default(),
             },
         );
         let hosts = collect_registry_hosts(&apps);

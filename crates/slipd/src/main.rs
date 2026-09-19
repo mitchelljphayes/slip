@@ -344,9 +344,15 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let apps_snapshot = apps.clone();
+    let secrets_store = slip_core::SecretsStore::new(slip_config.storage.path.join("secrets"))
+        .map_err(|e| anyhow::anyhow!("secrets store error: {e}"))?;
+    // Migrate before sharing the live map with the service usage reader.
+    slip_core::config::migrate_app_secrets(&mut apps, &secrets_store);
+    let apps = Arc::new(RwLock::new(apps));
     let usage = std::sync::Arc::new(slip_core::services::AppConfigUsageReader::new(
-        std::sync::Arc::new(tokio::sync::RwLock::new(apps_snapshot)),
+        apps.clone(),
+        secrets_store.clone(),
+        db.clone(),
     ));
 
     let service_controller = std::sync::Arc::new(slip_core::services::ServiceController::new(
@@ -390,20 +396,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Build application state ──────────────────────────────────────────────
-    let secrets_store = slip_core::SecretsStore::new(slip_config.storage.path.join("secrets"))
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to initialize secrets store");
-            anyhow::anyhow!("secrets store error: {e}")
-        })?;
-
-    // ── Migrate deprecated [app] secret from TOML to secrets store ──────────
-    // This runs once at daemon startup.  The TOML field remains readable as a
-    // fallback during the migration window.
-    slip_core::config::migrate_app_secrets(&mut apps, &secrets_store);
-
     let state = Arc::new(AppState {
         config: slip_config,
-        apps: RwLock::new(apps),
+        apps,
         config_dir: config_path.to_path_buf(),
         deploy_locks: DashMap::new(),
         runtime,

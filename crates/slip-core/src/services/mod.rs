@@ -20,14 +20,17 @@
 //! - [`secret`]: atomic instance-scoped `InstanceSecretBundle` implementing
 //!   the Part 1 `InstanceSecretCapability`.
 //!
-//! Part 3 will add the PostgreSQL 18 provider, controller, API, CLI, and
-//! reconciliation.
+//! The PostgreSQL 18 provider and controller implement lifecycle reconciliation.
+//! [`bindings`] retains app-scoped credentials; [`resource`] defines validated
+//! resource identities used by provider operations.
 
+pub mod bindings;
 pub mod controller;
 pub mod image_ref;
 pub mod name;
 pub mod postgres;
 pub mod repository;
+pub mod resource;
 pub mod secret;
 pub mod spec;
 pub mod storage;
@@ -43,6 +46,9 @@ pub use postgres::{
     resolve_image_for_version,
 };
 pub use repository::{ServiceRepository, ServiceRepositoryError, ServiceRow, ServiceStateRow};
+pub use resource::{
+    ResourceCredentials, compute_resource_id, role_comment, validate_resource_component,
+};
 #[cfg(target_os = "linux")]
 pub use secret::InstanceSecretBundle;
 pub use secret::{GenerationName, SecretBundleError, SecretBytes};

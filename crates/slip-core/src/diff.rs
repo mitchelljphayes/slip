@@ -31,6 +31,7 @@ struct Pushable {
     env: BTreeMap<String, String>,
     volumes: Vec<PushableVolume>,
     routes: Vec<PushableRoute>,
+    needs: BTreeMap<String, PushableNeed>,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,6 +68,12 @@ struct PushableVolume {
 struct PushableRoute {
     hostname: String,
     port: Option<u16>,
+}
+
+#[derive(Debug, Serialize)]
+struct PushableNeed {
+    #[serde(rename = "type")]
+    r#type: String,
 }
 
 // ─── Normalization ────────────────────────────────────────────────────────────
@@ -121,6 +128,18 @@ fn repo_pushable(cfg: &RepoConfig) -> Pushable {
             })
             .collect(),
         routes: Vec::new(), // repo doesn't carry hostname — routes are server-side
+        needs: cfg
+            .needs
+            .iter()
+            .map(|(alias, need)| {
+                (
+                    alias.clone(),
+                    PushableNeed {
+                        r#type: need.r#type.as_str().to_string(),
+                    },
+                )
+            })
+            .collect(),
     }
 }
 
@@ -183,6 +202,18 @@ fn server_pushable(resp: &AppResponse) -> Pushable {
                 port: r.port,
             })
             .collect(),
+        needs: resp
+            .needs
+            .iter()
+            .map(|(alias, need)| {
+                (
+                    alias.clone(),
+                    PushableNeed {
+                        r#type: need.r#type.as_str().to_string(),
+                    },
+                )
+            })
+            .collect(),
     }
 }
 
@@ -240,6 +271,12 @@ fn normalize_server_to_repo(repo: &Pushable, server: &mut Pushable) {
     if repo.deploy.timeout_secs.is_none() {
         server.deploy.timeout_secs = None;
     }
+    // Needs: full-replace semantics, same as env. The repo's `[needs]` is the
+    // desired state; the server's current needs are diffed against it directly.
+    // An empty repo `[needs]` produces Remove ops for every server need: that
+    // is the signal to clear bindings that were removed from the repo. We do
+    // NOT null the server side here (unlike health/resources where repo-None
+    // means "unmanaged"), because needs are always fully replaced on apply.
 }
 
 // ─── Stable JSON value with sorted keys ───────────────────────────────────────
@@ -537,6 +574,24 @@ pub fn build_update_payload(repo: &RepoConfig) -> Value {
         payload["volumes"] = Value::Array(Vec::new());
     }
 
+    // Needs (full replace; an empty map clears server needs)
+    if !repo.needs.is_empty() {
+        let needs_map: Value = repo
+            .needs
+            .iter()
+            .map(|(alias, need)| {
+                (
+                    alias.clone(),
+                    serde_json::json!({ "type": need.r#type.as_str() }),
+                )
+            })
+            .collect();
+        payload["needs"] = needs_map;
+    } else {
+        // Send empty map to clear server needs (full-replace semantics).
+        payload["needs"] = Value::Object(Default::default());
+    }
+
     payload
 }
 
@@ -661,6 +716,21 @@ pub fn build_create_payload(repo: &RepoConfig) -> Result<Value, String> {
         payload["volumes"] = Value::Array(vols);
     }
 
+    // Needs
+    if !repo.needs.is_empty() {
+        let needs_map: Value = repo
+            .needs
+            .iter()
+            .map(|(alias, need)| {
+                (
+                    alias.clone(),
+                    serde_json::json!({ "type": need.r#type.as_str() }),
+                )
+            })
+            .collect();
+        payload["needs"] = needs_map;
+    }
+
     Ok(payload)
 }
 
@@ -691,6 +761,7 @@ mod tests {
             env: HashMap::new(),
             deploy: None,
             remote: crate::repo_config::RemoteConfig::default(),
+            needs: BTreeMap::new(),
         };
         overrides(&mut cfg);
         cfg
@@ -698,6 +769,7 @@ mod tests {
 
     fn make_server(overrides: impl FnOnce(&mut AppResponse)) -> AppResponse {
         let mut resp = AppResponse {
+            needs: Default::default(),
             name: "testapp".to_string(),
             image: "nginx:latest".to_string(),
             domain: "testapp.example.com".to_string(),
@@ -1155,5 +1227,146 @@ mod tests {
         assert!(diff.ops.iter().any(|op| {
             matches!(op, json_patch::PatchOperation::Replace(r) if r.path == "/domain")
         }));
+    }
+
+    // ── Needs diff (full replace, removals show) ──────────────────────────────
+
+    fn server_with_needs(needs: &[(&str, crate::needs::NeedType)]) -> AppResponse {
+        let mut resp = make_server(|_| {});
+        resp.needs = needs
+            .iter()
+            .map(|(a, t)| (a.to_string(), crate::needs::Need::new(*t)))
+            .collect();
+        resp
+    }
+
+    #[test]
+    fn needs_matching_repo_and_server_no_diff() {
+        let repo = make_repo(|r| {
+            r.needs.insert(
+                "db".to_string(),
+                crate::needs::Need::new(crate::needs::NeedType::Postgres),
+            );
+        });
+        let server = server_with_needs(&[("db", crate::needs::NeedType::Postgres)]);
+        let diff = compute_diff(&repo, &server).unwrap();
+        assert!(
+            !diff.changed,
+            "identical needs → no diff, ops: {:?}",
+            diff.ops
+        );
+    }
+
+    #[test]
+    fn needs_add_detected() {
+        // Repo declares a need; server has none → Add op.
+        let repo = make_repo(|r| {
+            r.needs.insert(
+                "db".to_string(),
+                crate::needs::Need::new(crate::needs::NeedType::Postgres),
+            );
+        });
+        let server = make_server(|_| {});
+        let diff = compute_diff(&repo, &server).unwrap();
+        assert!(diff.changed);
+        assert!(diff.ops.iter().any(|op| {
+            matches!(op, json_patch::PatchOperation::Add(a) if a.path.to_string().starts_with("/needs/"))
+        }));
+    }
+
+    #[test]
+    fn needs_removal_shows_remove_ops() {
+        // Repo has no needs; server has `db` → Remove op (full-replace clears).
+        let repo = make_repo(|_| {});
+        let server = server_with_needs(&[("db", crate::needs::NeedType::Postgres)]);
+        let diff = compute_diff(&repo, &server).unwrap();
+        assert!(diff.changed);
+        assert!(
+            diff.ops.iter().any(|op| {
+                matches!(op, json_patch::PatchOperation::Remove(r) if r.path.to_string().starts_with("/needs/"))
+            }),
+            "empty repo needs must produce Remove ops for server needs, ops: {:?}",
+            diff.ops
+        );
+    }
+
+    #[test]
+    fn needs_alias_change_shows_remove_and_add() {
+        // Repo declares `analytics`; server has `db` (same type, different
+        // alias). Full-replace → Remove /needs/db + Add /needs/analytics.
+        let repo = make_repo(|r| {
+            r.needs.insert(
+                "analytics".to_string(),
+                crate::needs::Need::new(crate::needs::NeedType::Postgres),
+            );
+        });
+        let server = server_with_needs(&[("db", crate::needs::NeedType::Postgres)]);
+        let diff = compute_diff(&repo, &server).unwrap();
+        assert!(diff.changed);
+        assert!(diff.ops.iter().any(|op| {
+            matches!(op, json_patch::PatchOperation::Remove(r) if r.path == "/needs/db")
+        }));
+        assert!(diff.ops.iter().any(|op| {
+            matches!(op, json_patch::PatchOperation::Add(a) if a.path == "/needs/analytics")
+        }));
+    }
+
+    #[test]
+    fn needs_type_change_shows_replace() {
+        // Same alias, different type → Replace op on /needs/<alias>/type.
+        let repo = make_repo(|r| {
+            r.needs.insert(
+                "db".to_string(),
+                crate::needs::Need::new(crate::needs::NeedType::S3),
+            );
+        });
+        let server = server_with_needs(&[("db", crate::needs::NeedType::Postgres)]);
+        let diff = compute_diff(&repo, &server).unwrap();
+        assert!(diff.changed);
+        assert!(diff.ops.iter().any(|op| {
+            matches!(op, json_patch::PatchOperation::Replace(r) if r.path.to_string().starts_with("/needs/db"))
+        }));
+    }
+
+    #[test]
+    fn build_update_payload_contains_needs() {
+        let repo = make_repo(|r| {
+            r.needs.insert(
+                "db".to_string(),
+                crate::needs::Need::new(crate::needs::NeedType::Postgres),
+            );
+            r.needs.insert(
+                "cache".to_string(),
+                crate::needs::Need::new(crate::needs::NeedType::Kv),
+            );
+        });
+        let payload = build_update_payload(&repo);
+        assert_eq!(payload["needs"]["db"]["type"], "postgres");
+        assert_eq!(payload["needs"]["cache"]["type"], "kv");
+    }
+
+    #[test]
+    fn build_update_payload_empty_needs_clears_server() {
+        // Full-replace: empty repo needs → empty map sent to clear server needs.
+        let repo = make_repo(|_| {});
+        let payload = build_update_payload(&repo);
+        assert_eq!(
+            payload["needs"],
+            serde_json::Value::Object(Default::default())
+        );
+    }
+
+    #[test]
+    fn build_create_payload_contains_needs() {
+        let repo = make_repo(|r| {
+            r.app.image = Some("ghcr.io/org/app:latest".to_string());
+            r.routing.domain = Some("app.example.com".to_string());
+            r.needs.insert(
+                "storage".to_string(),
+                crate::needs::Need::new(crate::needs::NeedType::S3),
+            );
+        });
+        let payload = build_create_payload(&repo).unwrap();
+        assert_eq!(payload["needs"]["storage"]["type"], "s3");
     }
 }

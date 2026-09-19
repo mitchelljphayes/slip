@@ -11,6 +11,7 @@ pub mod error;
 pub mod health;
 pub mod manifest;
 pub mod merge;
+pub mod needs;
 pub mod podman;
 pub mod preview;
 pub mod reconcile;
@@ -56,6 +57,10 @@ pub use error::{CaddyError, ConfigError, HealthError, RuntimeError};
 pub use health::{HealthCheck, HealthChecker};
 pub use manifest::{ManifestError, RenderContext, render_manifest};
 pub use merge::{MergedConfig, MergedVolume, merge_config};
+pub use needs::{
+    CANONICAL_KV_ENV, CANONICAL_PG_ENV, CANONICAL_S3_ENV, MAX_ALIAS_LEN, Need, NeedError, NeedType,
+    validate_alias, validate_needs,
+};
 pub use podman::PodmanBackend;
 pub use preview::{PersistedPreviewState, PreviewState};
 pub use reconcile::{
