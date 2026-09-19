@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::runtime::RuntimeBackend;
 use crate::services::name::ServiceName;
+use crate::services::resource::ResourceCredentials;
 
 // ─── Provider kind ────────────────────────────────────────────────────────────
 
@@ -1098,10 +1099,9 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// `Box<dyn ServiceProvider>`; there is no native-async companion trait and
 /// no `async-trait` dependency.
 ///
-/// Part 1 defines the contract only. The concrete PostgreSQL provider
-/// implementation (Part 3) supplies `provision`, `ensure`, `health`, and
-/// `remove` bodies. No placeholder binding methods are added here -- resource
-/// and credential ownership APIs are deferred to SLIP-107.
+/// The PostgreSQL implementation supplies service lifecycle operations and
+/// isolated resource creation. Binding credentials are retained by the
+/// controller, not generated independently by provider calls.
 pub trait ServiceProvider: Send + Sync {
     /// The provider kind (e.g. `"postgres"`).
     fn kind(&self) -> ProviderKind;
@@ -1155,6 +1155,69 @@ pub trait ServiceProvider: Send + Sync {
     ) -> BoxFuture<'a, Result<(), ServiceError>> {
         let _ = (ctx, spec, container_id);
         Box::pin(async { Ok(()) })
+    }
+
+    /// Create or adopt an isolated resource (data namespace) inside a
+    /// running, owned service instance, applying the provided
+    /// [`ResourceCredentials`].
+    ///
+    /// The controller computes the resource id deterministically (see
+    /// [`crate::services::resource::compute_resource_id`]) and generates
+    /// the password from a CSPRNG, then persists both BEFORE calling this
+    /// method. The provider's job is to make the running service reflect
+    /// that state idempotently:
+    ///
+    /// - For PostgreSQL: create the LOGIN role (with a deterministic
+    ///   ownership comment) and the owned database, revoke `CONNECT`/`TEMP`
+    ///   from `PUBLIC`, and ensure the public schema default is safe.
+    /// - Idempotent restart-safe: never drop; detect an existing foreign
+    ///   role/database (ownership marker mismatch) and refuse adoption.
+    /// - SQL is executed via stdin to `psql --no-psqlrc -v ON_ERROR_STOP=1`
+    ///   using a mounted `PGPASSFILE` like the readiness check. No
+    ///   plaintext password in argv, env, log, or error.
+    /// - Verify service ownership/readiness via existing provider checks
+    ///   before exec.
+    ///
+    /// `resource` carries the validated resource id (also the role and
+    /// database name) and the generated password. The password is only
+    /// used inside the SQL sent via stdin (e.g. `ALTER ROLE ... PASSWORD
+    /// ...`); it never appears in argv or env.
+    ///
+    /// The default fails closed until a provider implements resource creation.
+    fn create_resource<'a>(
+        &'a self,
+        ctx: &'a ProviderContext<'a>,
+        spec: &'a ServiceSpec,
+        state: &'a ServiceState,
+        resource: &'a ResourceCredentials,
+    ) -> BoxFuture<'a, Result<(), ServiceError>> {
+        let _ = (ctx, spec, state, resource);
+        Box::pin(async {
+            Err(ServiceError::Internal(
+                "create_resource not supported by this provider".to_string(),
+            ))
+        })
+    }
+
+    /// Produce the canonical app-facing environment variables for a bound
+    /// resource credential (e.g. `DATABASE_URL` for PostgreSQL).
+    ///
+    /// The returned map is what the controller injects into the app
+    /// container's env. It is the ONLY place the resource password is
+    /// legitimately exposed: the app container is the intended recipient.
+    /// The service runtime never sees it in argv/env.
+    ///
+    /// Default returns `Unsupported` so existing fakes are unaffected
+    /// until a provider explicitly implements it (SLIP-107).
+    fn resource_env<'a>(
+        &'a self,
+        spec: &'a ServiceSpec,
+        resource: &'a ResourceCredentials,
+    ) -> Result<std::collections::BTreeMap<String, String>, ServiceError> {
+        let _ = (spec, resource);
+        Err(ServiceError::Internal(
+            "resource_env not supported by this provider".to_string(),
+        ))
     }
 }
 

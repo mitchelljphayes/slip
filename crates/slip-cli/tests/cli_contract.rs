@@ -3161,6 +3161,487 @@ fn deploy_no_apply_skips_apply() {
         );
 }
 
+// ─── SLIP-107 regression: preserve server missing-service error on HTTP 404 ───
+//
+// When the server returns 404 because a referenced service (e.g. postgres) is
+// not provisioned, the CLI must surface the server's prescriptive error text
+// verbatim (via `api_error_text`) and exit NOT_FOUND (4). It must NOT
+// substitute a generic "app not found" message. These tests cover the three
+// paths that touch a 404 from the server: apply-create (POST), apply-update
+// (PATCH), and deploy with --no-apply (POST /v1/deploy).
+
+/// The exact server error text the CLI must preserve through `api_error_text`.
+const MISSING_PG_SERVICE_ERROR: &str =
+    "no postgres service — run `slip services add postgres` on the server";
+
+/// A slip.toml declaring a postgres need, so the create/update payload
+/// includes `[needs.db]`.
+fn make_slip_toml_with_needs(name: &str, image: &str, domain: &str) -> String {
+    format!(
+        r#"
+[app]
+name = "{name}"
+image = "{image}"
+
+[routing]
+domain = "{domain}"
+port = 3000
+
+[health]
+path = "/healthz"
+
+[needs.db]
+type = "postgres"
+"#
+    )
+}
+
+/// Start a mock axum server that returns 404 with the missing-postgres-service
+/// error for `GET /v1/apps/{name}` (so apply takes the create path) and for
+/// `POST /v1/apps` (so apply-create fails with the server's 404). The deploy
+/// route is not wired here.
+fn start_mock_server_create_404() -> String {
+    let app = Router::new()
+        .route(
+            "/v1/apps/{name}",
+            get(
+                |axum::extract::Path(_name): axum::extract::Path<String>| async move {
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        [("cache-control", "no-store")],
+                        Json(serde_json::json!({
+                            "error": format!("app '{_name}' not found")
+                        })),
+                    )
+                },
+            ),
+        )
+        .route(
+            "/v1/apps",
+            post(|| async move {
+                (
+                    axum::http::StatusCode::NOT_FOUND,
+                    [("cache-control", "no-store")],
+                    Json(serde_json::json!({
+                        "error": MISSING_PG_SERVICE_ERROR
+                    })),
+                )
+            }),
+        );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener =
+        rt.block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() });
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{}", addr);
+    std::thread::spawn(move || {
+        rt.block_on(async {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    url
+}
+
+/// Start a mock axum server where `GET /v1/apps/{name}` returns an existing
+/// app (no needs) and `PATCH /v1/apps/{name}` returns 404 with the
+/// missing-postgres-service error. The repo declares `[needs.db]` so the diff
+/// is non-empty and the CLI issues a PATCH.
+fn start_mock_server_update_404() -> String {
+    let existing = normalize_mock_app(serde_json::json!({
+        "name": "needsapp",
+        "image": "ghcr.io/org/needsapp:latest",
+        "domain": "needsapp.example.com",
+        "port": 3000,
+        "health": {"path": "/healthz"}
+    }));
+
+    let app = Router::new()
+        .route(
+            "/v1/apps/{name}",
+            get(
+                move |axum::extract::Path(name): axum::extract::Path<String>| {
+                    let existing = existing.clone();
+                    async move {
+                        if name == "needsapp" {
+                            (
+                                axum::http::StatusCode::OK,
+                                [("cache-control", "no-store")],
+                                Json(existing),
+                            )
+                        } else {
+                            (
+                                axum::http::StatusCode::NOT_FOUND,
+                                [("cache-control", "no-store")],
+                                Json(
+                                    serde_json::json!({"error": format!("app '{name}' not found")}),
+                                ),
+                            )
+                        }
+                    }
+                },
+            ),
+        )
+        .route(
+            "/v1/apps/{name}",
+            patch(
+                |axum::extract::Path(_name): axum::extract::Path<String>,
+                 Json(_body): Json<Value>| async move {
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        [("cache-control", "no-store")],
+                        Json(serde_json::json!({
+                            "error": MISSING_PG_SERVICE_ERROR
+                        })),
+                    )
+                },
+            ),
+        );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener =
+        rt.block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() });
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{}", addr);
+    std::thread::spawn(move || {
+        rt.block_on(async {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    url
+}
+
+/// Start a mock axum server where `POST /v1/deploy` returns 404 with the
+/// missing-postgres-service error. Used for `deploy --no-apply` (which skips
+/// the apply path and goes straight to the deploy POST).
+fn start_mock_server_deploy_404() -> String {
+    let app = Router::new().route(
+        "/v1/deploy",
+        post(|| async move {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                [("cache-control", "no-store")],
+                Json(serde_json::json!({
+                    "error": MISSING_PG_SERVICE_ERROR
+                })),
+            )
+        }),
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener =
+        rt.block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() });
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{}", addr);
+    std::thread::spawn(move || {
+        rt.block_on(async {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    url
+}
+
+/// SLIP-107: `slip apply` on a new app whose `[needs.db]` references a
+/// postgres service the server doesn't have. The server returns 404 on the
+/// POST /v1/apps with a prescriptive "no postgres service" error. The CLI
+/// must preserve that exact server error text and exit NOT_FOUND (4), NOT
+/// substitute a generic "app not found" message.
+#[test]
+fn slip_107_apply_create_404_preserves_missing_service_error() {
+    let url = start_mock_server_create_404();
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let toml =
+        make_slip_toml_with_needs("needsapp", "ghcr.io/org/needsapp", "needsapp.example.com");
+    tmp.child("slip.toml").write_str(&toml).unwrap();
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .current_dir(tmp.path())
+        .args([
+            "apply",
+            "needsapp",
+            "--server",
+            &url,
+            "--token",
+            "test-token",
+        ])
+        .assert();
+
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    // Exit code 4 (NOT_FOUND) — not a generic 1.
+    assert.failure().code(output::NOT_FOUND);
+
+    // The exact server error text must appear verbatim — no false "app not
+    // found" substitution.
+    assert!(
+        stderr.contains(MISSING_PG_SERVICE_ERROR),
+        "stderr must preserve the server's missing-service error verbatim: {stderr}"
+    );
+    // The prescriptive remedy line must also be present.
+    assert!(
+        stderr.contains("provision the missing service on the server"),
+        "stderr must include the remedy: {stderr}"
+    );
+    // And it must NOT say the app itself was not found.
+    assert!(
+        !stderr.contains("app 'needsapp' not found"),
+        "stderr must not substitute a false 'app not found' error: {stderr}"
+    );
+
+    tmp.close().unwrap();
+}
+
+/// SLIP-107: `slip apply` on an existing app whose repo config adds a
+/// `[needs.db]` postgres binding. The PATCH /v1/apps/{name} returns 404 with
+/// the missing-service error. The CLI must preserve the server's error text
+/// and exit NOT_FOUND (4).
+#[test]
+fn slip_107_apply_update_404_preserves_missing_service_error() {
+    let url = start_mock_server_update_404();
+    let tmp = assert_fs::TempDir::new().unwrap();
+    // Repo declares [needs.db]; the server's existing app has no needs, so
+    // the diff is non-empty and the CLI issues a PATCH.
+    let toml = make_slip_toml_with_needs(
+        "needsapp",
+        "ghcr.io/org/needsapp:latest",
+        "needsapp.example.com",
+    );
+    tmp.child("slip.toml").write_str(&toml).unwrap();
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .current_dir(tmp.path())
+        .args([
+            "apply",
+            "needsapp",
+            "--server",
+            &url,
+            "--token",
+            "test-token",
+        ])
+        .assert();
+
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    // Exit code 4 (NOT_FOUND).
+    assert.failure().code(output::NOT_FOUND);
+
+    // The exact server error text must appear verbatim.
+    assert!(
+        stderr.contains(MISSING_PG_SERVICE_ERROR),
+        "stderr must preserve the server's missing-service error verbatim: {stderr}"
+    );
+    // The prescriptive remedy line for the PATCH path.
+    assert!(
+        stderr.contains("resolve the missing app or service, then retry `slip apply`"),
+        "stderr must include the PATCH-path remedy: {stderr}"
+    );
+    // No false "app not found" substitution.
+    assert!(
+        !stderr.contains("app 'needsapp' not found"),
+        "stderr must not substitute a false 'app not found' error: {stderr}"
+    );
+
+    tmp.close().unwrap();
+}
+
+/// SLIP-107: `slip deploy --no-apply` hits POST /v1/deploy directly. When the
+/// server returns 404 (missing postgres service), the CLI must preserve the
+/// server's error text and exit NOT_FOUND (4). Uses the exact existing CLI
+/// args (`deploy <app> <tag> --secret <s> --no-apply`).
+#[test]
+fn slip_107_deploy_no_apply_404_preserves_missing_service_error() {
+    let url = start_mock_server_deploy_404();
+    let tmp = assert_fs::TempDir::new().unwrap();
+    // A slip.toml is not strictly required for --no-apply, but keep the cwd
+    // clean so the test doesn't depend on the host's slip.toml.
+    let toml =
+        make_slip_toml_with_needs("needsapp", "ghcr.io/org/needsapp", "needsapp.example.com");
+    tmp.child("slip.toml").write_str(&toml).unwrap();
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .current_dir(tmp.path())
+        .args([
+            "--server",
+            &url,
+            "deploy",
+            "needsapp",
+            "v1",
+            "--secret",
+            "dummy-secret",
+            "--no-apply",
+        ])
+        .assert();
+
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    // Exit code 4 (NOT_FOUND).
+    assert.failure().code(output::NOT_FOUND);
+
+    // The exact server error text must appear verbatim.
+    assert!(
+        stderr.contains(MISSING_PG_SERVICE_ERROR),
+        "stderr must preserve the server's missing-service error verbatim: {stderr}"
+    );
+    // The prescriptive remedy line for the deploy path.
+    assert!(
+        stderr.contains("resolve the missing app or service, then retry the deployment"),
+        "stderr must include the deploy-path remedy: {stderr}"
+    );
+
+    tmp.close().unwrap();
+}
+
+// ─── SLIP-107 regression: unknown need type / field / bad alias are rejected ──
+//
+// The CLI's `slip validate` must reject a `[needs.<alias>]` table with an
+// unknown `type`, an unknown field, or a malformed alias. These surface as
+// validation errors and exit GENERIC (1), matching the existing
+// `slip_validate_json_envelope_invalid_config` test's contract.
+
+/// `slip validate --json` with `[needs.db] type = "mysql"` (unknown type)
+/// must report `ok: false` and exit GENERIC. The error must mention the bad
+/// type so the user knows what to fix.
+#[test]
+fn slip_107_validate_unknown_need_type_exits_generic() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let slip_toml = r#"
+[app]
+name = "myapp"
+kind = "container"
+image = "ghcr.io/org/myapp"
+
+[routing]
+domain = "myapp.example.com"
+port = 3000
+
+[needs.db]
+type = "mysql"
+"#;
+    std::fs::write(tmp.child("slip.toml").path(), slip_toml).unwrap();
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args(["validate", "--json"])
+        .current_dir(tmp.path())
+        .assert();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert.failure().code(output::GENERIC);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout is a JSON envelope");
+    assert_eq!(parsed["ok"], false);
+    let errors = parsed["errors"].as_array().expect("errors is array");
+    assert!(!errors.is_empty(), "errors must be non-empty");
+    // The error text should reference the unknown type or the needs table.
+    let combined = errors
+        .iter()
+        .map(|e| e["message"].as_str().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        combined.contains("mysql") || combined.contains("need"),
+        "error should reference the unknown type or needs table: {combined}"
+    );
+
+    tmp.close().unwrap();
+}
+
+/// `slip validate --json` with an unknown field in `[needs.db]` must report
+/// `ok: false` and exit GENERIC (deny_unknown_fields on Need).
+#[test]
+fn slip_107_validate_unknown_need_field_exits_generic() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let slip_toml = r#"
+[app]
+name = "myapp"
+kind = "container"
+image = "ghcr.io/org/myapp"
+
+[routing]
+domain = "myapp.example.com"
+port = 3000
+
+[needs.db]
+type = "postgres"
+bogus_field = "nope"
+"#;
+    std::fs::write(tmp.child("slip.toml").path(), slip_toml).unwrap();
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args(["validate", "--json"])
+        .current_dir(tmp.path())
+        .assert();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert.failure().code(output::GENERIC);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout is a JSON envelope");
+    assert_eq!(parsed["ok"], false);
+    let errors = parsed["errors"].as_array().expect("errors is array");
+    assert!(!errors.is_empty(), "errors must be non-empty");
+
+    tmp.close().unwrap();
+}
+
+/// `slip validate --json` with a malformed need alias (uppercase / space)
+/// must report `ok: false` and exit GENERIC.
+#[test]
+fn slip_107_validate_bad_need_alias_exits_generic() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let slip_toml = r#"
+[app]
+name = "myapp"
+kind = "container"
+image = "ghcr.io/org/myapp"
+
+[routing]
+domain = "myapp.example.com"
+port = 3000
+
+[needs."My DB"]
+type = "postgres"
+"#;
+    std::fs::write(tmp.child("slip.toml").path(), slip_toml).unwrap();
+
+    let mut cmd = Command::cargo_bin("slip").unwrap();
+    let assert = cmd
+        .args(["validate", "--json"])
+        .current_dir(tmp.path())
+        .assert();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert.failure().code(output::GENERIC);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout is a JSON envelope");
+    assert_eq!(parsed["ok"], false);
+    let errors = parsed["errors"].as_array().expect("errors is array");
+    assert!(!errors.is_empty(), "errors must be non-empty");
+    // The error should mention the alias or the needs table.
+    let combined = errors
+        .iter()
+        .map(|e| e["message"].as_str().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        combined.contains("My DB") || combined.contains("need") || combined.contains("alias"),
+        "error should reference the bad alias or needs table: {combined}"
+    );
+
+    tmp.close().unwrap();
+}
+
 mod output {
     pub const OK: i32 = 0;
     pub const GENERIC: i32 = 1;

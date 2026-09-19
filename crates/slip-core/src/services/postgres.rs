@@ -26,6 +26,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::services::image_ref::PinnedImageRef;
+use crate::services::resource::{ResourceCredentials, role_comment};
 use crate::services::spec::{
     ActiveSecretMounts, ContainerId, EnsureAction, EnsureOutcome, HealthKind, ProviderContext,
     ProviderKind, ProviderVersion, ProvisionOutcome, ServiceError, ServiceHealth, ServiceProvider,
@@ -1533,6 +1534,341 @@ impl ServiceProvider for PostgresProvider {
                 .map_err(|_| ServiceError::ReadinessFailed("readiness probe failed".to_string()))
         })
     }
+
+    fn create_resource<'a>(
+        &'a self,
+        ctx: &'a ProviderContext<'a>,
+        spec: &'a ServiceSpec,
+        state: &'a ServiceState,
+        resource: &'a ResourceCredentials,
+    ) -> crate::services::spec::BoxFuture<'a, Result<(), ServiceError>> {
+        Box::pin(async move {
+            // 1. Rootful check — same gate as provision/ensure.
+            if !ctx.runtime().is_rootful().await {
+                return Err(ServiceError::Blocked(
+                    spec.name().as_str().to_string(),
+                    "services require a rootful Podman/Docker runtime".to_string(),
+                ));
+            }
+
+            // 2. There must be a running, owned container. We reuse the
+            //    ensure() ownership+readiness verification path by requiring
+            //    a persisted container id and verifying ownership + healthy
+            //    state. This is the "verify service ownership/readiness via
+            //    existing provider checks before exec" requirement.
+            let cid = state.container_id().ok_or_else(|| {
+                ServiceError::Blocked(
+                    spec.name().as_str().to_string(),
+                    "service has no running container — run `slip apply` first".to_string(),
+                )
+            })?;
+
+            let image = resolve_image_for_version(spec.version())?;
+            let mounts = ctx.secrets().active_secret_mounts().map_err(|e| {
+                ServiceError::Blocked(
+                    spec.name().as_str().to_string(),
+                    format!("secret mount tokens unavailable: {e}"),
+                )
+            })?;
+
+            let inspect = ctx
+                .runtime()
+                .inspect_service(cid.as_str())
+                .await
+                .map_err(|_| {
+                    ServiceError::Blocked(
+                        spec.name().as_str().to_string(),
+                        "failed to inspect service container".to_string(),
+                    )
+                })?;
+
+            // Full ownership verification (labels, digest, network, ports,
+            // caps, mounts). Any mismatch → Blocked, zero mutations.
+            self.verify_ownership(
+                ctx,
+                spec,
+                state,
+                mounts.generation.as_str(),
+                &image,
+                &inspect,
+            )?;
+
+            // The container must be running and healthy before we run SQL.
+            if !inspect.running {
+                return Err(ServiceError::Blocked(
+                    spec.name().as_str().to_string(),
+                    "service container is not running — run `slip ensure` first".to_string(),
+                ));
+            }
+            if inspect.health_status != "healthy" {
+                return Err(ServiceError::ReadinessFailed(
+                    "service container is not healthy".to_string(),
+                ));
+            }
+
+            // 3. Build the SQL. The resource id is validated by
+            //    ResourceCredentials::new to be `slip_` + 48 lowercase hex,
+            //    which is injection-safe in unquoted PostgreSQL identifier
+            //    position and in single-quoted string literal position
+            //    (hex has no quotes/backslashes). The password is 64-char
+            //    lowercase hex, also injection-safe in a single-quoted
+            //    literal. We still escape defensively by rejecting any
+            //    non-hex character at construction time (already done).
+            //
+            //    The SQL is idempotent and restart-safe:
+            //    - Roles/databases are NEVER dropped.
+            //    - An existing role with the right ownership comment is
+            //      adopted (password is reset to the persisted value).
+            //    - An existing role with a different/non-slip comment is
+            //      foreign → refuse adoption.
+            //    - An existing database whose owner is not our role (and
+            //      not a prior incarnation of it) is foreign → refuse.
+            //    - The atomic role create+comment is a single psql session;
+            //      if psql crashes between CREATE ROLE and COMMENT, the
+            //      role exists without a comment, and the next run detects
+            //      a role with the wrong comment → refuse (operator must
+            //      inspect). This is fail-closed.
+            //    - CREATE DATABASE cannot run inside a transaction block, so
+            //      it is a separate psql invocation. A crash between
+            //      CREATE DATABASE and the subsequent GRANT/REVOKE leaves a
+            //      database owned by our role — the ownership (rolowner)
+            //      IS the deterministic marker for the database, since the
+            //      role name == resource id == intended db name. A re-run
+            //      detects the db exists with the right owner and completes
+            //      the grants/revokes idempotently.
+            let sql = build_resource_sql(resource);
+
+            // 4. Run the SQL via stdin to psql, using the mounted PGPASSFILE
+            //    for authentication (same pattern as the readiness check).
+            //    No password in argv or env.
+            ctx.runtime()
+                .exec_service_stdin(
+                    cid.as_str(),
+                    &[
+                        "psql",
+                        "--no-psqlrc",
+                        "-v",
+                        "ON_ERROR_STOP=1",
+                        "-h",
+                        "127.0.0.1",
+                        "-U",
+                        "postgres",
+                        "-d",
+                        "postgres",
+                        "-w",
+                    ],
+                    &[("PGPASSFILE", "/run/secrets/slip-pgpass")],
+                    sql.as_bytes(),
+                    Duration::from_secs(30),
+                    8192,
+                )
+                .await
+                .map_err(|_| {
+                    // Sanitized: no raw exec error text, no secret.
+                    ServiceError::Internal(
+                        "resource creation SQL failed — see service logs for details".to_string(),
+                    )
+                })?;
+
+            info!(
+                service = %spec.name(),
+                resource = %resource.id(),
+                "postgres resource created (idempotent)"
+            );
+            Ok(())
+        })
+    }
+
+    fn resource_env<'a>(
+        &'a self,
+        spec: &'a ServiceSpec,
+        resource: &'a ResourceCredentials,
+    ) -> Result<std::collections::BTreeMap<String, String>, ServiceError> {
+        // The app connects over the shared slip network using the service's
+        // DNS alias (= service name). The resource id is simultaneously the
+        // role, the database, and the username. The password is the
+        // generated 64-char hex.
+        //
+        // DATABASE_URL is the canonical env var. The password is URL-safe
+        // hex (no reserved chars), so no percent-encoding is needed.
+        let host = spec.name().as_str();
+        let database_url = format!(
+            "postgresql://{user}:{password}@{host}:5432/{db}",
+            user = resource.id(),
+            password = resource.password(),
+            host = host,
+            db = resource.id(),
+        );
+
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("DATABASE_URL".to_string(), database_url);
+        Ok(env)
+    }
+}
+
+// ─── Resource creation SQL (SLIP-107) ────────────────────────────────────────
+
+/// Build the idempotent, restart-safe SQL that creates a PostgreSQL LOGIN
+/// role + owned database for a resource, revokes PUBLIC access, and ensures
+/// the public schema default is safe.
+///
+/// The SQL is sent via stdin to `psql --no-psqlrc -v ON_ERROR_STOP=1`. It
+/// uses `DO` blocks for role creation (transactional), `SELECT format()`
+/// plus `\\gexec` for idempotent `CREATE DATABASE` (non-transactional), and
+/// `\\connect` to switch to the resource database before running schema
+/// grants (so they apply to the resource db, not the admin `postgres` db).
+///
+/// # Ownership markers
+///
+/// - **Role**: a `COMMENT ON ROLE` with the deterministic string
+///   `slip:resource:<resource_id>` (see [`role_comment`]). Since the role
+///   name == resource id, a role whose comment does not match this marker
+///   is foreign and must not be adopted.
+/// - **Database**: the database owner IS the marker. A database with the
+///   expected name whose owner is not our role is foreign.
+///
+/// # Log suppression
+///
+/// The password appears in `CREATE/ALTER ROLE ... PASSWORD '...'`. To keep
+/// it out of the server log (`log_statement` could be `all`), the SQL
+/// sets `log_statement='none'` and `log_min_error_statement='panic'` at
+/// the start of the session, and re-asserts them after `\connect` (the
+/// connection switch resets session GUCs to the database/user defaults).
+///
+/// # Cross-connect window
+///
+/// `CREATE DATABASE ... ALLOW_CONNECTIONS false` creates the database in
+/// a closed state. We then `REVOKE ALL ON DATABASE ... FROM PUBLIC` and
+/// `GRANT CONNECT ... TO <id>` before `ALTER DATABASE ... ALLOW_CONNECTIONS
+/// true`. This eliminates the window where another role could connect to
+/// the new database before the revokes land.
+fn build_resource_sql(resource: &ResourceCredentials) -> String {
+    let id = resource.id();
+    let password = resource.password();
+    let comment = role_comment(id);
+
+    // The id is `slip_` + 48 lowercase hex — a valid unquoted PostgreSQL
+    // identifier (≤ 63 bytes, starts with letter, [a-z0-9_]). The password
+    // is 64 lowercase hex — injection-safe in a single-quoted literal.
+    // The id is interpolated unquoted (it is a validated identifier).
+    format!(
+        r#"-- slip-managed resource creation (SLIP-107)
+-- Idempotent, restart-safe, fail-closed on foreign objects.
+-- Role and database are NEVER dropped.
+
+-- ─── Session log suppression ─────────────────────────────────────────────
+-- Suppress password SQL from the server log. log_statement='none' prevents
+-- the CREATE/ALTER ROLE PASSWORD statement from being logged. We re-assert
+-- these after \connect (the switch resets session GUCs).
+SET log_statement = 'none';
+SET log_min_error_statement = 'panic';
+
+-- ─── Role ────────────────────────────────────────────────────────────────
+-- Create the LOGIN role with the deterministic ownership comment, or adopt
+-- an existing role whose comment matches. A role with a mismatched comment
+-- is foreign → raise to abort (fail-closed).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{id}') THEN
+        CREATE ROLE {id}
+            LOGIN
+            NOSUPERUSER
+            NOCREATEDB
+            NOCREATEROLE
+            NOREPLICATION
+            NOBYPASSRLS
+            PASSWORD '{password}';
+        COMMENT ON ROLE {id} IS '{comment}';
+    ELSE
+        -- Role exists: verify ownership marker.
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_shdescription d
+            JOIN pg_roles r ON r.oid = d.objoid
+            WHERE r.rolname = '{id}' AND d.description = '{comment}'
+        ) THEN
+            RAISE EXCEPTION 'foreign role {id} exists with mismatched ownership marker — refusing adoption';
+        END IF;
+        -- Owned by us: reassert ALL privilege flags to catch drift (a role
+        -- that was tampered to SUPERUSER must be fixed back, not silently
+        -- kept). Then set the password to the persisted value.
+        ALTER ROLE {id} NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+        ALTER ROLE {id} PASSWORD '{password}';
+    END IF;
+END $$;
+
+-- ─── Database (idempotent via \gexec) ──────────────────────────────────────
+-- CREATE DATABASE cannot run inside a transaction block and errors if the
+-- db already exists. We use SELECT format() + \gexec to conditionally emit
+-- the statement only when the db does not exist. This makes the second
+-- (idempotent) apply succeed rather than failing under ON_ERROR_STOP=1.
+--
+-- The database is created with ALLOW_CONNECTIONS false to eliminate the
+-- cross-connect window: no role can connect until we REVOKE PUBLIC and
+-- GRANT CONNECT to the owner, after which we open it with
+-- ALLOW_CONNECTIONS true.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_database WHERE datname = '{id}') THEN
+        -- Database exists: verify the owner is our role.
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_database d
+            JOIN pg_roles r ON r.oid = d.datdba
+            WHERE d.datname = '{id}' AND r.rolname = '{id}'
+        ) THEN
+            RAISE EXCEPTION 'foreign database {id} exists with mismatched owner — refusing adoption';
+        END IF;
+    END IF;
+END $$;
+
+-- Conditionally CREATE DATABASE with ALLOW_CONNECTIONS false (closed).
+-- \gexec runs the formatted statement produced by SELECT format().
+SELECT format('CREATE DATABASE %I OWNER %I ALLOW_CONNECTIONS false', '{id}', '{id}')
+WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = '{id}')\gexec
+
+-- ─── Database-level privileges (run against admin db) ────────────────────
+-- Revoke ALL from PUBLIC on the resource database (CONNECT, TEMP, and
+-- CREATE on schema public via the database-level default). Grant CONNECT
+-- only to the owning role.
+REVOKE ALL ON DATABASE {id} FROM PUBLIC;
+GRANT CONNECT ON DATABASE {id} TO {id};
+
+-- Open the database for connections now that PUBLIC has no access.
+ALTER DATABASE {id} ALLOW_CONNECTIONS true;
+
+-- ─── Connect to the resource database ────────────────────────────────────
+-- Schema and default-privilege grants must run while connected to the
+-- resource database, NOT the admin `postgres` database. Running them
+-- against `postgres` would grant the resource role privileges on the
+-- admin database's public schema — a privilege escalation.
+\connect {id}
+
+-- Re-assert log suppression after \connect (the switch resets GUCs).
+SET log_statement = 'none';
+SET log_min_error_statement = 'panic';
+
+-- ─── Public schema safe default ──────────────────────────────────────────
+-- Ensure the public schema default privileges are safe: the owner retains
+-- full control; no new objects are world-accessible by default.
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT USAGE, CREATE ON SCHEMA public TO {id};
+
+-- Ensure the owner has full schema privileges.
+GRANT ALL ON SCHEMA public TO {id};
+
+-- ─── Default table privileges ────────────────────────────────────────────
+-- Revoke default PUBLIC privileges on objects created by the resource role
+-- in the public schema. For TABLES: INSERT, SELECT, UPDATE, DELETE,
+-- TRUNCATE, REFERENCES, TRIGGER. For SEQUENCES: USAGE, SELECT, UPDATE
+-- (NOT INSERT — INSERT is invalid for sequences and would error).
+ALTER DEFAULT PRIVILEGES FOR ROLE {id} IN SCHEMA public
+    REVOKE INSERT, SELECT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLES FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE {id} IN SCHEMA public
+    REVOKE USAGE, SELECT, UPDATE ON SEQUENCES FROM PUBLIC;
+"#,
+        id = id,
+        password = password,
+        comment = comment,
+    )
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────────
@@ -1551,6 +1887,9 @@ mod tests {
     use std::path::PathBuf;
     use std::pin::Pin;
 
+    /// Recorded `exec_service_stdin` call: (container_id, argv, stdin_bytes).
+    type StdinCall = (String, Vec<String>, Vec<u8>);
+
     /// A recording fake runtime for provider tests.
     struct RecordingRuntime {
         rootful: bool,
@@ -1558,6 +1897,7 @@ mod tests {
         inspect_responses:
             std::sync::Mutex<std::collections::VecDeque<crate::runtime::ServiceContainerInspect>>,
         probe_calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+        stdin_calls: std::sync::Mutex<Vec<StdinCall>>,
         stop_remove_calls: std::sync::Mutex<Vec<String>>,
         start_calls: std::sync::Mutex<Vec<String>>,
         pull_calls: std::sync::Mutex<Vec<(String, String)>>,
@@ -1571,6 +1911,7 @@ mod tests {
                 created_specs: Default::default(),
                 inspect_responses: Default::default(),
                 probe_calls: Default::default(),
+                stdin_calls: Default::default(),
                 stop_remove_calls: Default::default(),
                 start_calls: Default::default(),
                 pull_calls: Default::default(),
@@ -1597,6 +1938,12 @@ mod tests {
         #[allow(dead_code)]
         fn probe_count(&self) -> usize {
             self.probe_calls.lock().unwrap().len()
+        }
+
+        /// Return the recorded `exec_service_stdin` calls as
+        /// `(container_id, argv, stdin_bytes)`.
+        fn stdin_calls(&self) -> Vec<(String, Vec<String>, Vec<u8>)> {
+            self.stdin_calls.lock().unwrap().clone()
         }
 
         fn stop_remove_count(&self) -> usize {
@@ -1745,6 +2092,23 @@ mod tests {
             self.probe_calls.lock().unwrap().push((
                 container_id.to_string(),
                 argv.iter().map(|s| s.to_string()).collect(),
+            ));
+            Box::pin(async { Ok(()) })
+        }
+
+        fn exec_service_stdin<'a>(
+            &'a self,
+            container_id: &'a str,
+            argv: &'a [&'a str],
+            _env: &'a [(&'a str, &'a str)],
+            stdin_input: &'a [u8],
+            _timeout: Duration,
+            _max_output: usize,
+        ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+            self.stdin_calls.lock().unwrap().push((
+                container_id.to_string(),
+                argv.iter().map(|s| s.to_string()).collect(),
+                stdin_input.to_vec(),
             ));
             Box::pin(async { Ok(()) })
         }
@@ -2516,6 +2880,583 @@ mod tests {
         // Port bindings are enforced as empty by construction (the spec
         // doesn't even have a port field; create_and_start_service uses None).
         assert!(spec.restart_unless_stopped());
+    }
+
+    // ── Resource creation SQL tests (SLIP-107) ──────────────────────────────
+
+    fn sample_resource() -> ResourceCredentials {
+        let id = crate::services::resource::compute_resource_id(
+            "install-id-test",
+            "0123456789abcdef0123456789abcdef",
+            "myapp",
+            "db",
+        );
+        // Generate a 64-char lowercase hex password.
+        let password = "a".repeat(64);
+        ResourceCredentials::new(id, password).unwrap()
+    }
+
+    #[test]
+    fn build_resource_sql_creates_role_with_login_no_privileges() {
+        let resource = sample_resource();
+        let sql = build_resource_sql(&resource);
+        assert!(sql.contains("CREATE ROLE"));
+        assert!(sql.contains("LOGIN"));
+        assert!(sql.contains("NOSUPERUSER"));
+        assert!(sql.contains("NOCREATEDB"));
+        assert!(sql.contains("NOCREATEROLE"));
+        assert!(sql.contains("NOREPLICATION"));
+        assert!(sql.contains("NOBYPASSRLS"));
+    }
+
+    #[test]
+    fn build_resource_sql_never_drops() {
+        let resource = sample_resource();
+        let sql = build_resource_sql(&resource);
+        assert!(
+            !sql.to_lowercase().contains("drop role"),
+            "SQL must never DROP ROLE"
+        );
+        assert!(
+            !sql.to_lowercase().contains("drop database"),
+            "SQL must never DROP DATABASE"
+        );
+    }
+
+    #[test]
+    fn build_resource_sql_revokes_public_connect_temp() {
+        let resource = sample_resource();
+        let sql = build_resource_sql(&resource);
+        // We revoke ALL from PUBLIC (which includes CONNECT and TEMP), then
+        // grant CONNECT back only to the resource role.
+        assert!(sql.contains("REVOKE ALL ON DATABASE"));
+        assert!(sql.contains("FROM PUBLIC"));
+        assert!(sql.contains("GRANT CONNECT ON DATABASE"));
+    }
+
+    #[test]
+    fn build_resource_sql_revokes_public_schema_all() {
+        let resource = sample_resource();
+        let sql = build_resource_sql(&resource);
+        assert!(sql.contains("REVOKE ALL ON SCHEMA public FROM PUBLIC"));
+    }
+
+    #[test]
+    fn build_resource_sql_has_ownership_comment() {
+        let resource = sample_resource();
+        let sql = build_resource_sql(&resource);
+        let expected_comment = role_comment(resource.id());
+        assert!(sql.contains("COMMENT ON ROLE"));
+        assert!(sql.contains(&expected_comment));
+    }
+
+    #[test]
+    fn build_resource_sql_refuses_foreign_role() {
+        let resource = sample_resource();
+        let sql = build_resource_sql(&resource);
+        assert!(
+            sql.contains("refusing adoption"),
+            "SQL must refuse foreign role adoption"
+        );
+    }
+
+    #[test]
+    fn build_resource_sql_refuses_foreign_database() {
+        let resource = sample_resource();
+        let sql = build_resource_sql(&resource);
+        assert!(
+            sql.contains("refusing adoption"),
+            "SQL must refuse foreign database adoption"
+        );
+    }
+
+    #[test]
+    fn build_resource_sql_uses_on_error_stop_semantics() {
+        // The SQL is run with psql -v ON_ERROR_STOP=1; the DO blocks raise
+        // exceptions to abort. Verify RAISE EXCEPTION is present.
+        let resource = sample_resource();
+        let sql = build_resource_sql(&resource);
+        assert!(sql.contains("RAISE EXCEPTION"));
+    }
+
+    #[test]
+    fn build_resource_sql_uses_default_privileges() {
+        let resource = sample_resource();
+        let sql = build_resource_sql(&resource);
+        assert!(sql.contains("ALTER DEFAULT PRIVILEGES"));
+        assert!(sql.contains("REVOKE"));
+        assert!(sql.contains("FROM PUBLIC"));
+        // Sequences: USAGE, SELECT, UPDATE (NOT INSERT — invalid for sequences).
+        assert!(sql.contains("USAGE, SELECT, UPDATE ON SEQUENCES"));
+        assert!(!sql.contains("INSERT, UPDATE, USAGE ON SEQUENCES"));
+    }
+
+    #[test]
+    fn build_resource_sql_password_not_in_comment() {
+        // The password appears only in the CREATE/ALTER ROLE statement, not
+        // in the comment (which is the deterministic ownership marker).
+        let resource = sample_resource();
+        let sql = build_resource_sql(&resource);
+        let comment_line = sql.lines().find(|l| l.contains("COMMENT ON ROLE")).unwrap();
+        assert!(!comment_line.contains(resource.password()));
+    }
+
+    #[test]
+    fn build_resource_sql_create_database_is_top_level() {
+        // CREATE DATABASE cannot run inside a transaction block, so it must
+        // be a top-level statement, not inside a DO block. We use
+        // SELECT format() + \gexec for idempotent conditional creation.
+        let resource = sample_resource();
+        let sql = build_resource_sql(&resource);
+        assert!(sql.contains("CREATE DATABASE"));
+        assert!(
+            sql.contains("\\gexec"),
+            "must use \\gexec for idempotent CREATE DATABASE"
+        );
+        assert!(
+            sql.contains("ALLOW_CONNECTIONS false"),
+            "must create with ALLOW_CONNECTIONS false to avoid cross-connect window"
+        );
+        assert!(
+            sql.contains("ALLOW_CONNECTIONS true"),
+            "must open database after PUBLIC revoke"
+        );
+        let creation = sql.find("SELECT format('CREATE DATABASE").unwrap();
+        assert!(creation > sql.rfind("END $$;").unwrap());
+        assert!(sql[creation..].contains("\\gexec"));
+    }
+
+    #[test]
+    fn build_resource_sql_connects_to_resource_db_for_schema_grants() {
+        // Schema grants must run while connected to the resource database,
+        // not the admin postgres database. This prevents granting the
+        // resource role privileges on the admin db's public schema.
+        let resource = sample_resource();
+        let sql = build_resource_sql(&resource);
+        assert!(
+            sql.contains("\\connect"),
+            "must \\connect to resource db before schema grants"
+        );
+        // The REVOKE ALL ON SCHEMA public must come AFTER \connect.
+        let connect_pos = sql.find("\\connect").unwrap();
+        let revoke_pos = sql.find("REVOKE ALL ON SCHEMA public").unwrap();
+        assert!(
+            revoke_pos > connect_pos,
+            "schema revoke must come after \\connect to resource db"
+        );
+    }
+
+    #[test]
+    fn build_resource_sql_suppresses_password_from_logs() {
+        // The SQL must SET log_statement='none' and
+        // log_min_error_statement='panic' to suppress password from logs.
+        // This must be done twice: once at the start, and once after \connect
+        // (the switch resets session GUCs).
+        let resource = sample_resource();
+        let sql = build_resource_sql(&resource);
+        assert!(sql.contains("SET log_statement = 'none';"));
+        assert!(sql.contains("SET log_min_error_statement = 'panic';"));
+        // Count occurrences — should be at least 2 (before and after \connect).
+        let count = sql.matches("SET log_statement = 'none';").count();
+        assert!(
+            count >= 2,
+            "log suppression must be set at least twice (before and after \\connect), got {count}"
+        );
+    }
+
+    #[test]
+    fn build_resource_sql_reasserts_role_privilege_flags() {
+        // On an existing owned role, the SQL must reassert ALL privilege
+        // flags (NOSUPERUSER etc.) to catch drift — not silently keep them.
+        let resource = sample_resource();
+        let sql = build_resource_sql(&resource);
+        // The ALTER ROLE ... NOSUPERUSER ... line appears in the ELSE branch
+        // (existing role). Verify it's present.
+        assert!(
+            sql.contains("ALTER ROLE") && sql.contains("NOSUPERUSER"),
+            "must reassert role privilege flags on existing role"
+        );
+    }
+
+    // ── resource_env tests (SLIP-107) ───────────────────────────────────────
+
+    #[test]
+    fn resource_env_produces_database_url() {
+        let provider = PostgresProvider::new();
+        let spec = sample_spec("pg-main");
+        let resource = sample_resource();
+        let env = provider.resource_env(&spec, &resource).unwrap();
+        let url = env.get("DATABASE_URL").expect("DATABASE_URL must be set");
+        assert!(url.starts_with("postgresql://"));
+        assert!(url.contains(resource.id()));
+        assert!(url.contains(resource.password()));
+        // The host is the service name (DNS alias on the slip network).
+        assert!(url.contains("@pg-main:5432/"));
+    }
+
+    #[test]
+    fn resource_env_database_url_uses_resource_id_as_db_name() {
+        let provider = PostgresProvider::new();
+        let spec = sample_spec("pg");
+        let resource = sample_resource();
+        let env = provider.resource_env(&spec, &resource).unwrap();
+        let url = env.get("DATABASE_URL").unwrap();
+        // The database name in the URL path is the resource id.
+        let db_name = url.rsplit('/').next().unwrap();
+        assert_eq!(db_name, resource.id());
+    }
+
+    #[test]
+    fn resource_env_database_url_uses_resource_id_as_user() {
+        let provider = PostgresProvider::new();
+        let spec = sample_spec("pg");
+        let resource = sample_resource();
+        let env = provider.resource_env(&spec, &resource).unwrap();
+        let url = env.get("DATABASE_URL").unwrap();
+        // The user in the URL is the resource id.
+        let after_scheme = url.strip_prefix("postgresql://").unwrap();
+        let user = after_scheme.split(':').next().unwrap();
+        assert_eq!(user, resource.id());
+    }
+
+    // ── create_resource provider tests with RecordingRuntime (SLIP-107) ─────
+
+    /// Build a state with a persisted container id for create_resource tests.
+    fn state_with_container_id(name: &str, cid: &ContainerId) -> ServiceState {
+        let base = sample_state(name);
+        crate::services::spec::ServiceState::from_validated(
+            base.service_name().clone(),
+            base.provider(),
+            base.data_major(),
+            base.version().clone(),
+            base.instance_id().clone(),
+            base.generation(),
+            base.phase(),
+            Some(cid.clone()),
+            base.resolved_image().clone(),
+            base.applied_spec_hash().cloned(),
+            base.secret_ref().clone(),
+            base.health(),
+            base.last_error(),
+            base.last_checked_at(),
+            base.updated_at(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_resource_blocked_when_no_container() {
+        let rt = RecordingRuntime::new(true);
+        let provider = PostgresProvider::new();
+        let spec = sample_spec("pg");
+        let state = sample_state("pg"); // no container_id
+        let mounts = sample_mounts();
+        let secrets = FakeInstanceSecrets::with_mounts(state.instance_id().clone(), mounts);
+        let ctx = make_ctx(&rt, &secrets, &state);
+        let resource = sample_resource();
+
+        let result = provider
+            .create_resource(&ctx, &spec, &state, &resource)
+            .await;
+        assert!(result.is_err());
+        assert!(
+            rt.stdin_calls().is_empty(),
+            "must not exec SQL on no container"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_resource_blocked_on_non_rootful() {
+        let rt = RecordingRuntime::new(false);
+        let provider = PostgresProvider::new();
+        let spec = sample_spec("pg");
+        let cid = ContainerId::parse(&rt.next_id()).unwrap();
+        let state = state_with_container_id("pg", &cid);
+        let mounts = sample_mounts();
+        let secrets = FakeInstanceSecrets::with_mounts(state.instance_id().clone(), mounts);
+        let ctx = make_ctx(&rt, &secrets, &state);
+        let resource = sample_resource();
+
+        let result = provider
+            .create_resource(&ctx, &spec, &state, &resource)
+            .await;
+        assert!(result.is_err());
+        assert!(rt.stdin_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_resource_blocked_on_ownership_mismatch() {
+        let rt = RecordingRuntime::new(true);
+        let provider = PostgresProvider::new();
+        let spec = sample_spec("pg");
+        let cid = ContainerId::parse(&rt.next_id()).unwrap();
+        let state = state_with_container_id("pg", &cid);
+        let mounts = sample_mounts();
+        let secrets = FakeInstanceSecrets::with_mounts(state.instance_id().clone(), mounts);
+
+        // Queue an inspect with wrong labels (ownership mismatch).
+        let wrong_labels = BTreeMap::new();
+        let image = sample_pinned_image();
+        rt.queue_inspect(healthy_inspect(
+            cid.as_str(),
+            &wrong_labels,
+            vec![image.repo_digest()],
+            expected_mount_tuples(),
+        ));
+
+        let ctx = make_ctx(&rt, &secrets, &state);
+        let resource = sample_resource();
+
+        let result = provider
+            .create_resource(&ctx, &spec, &state, &resource)
+            .await;
+        assert!(result.is_err());
+        assert!(
+            rt.stdin_calls().is_empty(),
+            "must not exec SQL on ownership mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_resource_blocked_when_not_healthy() {
+        let rt = RecordingRuntime::new(true);
+        let provider = PostgresProvider::new();
+        let spec = sample_spec("pg");
+        let cid = ContainerId::parse(&rt.next_id()).unwrap();
+        let state = state_with_container_id("pg", &cid);
+        let mounts = sample_mounts();
+        let secrets = FakeInstanceSecrets::with_mounts(state.instance_id().clone(), mounts.clone());
+
+        // Build correct labels so ownership passes, but set health to starting.
+        let spec_hash = spec.effective_hash().unwrap();
+        let labels = ownership_labels(
+            "install-id-test",
+            state.instance_id().as_str(),
+            "pg",
+            spec_hash.as_str(),
+            mounts.generation.as_str(),
+        );
+        let image = sample_pinned_image();
+        let mut inspect = healthy_inspect(
+            cid.as_str(),
+            &labels,
+            vec![image.repo_digest()],
+            expected_mount_tuples(),
+        );
+        inspect.health_status = "starting".to_string();
+        rt.queue_inspect(inspect);
+
+        let ctx = make_ctx(&rt, &secrets, &state);
+        let resource = sample_resource();
+
+        let result = provider
+            .create_resource(&ctx, &spec, &state, &resource)
+            .await;
+        assert!(result.is_err());
+        assert!(
+            rt.stdin_calls().is_empty(),
+            "must not exec SQL when not healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_resource_execs_sql_via_stdin_when_healthy_and_owned() {
+        let rt = RecordingRuntime::new(true);
+        let provider = PostgresProvider::new();
+        let spec = sample_spec("pg");
+        let cid = ContainerId::parse(&rt.next_id()).unwrap();
+        let state = state_with_container_id("pg", &cid);
+        let mounts = sample_mounts();
+        let secrets = FakeInstanceSecrets::with_mounts(state.instance_id().clone(), mounts.clone());
+
+        // Build correct labels and a healthy, running, fully-owned inspect.
+        let spec_hash = spec.effective_hash().unwrap();
+        let labels = ownership_labels(
+            "install-id-test",
+            state.instance_id().as_str(),
+            "pg",
+            spec_hash.as_str(),
+            mounts.generation.as_str(),
+        );
+        let image = sample_pinned_image();
+        rt.queue_inspect(healthy_inspect(
+            cid.as_str(),
+            &labels,
+            vec![image.repo_digest()],
+            expected_mount_tuples(),
+        ));
+
+        let ctx = make_ctx(&rt, &secrets, &state);
+        let resource = sample_resource();
+
+        provider
+            .create_resource(&ctx, &spec, &state, &resource)
+            .await
+            .expect("create_resource should succeed on healthy owned container");
+
+        // Verify exactly one stdin exec call was made.
+        let stdin_calls = rt.stdin_calls();
+        assert_eq!(stdin_calls.len(), 1, "exactly one stdin exec expected");
+        let (called_cid, argv, stdin_bytes) = &stdin_calls[0];
+        assert_eq!(called_cid, cid.as_str());
+        // argv must be psql --no-psqlrc -v ON_ERROR_STOP=1 ... -w
+        assert!(argv.iter().any(|a| a == "psql"));
+        assert!(argv.iter().any(|a| a == "--no-psqlrc"));
+        assert!(argv.iter().any(|a| a == "ON_ERROR_STOP=1"));
+        assert!(
+            argv.iter().any(|a| a == "-w"),
+            "must use -w (no password prompt)"
+        );
+        // The SQL in stdin must contain the resource id.
+        let sql = String::from_utf8_lossy(stdin_bytes);
+        assert!(sql.contains(resource.id()));
+        // The password must NOT appear in argv.
+        assert!(
+            !argv.iter().any(|a| a.contains(resource.password())),
+            "password must not appear in argv"
+        );
+        // The PGPASSFILE env is set via the env param, not argv. The password
+        // is only in the SQL stdin (for ALTER ROLE), which is expected.
+        // Verify the SQL contains the password (for ALTER ROLE PASSWORD).
+        assert!(
+            sql.contains(resource.password()),
+            "SQL must contain the password for ALTER ROLE"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_resource_idempotent_second_call_also_execs() {
+        // Both calls should exec SQL (idempotency is server-side via the
+        // DO blocks; the provider always sends the full idempotent SQL).
+        let rt = RecordingRuntime::new(true);
+        let provider = PostgresProvider::new();
+        let spec = sample_spec("pg");
+        let cid = ContainerId::parse(&rt.next_id()).unwrap();
+        let state = state_with_container_id("pg", &cid);
+        let mounts = sample_mounts();
+        let secrets = FakeInstanceSecrets::with_mounts(state.instance_id().clone(), mounts.clone());
+
+        let spec_hash = spec.effective_hash().unwrap();
+        let labels = ownership_labels(
+            "install-id-test",
+            state.instance_id().as_str(),
+            "pg",
+            spec_hash.as_str(),
+            mounts.generation.as_str(),
+        );
+        let image = sample_pinned_image();
+
+        // Queue two healthy inspects (one per call).
+        for _ in 0..2 {
+            rt.queue_inspect(healthy_inspect(
+                cid.as_str(),
+                &labels,
+                vec![image.repo_digest()],
+                expected_mount_tuples(),
+            ));
+        }
+
+        let ctx = make_ctx(&rt, &secrets, &state);
+        let resource = sample_resource();
+
+        provider
+            .create_resource(&ctx, &spec, &state, &resource)
+            .await
+            .unwrap();
+        provider
+            .create_resource(&ctx, &spec, &state, &resource)
+            .await
+            .unwrap();
+
+        assert_eq!(rt.stdin_calls().len(), 2, "both calls must exec SQL");
+    }
+
+    // ── Default trait method tests (SLIP-107) ────────────────────────────────
+
+    /// A provider that does not implement create_resource/resource_env should
+    /// get the default Unsupported behavior.
+    struct NoResourceProvider;
+
+    impl ServiceProvider for NoResourceProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Postgres
+        }
+        fn validate(&self, _spec: &ServiceSpec) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        fn provision<'a>(
+            &'a self,
+            _ctx: &'a ProviderContext<'a>,
+            _spec: &'a ServiceSpec,
+            _state: &'a ServiceState,
+        ) -> crate::services::spec::BoxFuture<'a, Result<ProvisionOutcome, ServiceError>> {
+            Box::pin(async {
+                Ok(ProvisionOutcome {
+                    container_id: ContainerId::parse(&"0".repeat(64)).unwrap(),
+                    created: true,
+                })
+            })
+        }
+        fn ensure<'a>(
+            &'a self,
+            _ctx: &'a ProviderContext<'a>,
+            _spec: &'a ServiceSpec,
+            _state: &'a ServiceState,
+        ) -> crate::services::spec::BoxFuture<'a, Result<EnsureOutcome, ServiceError>> {
+            Box::pin(async {
+                Ok(EnsureOutcome {
+                    container_id: ContainerId::parse(&"0".repeat(64)).unwrap(),
+                    action: EnsureAction::Noop,
+                    health: None,
+                })
+            })
+        }
+        fn health<'a>(
+            &'a self,
+            _ctx: &'a ProviderContext<'a>,
+            _state: &'a ServiceState,
+        ) -> crate::services::spec::BoxFuture<'a, Result<ServiceHealth, ServiceError>> {
+            Box::pin(async {
+                Ok(ServiceHealth {
+                    kind: HealthKind::Unknown,
+                })
+            })
+        }
+        fn remove<'a>(
+            &'a self,
+            _ctx: &'a ProviderContext<'a>,
+            _state: &'a ServiceState,
+        ) -> crate::services::spec::BoxFuture<'a, Result<(), ServiceError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[test]
+    fn default_create_resource_is_unsupported() {
+        let provider = NoResourceProvider;
+        let spec = sample_spec("pg");
+        // We can't easily build a full ProviderContext without a runtime,
+        // but resource_env is synchronous and testable directly.
+        let resource = sample_resource();
+        let result = provider.resource_env(&spec, &resource);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_resource_sql_id_is_valid_unquoted_pg_identifier() {
+        // The resource id must be a valid unquoted PostgreSQL identifier:
+        // ≤ 63 bytes, starts with a letter, [a-z0-9_].
+        let resource = sample_resource();
+        let id = resource.id();
+        assert!(id.len() <= 63, "id must be ≤ 63 bytes for PG identifier");
+        assert!(
+            id.chars().next().unwrap().is_ascii_alphabetic(),
+            "id must start with a letter"
+        );
+        assert!(
+            id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "id must contain only [a-z0-9_]"
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! Daemon config loaded from `/etc/slip/slip.toml`.
 //! App configs loaded from `/etc/slip/apps/*.toml`.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -647,6 +648,11 @@ pub struct AppConfig {
     /// Host-path volume mounts for this app.
     #[serde(default)]
     pub volumes: Vec<VolumeConfig>,
+    /// Service-need bindings (`[needs.<alias>]`). Server config is authoritative
+    /// per alias (see `merge.rs`); the repo may declare needs that are merged
+    /// key-by-key. An empty map (no `[needs]` table) is valid.
+    #[serde(default)]
+    pub needs: BTreeMap<String, crate::needs::Need>,
 }
 
 /// Basic application identity.
@@ -1325,6 +1331,11 @@ pub fn load_config_with_mode(
                     validate_tls_strategy(route_tls, Some(&route.hostname), &validation_ctx)?;
                 }
             }
+
+            // Validate needs bindings (alias format, env conflicts, collisions).
+            crate::needs::validate_needs(&app_cfg.needs, &app_cfg.env).map_err(|e| {
+                ConfigError::Internal(format!("apps.{}.needs: {e}", app_cfg.app.name))
+            })?;
 
             apps.insert(app_cfg.app.name.clone(), app_cfg);
         }

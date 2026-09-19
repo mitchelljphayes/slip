@@ -269,6 +269,7 @@ pub(crate) struct DeploySharedState<'a> {
     /// per-image at each pull via [`crate::registry::resolve_registry_credential`].
     pub registries: Vec<crate::registry::ResolvedRegistry>,
     pub secrets_store: Option<&'a crate::secrets::SecretsStore>,
+    pub services: Option<&'a crate::services::ServiceController>,
 }
 
 // ─── Core orchestrator ────────────────────────────────────────────────────────
@@ -299,6 +300,7 @@ pub async fn execute_deploy(state: Arc<AppState>, mut ctx: DeployContext) {
         db: state.db.clone(),
         registries: crate::registry::merged_registry_table(&state.config, &state.secrets_store),
         secrets_store: Some(&state.secrets_store),
+        services: state.services.as_deref(),
     };
 
     let result = tokio::time::timeout(
@@ -510,8 +512,49 @@ pub(crate) async fn execute_deploy_inner(
         None => app_config.clone(),
     };
 
+    // Reconcile before starting (or stopping, for recreate) any app container.
+    // Only the applied server declarations are authoritative, never stale image
+    // needs. Credentials stay in the secrets store, outside public config/env.
+    let binding_env = async {
+        if effective_config.needs.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let services = shared.services.ok_or_else(|| {
+            crate::services::bindings::BindingError::MissingService(
+                effective_config
+                    .needs
+                    .values()
+                    .next()
+                    .expect("nonempty needs")
+                    .r#type
+                    .to_string(),
+            )
+        })?;
+        let store = shared
+            .secrets_store
+            .ok_or(crate::services::bindings::BindingError::Store)?;
+        let _lease = services.bind(&effective_config, store).await?;
+        crate::services::bindings::env(store, &effective_config)
+    }
+    .await;
+    let binding_env = match binding_env {
+        Ok(env) => env,
+        Err(error) => {
+            ctx.fail(&format!("[binding_failed] {error}"));
+            record_deploy(&shared, ctx);
+            set_app_failed(shared.app_states, &app_name);
+            return;
+        }
+    };
+
     // ── STRATEGY DISPATCH ────────────────────────────────────────────────────
-    let env_vars = resolve_env_vars_for_app(&effective_config, shared.secrets_store, &app_name);
+    let mut env_vars = resolve_env_vars_for_app(&effective_config, shared.secrets_store, &app_name);
+    // Binding keys have already been checked against manual env and secrets.
+    for (key, value) in binding_env {
+        let prefix = format!("{key}=");
+        env_vars.retain(|entry| !entry.starts_with(&prefix));
+        env_vars.push(format!("{key}={value}"));
+    }
 
     // Determine if this is a pod or container deploy.
     let is_pod = merged.as_ref().map(|m| m.kind == "pod").unwrap_or(false);
@@ -936,6 +979,15 @@ async fn execute_blue_green_deploy_pod(
         }
     };
 
+    if let Err(error) =
+        crate::services::bindings::validate_pod_env(&manifest_bytes, effective_config)
+    {
+        ctx.fail(&format!("[binding_failed] {error}"));
+        record_deploy(shared, ctx);
+        set_app_failed(shared.app_states, app_name);
+        return;
+    }
+
     // Generate a unique pod suffix from a ULID fragment.
     let pod_suffix = ulid::Ulid::new().to_string()[..8].to_lowercase();
     let pod_name = format!("{app_name}-{pod_suffix}");
@@ -976,7 +1028,17 @@ async fn execute_blue_green_deploy_pod(
         return;
     }
     let manifest_path = manifests_dir.join(format!("{app_name}-{}.yaml", ctx.id));
-    if let Err(e) = std::fs::write(&manifest_path, &rendered_yaml) {
+    // Rendered manifests contain app secrets, including binding credentials.
+    // Create them privately, never with the process umask's usual 0644 mode.
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let write_result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&manifest_path)
+        .and_then(|mut file| file.write_all(rendered_yaml.as_bytes()));
+    if let Err(e) = write_result {
         ctx.fail(&format!(
             "[manifest_write_failed] failed to write manifest file: {e}"
         ));
@@ -2545,6 +2607,7 @@ mod tests {
             network: crate::config::NetworkConfig::default(),
             preview: None,
             volumes: Vec::new(),
+            needs: Default::default(),
         }
     }
 
@@ -2573,6 +2636,7 @@ mod tests {
             db: Db::open_in_memory().expect("in-memory db for tests"),
             registries: Vec::new(),
             secrets_store: None,
+            services: None,
         }
     }
 
@@ -2593,6 +2657,7 @@ mod tests {
             db,
             registries: Vec::new(),
             secrets_store: None,
+            services: None,
         }
     }
 
@@ -2613,6 +2678,7 @@ mod tests {
             db: Db::open_in_memory().expect("in-memory db for tests"),
             registries,
             secrets_store: None,
+            services: None,
         }
     }
 
@@ -3742,6 +3808,7 @@ container = "web"
             network: crate::config::NetworkConfig::default(),
             preview: None,
             volumes: Vec::new(),
+            needs: Default::default(),
         };
 
         let vars = resolve_env_vars_for_app(&app_config, None, "testapp");
@@ -3779,6 +3846,7 @@ container = "web"
             network: crate::config::NetworkConfig::default(),
             preview: None,
             volumes: Vec::new(),
+            needs: Default::default(),
         };
 
         let vars = resolve_env_vars_for_app(&app_config, Some(&store), "testapp");
@@ -3815,6 +3883,7 @@ container = "web"
             network: crate::config::NetworkConfig::default(),
             preview: None,
             volumes: Vec::new(),
+            needs: Default::default(),
         };
 
         let vars = resolve_env_vars_for_app(&app_config, Some(&store), "testapp");
@@ -3846,6 +3915,7 @@ container = "web"
             network: crate::config::NetworkConfig::default(),
             preview: None,
             volumes: Vec::new(),
+            needs: Default::default(),
         };
 
         let vars = resolve_env_vars_for_app(&app_config, None, "testapp");
@@ -4524,7 +4594,7 @@ container = "web"
 
         Arc::new(crate::api::AppState {
             config,
-            apps: RwLock::new(apps),
+            apps: Arc::new(RwLock::new(apps)),
             config_dir: std::path::PathBuf::from("/tmp/slip-test"),
             deploy_locks: DashMap::new(),
             runtime: Arc::new(docker),

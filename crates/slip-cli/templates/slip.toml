@@ -40,6 +40,8 @@ memory = "512m"
 cpus = "1.0"
 
 # ── Service dependencies (uncomment as needed) ──────────────────────────────
+# Provision postgres on the server, then run `slip apply` to bind this app.
+# s3 and kv env contracts are reserved; their providers are not available yet.
 #
 # [needs.db]
 # type = "postgres"     # → DATABASE_URL

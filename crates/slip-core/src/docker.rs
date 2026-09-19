@@ -1215,6 +1215,116 @@ impl RuntimeBackend for DockerClient {
                 .map_err(|_| RuntimeError::ExecFailed("exec timed out".to_string()))?
         })
     }
+
+    fn exec_service_stdin<'a>(
+        &'a self,
+        container_id: &'a str,
+        argv: &'a [&'a str],
+        env: &'a [(&'a str, &'a str)],
+        stdin_input: &'a [u8],
+        timeout: std::time::Duration,
+        max_output_bytes: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            use tokio::io::AsyncWriteExt;
+
+            // Create the exec instance with stdin attached. argv is static,
+            // env is allowlisted non-secret settings (e.g. PGPASSFILE).
+            let env_vec: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            let exec = self
+                .docker
+                .create_exec(
+                    container_id,
+                    CreateExecOptions {
+                        cmd: Some(argv.iter().map(|s| s.to_string()).collect()),
+                        env: Some(env_vec),
+                        attach_stdin: Some(true),
+                        attach_stdout: Some(true),
+                        attach_stderr: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|_e| {
+                    // Sanitize: no runtime internals in error text.
+                    RuntimeError::ExecFailed("exec creation failed".to_string())
+                })?;
+
+            let exec_future = async {
+                match self
+                    .docker
+                    .start_exec(&exec.id, None::<bollard::exec::StartExecOptions>)
+                    .await
+                {
+                    Ok(StartExecResults::Attached {
+                        mut output,
+                        mut input,
+                    }) => {
+                        // Write the full stdin payload, then close stdin so the
+                        // command sees EOF. SQL contains the resource password,
+                        // so neither the input nor output may be logged.
+                        if input.write_all(stdin_input).await.is_err() {
+                            return Err(RuntimeError::ExecFailed("stdin write failed".to_string()));
+                        }
+                        if input.shutdown().await.is_err() {
+                            // Non-fatal: some daemons close stdin eagerly.
+                        }
+
+                        // Discard bounded output. Never returned to caller.
+                        let mut output_buf: Vec<u8> = Vec::new();
+                        while let Some(item) = output.next().await {
+                            match item {
+                                Ok(log) => {
+                                    let bytes: &[u8] = log.as_ref();
+                                    if output_buf.len() + bytes.len() <= max_output_bytes {
+                                        output_buf.extend_from_slice(bytes);
+                                    } else if output_buf.len() < max_output_bytes {
+                                        let remaining = max_output_bytes - output_buf.len();
+                                        output_buf.extend_from_slice(&bytes[..remaining]);
+                                    }
+                                }
+                                Err(_) => {
+                                    return Err(RuntimeError::ExecFailed(
+                                        "exec output stream failed".into(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Ok(StartExecResults::Detached) => {
+                        return Err(RuntimeError::ExecFailed(
+                            "exec detached unexpectedly".to_string(),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(RuntimeError::ExecFailed("exec start failed".to_string()));
+                    }
+                }
+
+                // Check exit code.
+                let inspect = self.docker.inspect_exec(&exec.id).await;
+                match inspect {
+                    Ok(info) => {
+                        let exit_code = info.exit_code.ok_or_else(|| {
+                            RuntimeError::ExecFailed("exec exit code unavailable".into())
+                        })?;
+                        if exit_code == 0 {
+                            Ok(())
+                        } else {
+                            Err(RuntimeError::ExecFailed(format!(
+                                "exec exited with code {exit_code}"
+                            )))
+                        }
+                    }
+                    Err(_) => Err(RuntimeError::ExecFailed("exec inspect failed".to_string())),
+                }
+            };
+
+            tokio::time::timeout(timeout, exec_future)
+                .await
+                .map_err(|_| RuntimeError::ExecFailed("exec timed out".to_string()))?
+        })
+    }
 }
 
 // ─── Helper functions ─────────────────────────────────────────────────────────

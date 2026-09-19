@@ -534,6 +534,7 @@ mod tests {
             network: NetworkConfig::default(),
             preview: None,
             volumes: vec![],
+            needs: Default::default(),
         }
     }
 
