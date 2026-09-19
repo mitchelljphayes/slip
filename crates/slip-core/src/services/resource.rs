@@ -1,7 +1,7 @@
 //! Service resource credentials primitive (SLIP-107).
 //!
 //! A *resource* is a named, owned, isolated data namespace inside a managed
-//! service instance — for PostgreSQL, a LOGIN role + owned database. Apps
+//! service instance (for PostgreSQL, a LOGIN role plus an owned database). Apps
 //! bind to a resource via an alias; the controller allocates a
 //! [`ResourceCredentials`] per (installation, service instance, app, alias)
 //! tuple and persists it before calling
@@ -32,7 +32,7 @@
 //! - logs, errors, or `Debug` output (the password field is redacted).
 //!
 //! The password DOES appear in the app-facing env produced by
-//! [`ServiceProvider::resource_env`] (e.g. `DATABASE_URL`) — that is the
+//! [`ServiceProvider::resource_env`] (e.g. `DATABASE_URL`); that is the
 //! whole point of a resource credential. The app container is the intended
 //! recipient; the service runtime never sees it in argv/env.
 

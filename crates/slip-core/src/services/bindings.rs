@@ -11,7 +11,7 @@ use crate::{config::AppConfig, needs::Need, secrets::SecretsStore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BindingError {
-    #[error("no {0} service — run `slip services add {0}` on the server")]
+    #[error("no {0} service: run `slip services add {0}` on the server")]
     MissingService(String),
     #[error("{0}")]
     Invalid(String),

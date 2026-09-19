@@ -1082,7 +1082,7 @@ fn e2e_build_state(
     // Secrets store.
     let secrets_store = SecretsStore::new(storage_path.join("secrets")).expect("SecretsStore::new");
 
-    // Apps map — starts empty; the test populates it via POST /v1/apps.
+    // Apps map starts empty; the test populates it via POST /v1/apps.
     let apps: std::collections::HashMap<String, slip_core::config::AppConfig> =
         std::collections::HashMap::new();
     let mut apps_for_migrate = apps;
@@ -1137,7 +1137,7 @@ fn e2e_build_state(
 }
 
 /// Start a minimal HTTP server that accepts any request and returns 200.
-/// This stands in for a real Caddy admin API during the deploy test — the
+/// This stands in for a real Caddy admin API during the deploy test; the
 /// `CaddyClient` makes PATCH/POST/GET/DELETE requests to it, all of which
 /// succeed. Returns the server's bind address.
 ///
@@ -1226,7 +1226,7 @@ async fn wait_until_ready(
 /// pulled by the catalog digest test), which includes `psql`. The
 /// `DATABASE_URL` is passed as the `-d` argument to `psql`, which accepts a
 /// connection URI (libpq feature). It is never passed via argv in a way that
-/// leaks the password — the URL is passed via an environment variable to the
+/// leaks the password: the URL is passed via an environment variable to the
 /// container, then `psql` reads it from `-d "$DATABASE_URL"` inside the
 /// container's shell.
 fn pg_client_verify(container_network: &str, database_url: &str, sql: &str) -> (i32, String) {
@@ -1283,31 +1283,17 @@ fn shell_quote_single(s: &str) -> String {
 
 /// SLIP-107 end-to-end contract test.
 ///
-/// This test exercises the full apply → bind → bindings::env → client
+/// This test exercises the full apply, bind, `bindings::env`, and client
 /// container path through the real axum API router and a live
 /// `ServiceController` backed by `AppConfigUsageReader` (the production usage
 /// reader wired to the live `Arc<RwLock<apps>>`).
 ///
-/// Coverage:
-/// 1. POST /v1/apps with `needs.db` → `prepare_bindings` → `ctrl.bind` →
-///    resource provisioned → binding credentials persisted.
-/// 2. GET /v1/apps/{name} → no password/secret in response.
-/// 3. `bindings::env` returns `DATABASE_URL` with the correct connection
-///    string (user=resource_id, host=service_name, db=resource_id).
-/// 4. A postgres client container on the slip network, using the
-///    `DATABASE_URL` from `bindings::env`, can connect and create a table
-///    (proves the binding env is a real working connection string).
-/// 5. Two apps with `needs.db` on the same service → different resources,
-///    different DATABASE_URLs, cross-database access denied (isolation).
-/// 6. PATCH app to detach needs (`needs={}`) → `bindings::env` returns empty
-///    (no DATABASE_URL injected); a manually-set normal secret is preserved.
-/// 7. Service removal refused (live map has active binding from app 2) →
-///    proves the usage reader sees the live map, not a stale snapshot.
-/// 8. PATCH app to reattach needs → same `DATABASE_URL` and same data
-///    (reattach returns exact URL/data; retained credentials reused).
-/// 9. Removal refusal after apply (no stale usage snapshot): after both
-///    apps have `needs.db`, removing the service is refused; after one app
-///    detaches, removal is still refused (the other still binds).
+/// The assertions follow the acceptance criteria rather than narrating the
+/// code: a deployed app gets a working `DATABASE_URL`; two apps are
+/// isolated from each other's databases; repeated apply is idempotent.
+/// Detaching a need stops injection without dropping data or touching
+/// unrelated secrets. Service removal is refused while the live app map
+/// shows a binding.
 ///
 /// Secret safety: no raw password appears in any command-line argument or
 /// assertion message. The DATABASE_URL contains the password but is passed
@@ -1451,8 +1437,8 @@ async fn contract_slip107_e2e_apply_bind_env_client() {
         .cloned()
         .expect("DATABASE_URL must be present in binding env");
 
-    // Verify the DATABASE_URL has the expected structure (no password leak
-    // in the assertion message — only check the prefix).
+    // Verify the DATABASE_URL has the expected structure. Only the prefix
+    // is checked so a failed assertion cannot leak the password.
     assert!(
         database_url_a.starts_with("postgresql://"),
         "DATABASE_URL must be a postgresql:// URL"
@@ -1465,7 +1451,7 @@ async fn contract_slip107_e2e_apply_bind_env_client() {
     // ── 5. Client container verifies DB connectivity using DATABASE_URL ──
     //    Run a psql client on the slip network with DATABASE_URL env. The
     //    container uses the URL to connect and create a test table. This
-    //    proves the binding env is a real, working connection string — not
+    //    proves the binding env is a real, working connection string, not
     //    a mock.
     let create_table_sql = "CREATE TABLE IF NOT EXISTS slip_e2e (val text); INSERT INTO slip_e2e VALUES ('app-a-data');";
     let (code, output) = pg_client_verify("slip", &database_url_a, create_table_sql);
@@ -1526,7 +1512,7 @@ async fn contract_slip107_e2e_apply_bind_env_client() {
         "app-b client must connect to its own DB (exit={code_b}): {output_b}"
     );
 
-    // App-a CANNOT connect to app-b's DB using app-b's URL — but the URL
+    // App-a CANNOT connect to app-b's DB using app-b's URL, but the URL
     // includes app-b's credentials, so this would actually succeed. The
     // isolation is at the resource level: app-a's user cannot connect to
     // app-b's database. We verify this by using app-a's DATABASE_URL but
@@ -1665,20 +1651,13 @@ async fn contract_slip107_e2e_apply_bind_env_client() {
         "app-a data must persist after re-apply (exit={code_data}): {output_data}"
     );
 
-    // ── DEPLOY: HMAC POST /v1/deploy → execute_deploy → real app container ──
-    //    This exercises the full deploy orchestrator: the deploy handler
-    //    verifies the HMAC signature, calls `services.check_needs`, spawns
-    //    `execute_deploy` which pulls the image, resolves binding env from
-    //    `bindings::env`, injects it into the container via
-    //    `create_and_start`, runs the health check (path=None → start_period
-    //    wait), calls `caddy.set_routes` (the mock Caddy accepts), and marks
-    //    the deploy Completed.
-    //
-    //    We then `exec` inside the DEPLOYED app container, using the
-    //    DATABASE_URL env var that the orchestrator injected, to query the
-    //    test table we created via the binding. This proves the orchestrator
-    //    really injected the correct secret env — no test-side values are
-    //    passed into the container for this check.
+    // ── DEPLOY: signed POST /v1/deploy through the real orchestrator ──
+    //    The key assertion is that the orchestrator itself injected the
+    //    binding env. We exec inside the DEPLOYED app container and query
+    //    the table using only the DATABASE_URL it received.
+    //    The app image is postgres with trust auth so it starts and stays
+    //    healthy with a container-liveness probe; Caddy is mocked to
+    //    accept the route swap.
     let deploy_body = serde_json::json!({
         "app": app_a_name,
         "image": app_a_image,
@@ -1746,12 +1725,9 @@ async fn contract_slip107_e2e_apply_bind_env_client() {
     );
 
     // ── Verify: exec inside the DEPLOYED app container using its env ──
-    //    Find the deployed app container by the `slip.app` label. The
-    //    container was created by `execute_deploy` → `create_and_start`
-    //    with the binding env injected. We exec `psql` inside it using
-    //    the DATABASE_URL that the orchestrator set — no test-side values
-    //    are passed into the container. This proves the orchestrator
-    //    really injected the correct secret env from `bindings::env`.
+    //    Find the deployed app container by the `slip.app` label. We exec
+    //    `psql` inside it using only the DATABASE_URL the orchestrator
+    //    injected; no test-side values are passed into the container.
     let app_containers = runtime
         .list_by_label("slip.app", &app_a_name)
         .await
@@ -1833,7 +1809,8 @@ async fn contract_slip107_e2e_apply_bind_env_client() {
         "bindings::env must be empty after detaching needs"
     );
 
-    // Normal secret preserved (not removed by detach).
+    // Detach must leave manually-set secrets untouched (only binding keys
+    // disappear from the injected env).
     let normal_secret = state
         .secrets_store
         .get(&app_a_name, "MY_APP_KEY")
@@ -1864,7 +1841,7 @@ async fn contract_slip107_e2e_apply_bind_env_client() {
 
     // ── 10. Reattach needs → same URL/data (retained credentials) ───────
     //     PATCH app-a to reattach needs.db. The retained credentials must
-    //     be reused — same DATABASE_URL and same data.
+    //     be reused: same DATABASE_URL and same data.
     let reattach_body = serde_json::json!({
         "needs": {
             "db": { "type": "postgres" }

@@ -1,13 +1,13 @@
 //! Service-need bindings for app config (`[needs.<alias>]`).
 //!
-//! An app declares the external services it consumes — a Postgres database, an
-//! S3-compatible object store, a Redis-compatible cache — through the
-//! `[needs.<alias>]` table in both the repo `slip.toml` and the server-side
-//! `apps/<name>.toml`. Each binding carries:
+//! An app declares the external services it consumes, such as a Postgres
+//! database, an S3-compatible object store, or a Redis-compatible cache,
+//! through the `[needs.<alias>]` table in both the repo `slip.toml` and the
+//! server-side `apps/<name>.toml`. Each binding carries:
 //!
-//! - `alias`: the lowercase TOML key (`db`, `analytics`, `cache`, …) — the name
-//!   the app uses to refer to this service in its own config.
-//! - `type`: one of `postgres`, `s3`, `kv` — the provider kind. Only known
+//! - `alias`: the lowercase TOML key (`db`, `analytics`, `cache`, ...), the
+//!   name the app uses to refer to this service in its own config.
+//! - `type`: one of `postgres`, `s3`, `kv`, the provider kind. Only known
 //!   kinds are accepted (serde `deny_unknown_fields` + custom type parsing).
 //!
 //! ## Environment variable contract
@@ -21,7 +21,7 @@
 //!   / `S3_SECRET_ACCESS_KEY` respectively.
 //! - Type names (`postgres`, `s3`, `kv`) are ordinary aliases and receive a
 //!   prefix, just like any other non-canonical alias.
-//! - Any other alias (`analytics`, `audit`, …) gets an **uppercase prefix**:
+//! - Any other alias (`analytics`, `audit`, ...) gets an **uppercase prefix**:
 //!   `ANALYTICS_DATABASE_URL`, `AUDIT_REDIS_URL`, and the S3 set
 //!   `ANALYTICS_S3_ENDPOINT`, etc.
 //!
@@ -55,11 +55,11 @@ pub const CANONICAL_S3_ENV: &[&str] = &[
 ];
 
 /// Aliases that map to the canonical env vars (no uppercase prefix).
-/// Only the short service-canonical aliases get unprefixed env vars; the type
-/// names (`postgres`, `s3`, `kv`) are NOT canonical — they get prefixed env vars
-/// (`POSTGRES_DATABASE_URL`, `S3_S3_ENDPOINT`, `KV_REDIS_URL`) to avoid the
-/// redundant-but-confusing `S3_S3_*` clash for the common `s3` alias while
-/// still being valid.
+/// Only the short service-canonical aliases get unprefixed env vars. The
+/// type names (`postgres`, `s3`, `kv`) are NOT canonical: they get prefixed
+/// env vars (`POSTGRES_DATABASE_URL`, `S3_S3_ENDPOINT`, `KV_REDIS_URL`).
+/// The prefix keeps the common `s3` alias valid despite its redundant
+/// `S3_S3_*` spelling.
 const CANONICAL_PG_ALIASES: &[&str] = &["db"];
 const CANONICAL_S3_ALIASES: &[&str] = &["storage"];
 const CANONICAL_KV_ALIASES: &[&str] = &["cache"];
@@ -399,7 +399,7 @@ extra = true"#,
 
     #[test]
     fn env_keys_type_name_aliases_are_prefixed() {
-        // `postgres`, `s3`, `kv` are NOT canonical — they get uppercase prefixes.
+        // `postgres`, `s3`, `kv` are NOT canonical: they get uppercase prefixes.
         let pg = Need::new(NeedType::Postgres);
         assert_eq!(pg.env_keys("postgres"), vec!["POSTGRES_DATABASE_URL"]);
         let kv = Need::new(NeedType::Kv);
@@ -534,13 +534,11 @@ extra = true"#,
 
     #[test]
     fn validate_needs_collision_two_aliases_same_var() {
-        // Two non-canonical postgres aliases would generate different env vars,
-        // so no collision. But two aliases that happen to produce the same
-        // prefixed env var is impossible (prefix is the alias itself). The only
-        // collision path is two needs both claiming the *same* canonical alias
-        // — but BTreeMap keys are unique, so that can't happen either. This
-        // test documents that two distinct non-canonical postgres aliases do
-        // NOT collide.
+        // Two non-canonical postgres aliases generate different env vars, so
+        // no collision is possible: the prefix is the alias itself, and the
+        // canonical alias path cannot repeat because BTreeMap keys are
+        // unique. This test documents that two distinct non-canonical
+        // postgres aliases do NOT collide.
         let needs = map(&[
             ("analytics", NeedType::Postgres),
             ("audit", NeedType::Postgres),

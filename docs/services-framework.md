@@ -34,7 +34,7 @@ validated with the contracts below, but provisioning needs their future service
 providers. Missing services fail with exit **4**, for example:
 
 ```text
-no postgres service — run `slip services add postgres` on the server
+no postgres service: run `slip services add postgres` on the server
 ```
 
 ### Exact environment contract

@@ -1543,7 +1543,7 @@ impl ServiceProvider for PostgresProvider {
         resource: &'a ResourceCredentials,
     ) -> crate::services::spec::BoxFuture<'a, Result<(), ServiceError>> {
         Box::pin(async move {
-            // 1. Rootful check — same gate as provision/ensure.
+            // 1. Rootful check (same gate as provision/ensure).
             if !ctx.runtime().is_rootful().await {
                 return Err(ServiceError::Blocked(
                     spec.name().as_str().to_string(),
@@ -1597,7 +1597,7 @@ impl ServiceProvider for PostgresProvider {
             if !inspect.running {
                 return Err(ServiceError::Blocked(
                     spec.name().as_str().to_string(),
-                    "service container is not running — run `slip ensure` first".to_string(),
+                    "service container is not running: run `slip ensure` first".to_string(),
                 ));
             }
             if inspect.health_status != "healthy" {
@@ -1615,23 +1615,20 @@ impl ServiceProvider for PostgresProvider {
             //    literal. We still escape defensively by rejecting any
             //    non-hex character at construction time (already done).
             //
-            //    The SQL is idempotent and restart-safe:
-            //    - Roles/databases are NEVER dropped.
-            //    - An existing role with the right ownership comment is
-            //      adopted (password is reset to the persisted value).
-            //    - An existing role with a different/non-slip comment is
-            //      foreign → refuse adoption.
-            //    - An existing database whose owner is not our role (and
-            //      not a prior incarnation of it) is foreign → refuse.
-            //    - The atomic role create+comment is a single psql session;
-            //      if psql crashes between CREATE ROLE and COMMENT, the
-            //      role exists without a comment, and the next run detects
-            //      a role with the wrong comment → refuse (operator must
-            //      inspect). This is fail-closed.
+            // 3. Build the SQL. The SQL is idempotent and restart-safe. It
+            //    never drops roles or databases. An existing role or database
+            //    with a matching ownership marker is adopted; a foreign one
+            //    is refused. See build_resource_sql for the full rationale.
+            //
+            //    Crash-consistency note: the role create and its ownership
+            //    comment run in a single psql session. If psql dies between
+            //    CREATE ROLE and COMMENT, the role exists without a comment;
+            //    the next run sees the wrong comment and refuses (fail-closed
+            //    until an operator inspects).
             //    - CREATE DATABASE cannot run inside a transaction block, so
             //      it is a separate psql invocation. A crash between
             //      CREATE DATABASE and the subsequent GRANT/REVOKE leaves a
-            //      database owned by our role — the ownership (rolowner)
+            //      database owned by our role. The ownership (rolowner)
             //      IS the deterministic marker for the database, since the
             //      role name == resource id == intended db name. A re-run
             //      detects the db exists with the right owner and completes
@@ -1666,7 +1663,7 @@ impl ServiceProvider for PostgresProvider {
                 .map_err(|_| {
                     // Sanitized: no raw exec error text, no secret.
                     ServiceError::Internal(
-                        "resource creation SQL failed — see service logs for details".to_string(),
+                        "resource creation SQL failed: see service logs for details".to_string(),
                     )
                 })?;
 
@@ -1747,9 +1744,9 @@ fn build_resource_sql(resource: &ResourceCredentials) -> String {
     let password = resource.password();
     let comment = role_comment(id);
 
-    // The id is `slip_` + 48 lowercase hex — a valid unquoted PostgreSQL
+    // The id is `slip_` + 48 lowercase hex: a valid unquoted PostgreSQL
     // identifier (≤ 63 bytes, starts with letter, [a-z0-9_]). The password
-    // is 64 lowercase hex — injection-safe in a single-quoted literal.
+    // is 64 lowercase hex, injection-safe in a single-quoted literal.
     // The id is interpolated unquoted (it is a validated identifier).
     format!(
         r#"-- slip-managed resource creation (SLIP-107)
@@ -2986,7 +2983,7 @@ mod tests {
         assert!(sql.contains("ALTER DEFAULT PRIVILEGES"));
         assert!(sql.contains("REVOKE"));
         assert!(sql.contains("FROM PUBLIC"));
-        // Sequences: USAGE, SELECT, UPDATE (NOT INSERT — invalid for sequences).
+        // Sequences: USAGE, SELECT, UPDATE (INSERT is invalid for sequences).
         assert!(sql.contains("USAGE, SELECT, UPDATE ON SEQUENCES"));
         assert!(!sql.contains("INSERT, UPDATE, USAGE ON SEQUENCES"));
     }
@@ -3056,7 +3053,7 @@ mod tests {
         let sql = build_resource_sql(&resource);
         assert!(sql.contains("SET log_statement = 'none';"));
         assert!(sql.contains("SET log_min_error_statement = 'panic';"));
-        // Count occurrences — should be at least 2 (before and after \connect).
+        // Count occurrences: should be at least 2 (before and after \connect).
         let count = sql.matches("SET log_statement = 'none';").count();
         assert!(
             count >= 2,
@@ -3067,7 +3064,7 @@ mod tests {
     #[test]
     fn build_resource_sql_reasserts_role_privilege_flags() {
         // On an existing owned role, the SQL must reassert ALL privilege
-        // flags (NOSUPERUSER etc.) to catch drift — not silently keep them.
+        // flags (NOSUPERUSER etc.) to catch drift, not silently keep them.
         let resource = sample_resource();
         let sql = build_resource_sql(&resource);
         // The ALTER ROLE ... NOSUPERUSER ... line appears in the ELSE branch

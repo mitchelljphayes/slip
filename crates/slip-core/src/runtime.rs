@@ -614,7 +614,7 @@ pub trait RuntimeBackend: Send + Sync {
     /// - `env` pairs are allowlisted non-secret settings (e.g.
     ///   `PGPASSFILE=/run/secrets/slip-pgpass`).
     /// - `stdin_input` is written to the command's stdin in full before
-    ///   stdin is closed. It MUST NOT contain the password — it carries
+    ///   stdin is closed. It MUST NOT contain the password; it carries
     ///   only SQL referencing the validated resource id.
     /// - Output is capped at `max_output_bytes` and discarded on success.
     /// - On non-zero exit, returns `Err(RuntimeError::ExecFailed(...))`

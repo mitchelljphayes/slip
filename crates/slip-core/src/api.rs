@@ -1263,7 +1263,8 @@ async fn handle_delete_app(
         }
     }
 
-    // Remove Caddy routes
+    // Route removal needs the count that the reconcile loop would re-add;
+    // the map is already gone, so fall back to one for a single-route app.
     let route_count = state
         .app_states
         .read()

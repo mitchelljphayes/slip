@@ -3161,18 +3161,20 @@ fn deploy_no_apply_skips_apply() {
         );
 }
 
-// ─── SLIP-107 regression: preserve server missing-service error on HTTP 404 ───
+// SLIP-107 regression: preserve server missing-service error on HTTP 404.
 //
-// When the server returns 404 because a referenced service (e.g. postgres) is
-// not provisioned, the CLI must surface the server's prescriptive error text
+// When the server returns 404 because a referenced service is not
+// provisioned, the CLI must surface the server's prescriptive error text
 // verbatim (via `api_error_text`) and exit NOT_FOUND (4). It must NOT
-// substitute a generic "app not found" message. These tests cover the three
-// paths that touch a 404 from the server: apply-create (POST), apply-update
-// (PATCH), and deploy with --no-apply (POST /v1/deploy).
+// substitute a generic "app not found" message.
+//
+// These tests cover the three paths that touch a 404 from the server:
+// apply-create (POST), apply-update (PATCH), and deploy with --no-apply
+// (POST /v1/deploy).
 
 /// The exact server error text the CLI must preserve through `api_error_text`.
 const MISSING_PG_SERVICE_ERROR: &str =
-    "no postgres service — run `slip services add postgres` on the server";
+    "no postgres service: run `slip services add postgres` on the server";
 
 /// A slip.toml declaring a postgres need, so the create/update payload
 /// includes `[needs.db]`.
@@ -3377,11 +3379,11 @@ fn slip_107_apply_create_404_preserves_missing_service_error() {
 
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
 
-    // Exit code 4 (NOT_FOUND) — not a generic 1.
+    // Exit code 4 (NOT_FOUND), not a generic 1.
     assert.failure().code(output::NOT_FOUND);
 
-    // The exact server error text must appear verbatim — no false "app not
-    // found" substitution.
+    // The exact server error text must appear verbatim, with no false
+    // "app not found" substitution.
     assert!(
         stderr.contains(MISSING_PG_SERVICE_ERROR),
         "stderr must preserve the server's missing-service error verbatim: {stderr}"

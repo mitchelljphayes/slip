@@ -1164,19 +1164,16 @@ pub trait ServiceProvider: Send + Sync {
     /// The controller computes the resource id deterministically (see
     /// [`crate::services::resource::compute_resource_id`]) and generates
     /// the password from a CSPRNG, then persists both BEFORE calling this
-    /// method. The provider's job is to make the running service reflect
-    /// that state idempotently:
+    /// method. The provider makes the running service reflect that state
+    /// idempotently. Implementations must be restart-safe and fail closed
+    /// on foreign objects, and must verify service ownership and readiness
+    /// before exec.
     ///
-    /// - For PostgreSQL: create the LOGIN role (with a deterministic
-    ///   ownership comment) and the owned database, revoke `CONNECT`/`TEMP`
-    ///   from `PUBLIC`, and ensure the public schema default is safe.
-    /// - Idempotent restart-safe: never drop; detect an existing foreign
-    ///   role/database (ownership marker mismatch) and refuse adoption.
-    /// - SQL is executed via stdin to `psql --no-psqlrc -v ON_ERROR_STOP=1`
-    ///   using a mounted `PGPASSFILE` like the readiness check. No
-    ///   plaintext password in argv, env, log, or error.
-    /// - Verify service ownership/readiness via existing provider checks
-    ///   before exec.
+    /// For PostgreSQL this means: create the LOGIN role (with a
+    /// deterministic ownership comment) and the owned database, revoke
+    /// `CONNECT`/`TEMP` from `PUBLIC`, and ensure the public schema
+    /// default is safe. Never drop. An existing role or database with an
+    /// ownership-marker mismatch is foreign: refuse adoption.
     ///
     /// `resource` carries the validated resource id (also the role and
     /// database name) and the generated password. The password is only
@@ -1207,8 +1204,7 @@ pub trait ServiceProvider: Send + Sync {
     /// legitimately exposed: the app container is the intended recipient.
     /// The service runtime never sees it in argv/env.
     ///
-    /// Default returns `Unsupported` so existing fakes are unaffected
-    /// until a provider explicitly implements it (SLIP-107).
+    /// The default fails closed until a provider implements resource env.
     fn resource_env<'a>(
         &'a self,
         spec: &'a ServiceSpec,

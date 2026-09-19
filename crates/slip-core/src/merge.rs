@@ -187,9 +187,9 @@ pub fn merge_config(server: &AppConfig, repo: &RepoConfig) -> Result<MergedConfi
     // map is authoritative in full. The repo's image-carried `[needs]` is a
     // *declaration* that the deploy path rejects if it mismatches the server's
     // bound services (remedy: `slip apply`). It must NOT silently resurrect
-    // needs that were removed from the server config — doing so would revive
-    // stale bindings from an old image. So the merged needs are exactly the
-    // server's needs, period.
+    // needs that were removed from the server config, because doing so would
+    // revive stale bindings from an old image. So the merged needs are exactly
+    // the server's needs, period.
     merged.needs = server.needs.clone();
 
     Ok(MergedConfig {
@@ -866,7 +866,7 @@ mod tests {
     #[test]
     fn merge_needs_server_empty_drops_repo_needs() {
         // Server has no needs; repo declares `db`. The repo's image-carried
-        // needs are a declaration, not authority — the merged config must be
+        // needs are a declaration, not authority: the merged config must be
         // empty so a stale image cannot resurrect a removed binding.
         let server = base_server_config();
         let mut repo = minimal_repo_config("testapp");
@@ -883,7 +883,7 @@ mod tests {
 
     #[test]
     fn merge_needs_server_wins_over_repo() {
-        // Both declare `db` — merged result is exactly server's, ignoring repo.
+        // Both declare `db`; merged result is exactly server's, ignoring repo.
         let mut server = base_server_config();
         server
             .needs

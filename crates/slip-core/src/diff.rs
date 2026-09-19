@@ -273,7 +273,7 @@ fn normalize_server_to_repo(repo: &Pushable, server: &mut Pushable) {
     }
     // Needs: full-replace semantics, same as env. The repo's `[needs]` is the
     // desired state; the server's current needs are diffed against it directly.
-    // An empty repo `[needs]` produces Remove ops for every server need — that
+    // An empty repo `[needs]` produces Remove ops for every server need: that
     // is the signal to clear bindings that were removed from the repo. We do
     // NOT null the server side here (unlike health/resources where repo-None
     // means "unmanaged"), because needs are always fully replaced on apply.
@@ -574,7 +574,7 @@ pub fn build_update_payload(repo: &RepoConfig) -> Value {
         payload["volumes"] = Value::Array(Vec::new());
     }
 
-    // Needs (full replace, including removal — empty map clears server needs)
+    // Needs (full replace; an empty map clears server needs)
     if !repo.needs.is_empty() {
         let needs_map: Value = repo
             .needs
